@@ -38,11 +38,6 @@ from phyai.layers.linear.layers import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from phyai.layers.linear.loaders import (
-    ColumnShardLoader,
-    QKVShardLoader,
-    RowShardLoader,
-)
 from phyai.layers.linear.registry import (
     DefaultPolicy,
     ForcedPolicy,
@@ -50,6 +45,12 @@ from phyai.layers.linear.registry import (
     Policy,
 )
 from phyai.layers.linear.spec import ActivationView, Bf16Spec, Fp8Spec
+from phyai.layers.loaders import (
+    ColumnShardLoader,
+    QKVShardLoader,
+    ReplicatedLoader,
+    RowShardLoader,
+)
 from phyai.utils.cuda import sm_arch
 
 
@@ -122,6 +123,7 @@ __all__ = [
     "ColumnShardLoader",
     "RowShardLoader",
     "QKVShardLoader",
+    "ReplicatedLoader",
     # dispatcher / registry
     "KernelDispatcher",
     "get_linear_dispatcher",

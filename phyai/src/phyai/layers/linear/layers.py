@@ -13,12 +13,13 @@ import torch.nn as nn
 
 import phyai.parallel as P
 from phyai.layers.linear.dispatch import get_linear_dispatcher
-from phyai.layers.linear.loaders import (
+from phyai.layers.linear.spec import Bf16Spec
+from phyai.layers.loaders import (
     ColumnShardLoader,
     QKVShardLoader,
+    ReplicatedLoader,
     RowShardLoader,
 )
-from phyai.layers.linear.spec import Bf16Spec
 from phyai.parallel.state import resolve_mesh
 
 
@@ -89,13 +90,14 @@ class ReplicatedLinear(LinearBase):
             input_size_global=in_features,
             output_size_global=out_features,
             params_dtype=self.params_dtype,
-            weight_loader=None,
+            weight_loader=ReplicatedLoader(),
         )
         if bias:
             self.bias = nn.Parameter(
                 torch.zeros(out_features, dtype=self.params_dtype),
                 requires_grad=False,
             )
+            self.bias.loader = ReplicatedLoader()  # type: ignore[attr-defined]
         else:
             self.register_parameter("bias", None)
 
@@ -191,6 +193,9 @@ class ColumnParallelLinear(LinearBase):
                 torch.zeros(sum(per_rank_sizes), dtype=self.params_dtype),
                 requires_grad=False,
             )
+            # Bias is fused along the output dim just like the weight; the
+            # same ColumnShardLoader (narrow(0, ...)) drives both.
+            self.bias.loader = loader  # type: ignore[attr-defined]
         else:
             self.register_parameter("bias", None)
 
@@ -327,7 +332,10 @@ class QKVParallelLinear(ColumnParallelLinear):
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
         )
-        self.weight._loader = loader  # type: ignore[attr-defined]
+        self.weight.loader = loader  # type: ignore[attr-defined]
+        # Bias (when present) shares the same QKV layout along dim 0.
+        if self.bias is not None:
+            self.bias.loader = loader  # type: ignore[attr-defined]
 
 
 class RowParallelLinear(LinearBase):
@@ -388,11 +396,13 @@ class RowParallelLinear(LinearBase):
             weight_loader=loader,
         )
         if bias:
-            # RowParallel bias is global (only rank 0 adds it at forward).
+            # RowParallel bias is global (only rank 0 adds it at forward), so
+            # every rank loads the full disk tensor unsliced.
             self.bias = nn.Parameter(
                 torch.zeros(out_features, dtype=self.params_dtype),
                 requires_grad=False,
             )
+            self.bias.loader = ReplicatedLoader()  # type: ignore[attr-defined]
         else:
             self.register_parameter("bias", None)
 
