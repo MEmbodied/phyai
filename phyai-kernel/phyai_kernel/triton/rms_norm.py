@@ -414,6 +414,10 @@ def fused_add_rmsnorm(
     ``fused_add_rmsnorm`` contract).
     """
     _check_inputs(x, weight)
+    if not x.is_contiguous() or not residual.is_contiguous():
+        raise RuntimeError(
+            "phyai_kernel.triton.fused_add_rmsnorm: x and residual must be contiguous for in-place update"
+        )
     if x.shape != residual.shape:
         raise RuntimeError(
             "phyai_kernel.triton.fused_add_rmsnorm: x and residual shapes must match"
