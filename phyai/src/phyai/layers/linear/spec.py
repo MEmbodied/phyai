@@ -74,7 +74,7 @@ class Bf16Spec:
             ),
             requires_grad=False,
         )
-        layer.weight._loader = weight_loader  # type: ignore[attr-defined]
+        layer.weight.loader = weight_loader  # type: ignore[attr-defined]
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = out_per_rank
@@ -149,7 +149,7 @@ class Fp8Spec:
             ),
             requires_grad=False,
         )
-        layer.weight._loader = weight_loader  # type: ignore[attr-defined]
+        layer.weight.loader = weight_loader  # type: ignore[attr-defined]
 
         if self.granularity == Granularity.PER_TENSOR:
             layer.weight_scale = nn.Parameter(

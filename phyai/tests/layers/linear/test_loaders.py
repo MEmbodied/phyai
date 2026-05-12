@@ -6,9 +6,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from phyai.layers.linear.loaders import (
+from phyai.layers.loaders import (
     ColumnShardLoader,
     QKVShardLoader,
+    ReplicatedLoader,
     RowShardLoader,
 )
 
@@ -226,3 +227,39 @@ def test_qkv_loader_q_shape_mismatch():
     param = _param((12, 4))
     with pytest.raises(ValueError, match="global_q"):
         loader.load_qkv(param, torch.zeros(8, 4), "q")
+
+
+# ---------------------------------------------------------------------------
+# ReplicatedLoader
+# ---------------------------------------------------------------------------
+
+
+def test_replicated_load_full_copies_2d():
+    loader = ReplicatedLoader()
+    param = _param((4, 8))
+    src = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    loader.load_full(param, src)
+    assert torch.equal(param.data, src)
+
+
+def test_replicated_load_full_copies_1d_bias():
+    loader = ReplicatedLoader()
+    param = _param((16,))
+    src = torch.arange(16, dtype=torch.float32)
+    loader.load_full(param, src)
+    assert torch.equal(param.data, src)
+
+
+def test_replicated_load_full_scalar_broadcast():
+    """A 1-element saved scalar fills a 1-element parameter."""
+    loader = ReplicatedLoader()
+    param = _param((1,))
+    loader.load_full(param, torch.tensor([3.5]))
+    assert param.item() == 3.5
+
+
+def test_replicated_load_full_shape_mismatch():
+    loader = ReplicatedLoader()
+    param = _param((8,))
+    with pytest.raises(ValueError, match="shape"):
+        loader.load_full(param, torch.zeros(4))

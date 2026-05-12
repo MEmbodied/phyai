@@ -183,7 +183,7 @@ def test_merged_column_loader_addresses_two_shards(fake_mesh):
     assert layer.output_partition_sizes == [8, 8]
     assert layer.weight.shape == (16, 16)
 
-    loader = layer.weight._loader
+    loader = layer.weight.loader
     # Load shard 0: disk is (16, 16), rank 0 takes rows 0..8.
     disk = torch.arange(16 * 16, dtype=torch.bfloat16).reshape(16, 16)
     loader.load_shard(layer.weight, disk, shard_id=0)
@@ -263,7 +263,7 @@ def test_qkv_linear_loads_q_k_v_shards(fake_mesh):
         bias=False,
         params_dtype=torch.bfloat16,
     )
-    loader = layer.weight._loader
+    loader = layer.weight.loader
     assert isinstance(loader, L.QKVShardLoader)
 
     disk_q = torch.full((2 * 4, 16), 1.0, dtype=torch.bfloat16)
@@ -419,8 +419,8 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
         reduce_results=False,
         params_dtype=torch.float32,
     )
-    col.weight._loader.load_full(col.weight, W1)
-    row.weight._loader.load_full(row.weight, W2)
+    col.weight.loader.load_full(col.weight, W1)
+    row.weight.loader.load_full(row.weight, W2)
 
     y_col, _ = col(x)
     assert y_col.shape == (
