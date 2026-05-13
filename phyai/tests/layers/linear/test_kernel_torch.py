@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from phyai.layers.linear.backend import Granularity, KernelProbe
 from phyai.layers.linear.backends._torch import TorchKernel, _expand_block_scale
 from phyai.layers.linear.spec import Bf16Spec, Fp8Spec
+from phyai.layers.quant import AllocationRequest
 from phyai.parallel.state import Mode
 
 
@@ -47,12 +48,13 @@ def _build_layer(spec, *, N, K, device, dtype=torch.bfloat16, bias=False):
     layer.spec = spec
     spec.allocate(
         layer,
-        input_size_per_partition=K,
-        output_partition_sizes=[N],
-        input_size_global=K,
-        output_size_global=N,
-        params_dtype=dtype,
-        weight_loader=None,
+        AllocationRequest(
+            weight_shape=(N, K),
+            logical_widths=[N],
+            fused_dim=0,
+            weight_loader=None,
+            params_dtype=dtype,
+        ),
     )
     layer.weight.data = layer.weight.data.to(device)
     if hasattr(layer, "weight_scale"):

@@ -9,20 +9,17 @@ is a pure-capability Protocol each backend implements. There is no
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import Protocol, runtime_checkable
 
 import torch
 
+from phyai.layers.quant.granularity import Granularity
 from phyai.parallel.state import Mode
 
 
-class Granularity(Enum):
-    """How a scale tensor is laid out relative to the weight."""
-
-    PER_TENSOR = "per_tensor"
-    PER_CHANNEL = "per_channel"
-    BLOCK = "block"
+# ``Granularity`` was originally defined here. It now lives in
+# :mod:`phyai.layers.quant.granularity` so non-linear ops can reuse it; the
+# import above re-exports it under the historical path.
 
 
 @dataclass(frozen=True)

@@ -20,6 +20,7 @@ from phyai.layers.loaders import (
     ReplicatedLoader,
     RowShardLoader,
 )
+from phyai.layers.quant import AllocationRequest
 from phyai.parallel.state import resolve_mesh
 
 
@@ -85,13 +86,18 @@ class ReplicatedLinear(LinearBase):
         )
         self.spec.allocate(
             self,
-            input_size_per_partition=in_features,
-            output_partition_sizes=[out_features],
-            input_size_global=in_features,
-            output_size_global=out_features,
-            params_dtype=self.params_dtype,
-            weight_loader=ReplicatedLoader(),
+            AllocationRequest(
+                weight_shape=(out_features, in_features),
+                logical_widths=[out_features],
+                fused_dim=0,
+                weight_loader=ReplicatedLoader(),
+                params_dtype=self.params_dtype,
+            ),
         )
+        self.input_size_per_partition = in_features
+        self.output_size_per_partition = out_features
+        self.input_size_global = in_features
+        self.output_size_global = out_features
         if bias:
             self.bias = nn.Parameter(
                 torch.zeros(out_features, dtype=self.params_dtype),
@@ -180,13 +186,18 @@ class ColumnParallelLinear(LinearBase):
         )
         self.spec.allocate(
             self,
-            input_size_per_partition=in_features,
-            output_partition_sizes=per_rank_sizes,
-            input_size_global=in_features,
-            output_size_global=out_features,
-            params_dtype=self.params_dtype,
-            weight_loader=loader,
+            AllocationRequest(
+                weight_shape=(sum(per_rank_sizes), in_features),
+                logical_widths=per_rank_sizes,
+                fused_dim=0,
+                weight_loader=loader,
+                params_dtype=self.params_dtype,
+            ),
         )
+        self.input_size_per_partition = in_features
+        self.output_size_per_partition = sum(per_rank_sizes)
+        self.input_size_global = in_features
+        self.output_size_global = out_features
 
         if bias:
             self.bias = nn.Parameter(
@@ -388,13 +399,18 @@ class RowParallelLinear(LinearBase):
         loader = RowShardLoader(tp_rank=self.tp_rank, tp_size=self.tp_size)
         self.spec.allocate(
             self,
-            input_size_per_partition=in_per_rank,
-            output_partition_sizes=[out_features],
-            input_size_global=in_features,
-            output_size_global=out_features,
-            params_dtype=self.params_dtype,
-            weight_loader=loader,
+            AllocationRequest(
+                weight_shape=(out_features, in_per_rank),
+                logical_widths=[out_features],
+                fused_dim=0,
+                weight_loader=loader,
+                params_dtype=self.params_dtype,
+            ),
         )
+        self.input_size_per_partition = in_per_rank
+        self.output_size_per_partition = out_features
+        self.input_size_global = in_features
+        self.output_size_global = out_features
         if bias:
             # RowParallel bias is global (only rank 0 adds it at forward), so
             # every rank loads the full disk tensor unsliced.

@@ -186,11 +186,11 @@ def test_merged_column_loader_addresses_two_shards(fake_mesh):
     loader = layer.weight.loader
     # Load shard 0: disk is (16, 16), rank 0 takes rows 0..8.
     disk = torch.arange(16 * 16, dtype=torch.bfloat16).reshape(16, 16)
-    loader.load_shard(layer.weight, disk, shard_id=0)
+    loader.load_weight(layer.weight, disk, shard_id=0)
     expected = disk.narrow(0, 0, 8)
     assert torch.equal(layer.weight.data[:8], expected)
     # shard 1 lives at rows [8:16).
-    loader.load_shard(layer.weight, disk, shard_id=1)
+    loader.load_weight(layer.weight, disk, shard_id=1)
     assert torch.equal(layer.weight.data[8:16], expected)
 
 
@@ -269,9 +269,9 @@ def test_qkv_linear_loads_q_k_v_shards(fake_mesh):
     disk_q = torch.full((2 * 4, 16), 1.0, dtype=torch.bfloat16)
     disk_k = torch.full((2 * 4, 16), 2.0, dtype=torch.bfloat16)
     disk_v = torch.full((2 * 4, 16), 3.0, dtype=torch.bfloat16)
-    loader.load_qkv(layer.weight, disk_q, "q")
-    loader.load_qkv(layer.weight, disk_k, "k")
-    loader.load_qkv(layer.weight, disk_v, "v")
+    loader.load_weight(layer.weight, disk_q, "q")
+    loader.load_weight(layer.weight, disk_k, "k")
+    loader.load_weight(layer.weight, disk_v, "v")
 
     # [q | k | v] in fused param
     assert torch.all(layer.weight.data[0:8] == 1.0)
@@ -419,8 +419,8 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
         reduce_results=False,
         params_dtype=torch.float32,
     )
-    col.weight.loader.load_full(col.weight, W1)
-    row.weight.loader.load_full(row.weight, W2)
+    col.weight.loader.load_weight(col.weight, W1)
+    row.weight.loader.load_weight(row.weight, W2)
 
     y_col, _ = col(x)
     assert y_col.shape == (

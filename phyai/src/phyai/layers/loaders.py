@@ -1,25 +1,45 @@
 """Per-parameter weight loaders.
 
 Every nn.Parameter that comes out of phyai.layers has a ``param.loader``
-hanging off it. Checkpoint-loading code reaches for that attribute and
-calls one of three methods:
+hanging off it. The modeling-level checkpoint loop reaches for that
+attribute and calls a single method::
 
-* ``load_full(param, loaded)``: a single, un-fused tensor. Always available.
-  May still slice along dim 0 or dim 1 to grab this rank's slice.
-* ``load_shard(param, loaded, shard_id: int)``: write one logical
-  sub-matrix into a fused param (e.g. gate vs. up of a fused MLP).
-* ``load_qkv(param, loaded, shard_id: str)``: same idea for the Q/K/V
-  fused projection, with named shards instead of integers.
+    param.loader.load_weight(param, loaded, shard_id=...)
+
+The contract on ``loaded`` is one rule: it always carries the full,
+natural, un-sharded weight tensor for whatever it represents. There is
+no "pre-fused on disk" or "pre-replicated KV" path — those layouts never
+worked under GQA and are not supported.
+
+What ``shard_id`` selects:
+
+* ``None`` — ``loaded`` is the whole param. Valid for non-fused loaders
+  (:class:`ReplicatedLoader`, :class:`RowShardLoader`,
+  :class:`VocabShardLoader`, and :class:`ColumnShardLoader` configured
+  with a single output partition).
+* ``int`` — ``loaded`` is one full sub-matrix of a fused
+  ``MergedColumnParallelLinear``-style param. Used by
+  :class:`ColumnShardLoader` when ``output_partition_sizes`` has more
+  than one entry.
+* ``"q" | "k" | "v"`` — ``loaded`` is the full Q, K, or V matrix.
+  Used by :class:`QKVShardLoader`. K and V take the GQA replication
+  path on top of the column-shard slicing.
+
+Each loader rejects shapes its protocol does not handle, so a buggy
+checkpoint mapping fails at the first mismatched tensor instead of
+silently writing garbage.
 
 Loaders only carry their TP layout (``tp_rank``, ``tp_size``, partition
-sizes), not per-tensor state. So a column- or qkv-parallel layer hands the
-same instance to both its weight and its bias.
+sizes), not per-tensor state, so a column- or qkv-parallel layer hands
+the same instance to both its weight and its bias.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+
+ShardId = int | str | None
 
 
 class ReplicatedLoader:
@@ -35,13 +55,23 @@ class ReplicatedLoader:
     copy with no slicing.
     """
 
-    def load_full(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
+    def load_weight(
+        self,
+        param: nn.Parameter,
+        loaded: torch.Tensor,
+        shard_id: ShardId = None,
+    ) -> None:
+        if shard_id is not None:
+            raise ValueError(
+                f"ReplicatedLoader does not support sharded loads "
+                f"(got shard_id={shard_id!r})"
+            )
         if param.numel() == 1 and loaded.numel() == 1:
             param.data.fill_(loaded.item())
             return
         if param.shape != loaded.shape:
             raise ValueError(
-                f"ReplicatedLoader.load_full: param shape {tuple(param.shape)} "
+                f"ReplicatedLoader.load_weight: param shape {tuple(param.shape)} "
                 f"!= loaded shape {tuple(loaded.shape)}"
             )
         param.data.copy_(loaded)
@@ -55,7 +85,7 @@ class ColumnShardLoader:
     list ``[out // tp]``; for MergedColumnParallelLinear it's one entry per
     fused sub-matrix, e.g. ``[gate // tp, up // tp]``.
 
-    Both methods narrow on dim 0, which works equally well for the 2-D
+    Both code paths narrow on dim 0, which works equally well for the 2-D
     weight and the 1-D bias of the same layer, so a single instance can
     drive both.
     """
@@ -71,31 +101,39 @@ class ColumnShardLoader:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
 
-    def load_full(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
-        """Disk tensor is the global, un-sharded fused matrix."""
-        global_out = sum(self.output_partition_sizes) * self.tp_size
-        if loaded.shape[0] != global_out:
-            raise ValueError(
-                f"ColumnShardLoader.load_full: loaded.shape[0]={loaded.shape[0]} "
-                f"!= global_out={global_out}"
-            )
-        per_rank = sum(self.output_partition_sizes)
-        sliced = loaded.narrow(0, self.tp_rank * per_rank, per_rank)
-        param.data.copy_(sliced)
-
-    def load_shard(
+    def load_weight(
         self,
         param: nn.Parameter,
         loaded: torch.Tensor,
-        shard_id: int,
+        shard_id: ShardId = None,
     ) -> None:
-        """Disk tensor is one logical sub-matrix; write it into its slot.
+        n_slots = len(self.output_partition_sizes)
 
-        ``loaded`` carries only sub-matrix ``shard_id``, in its full global
-        width. We take this rank's slice of it and place it at offset
-        ``sum(partition_sizes[:shard_id])`` inside the fused parameter.
-        """
-        if shard_id < 0 or shard_id >= len(self.output_partition_sizes):
+        if shard_id is None:
+            # Non-fused layer: ``loaded`` is the whole un-sharded weight.
+            if n_slots != 1:
+                raise ValueError(
+                    f"ColumnShardLoader.load_weight: param is fused "
+                    f"({n_slots} slots, output_partition_sizes="
+                    f"{self.output_partition_sizes}); shard_id must be int"
+                )
+            per_rank = self.output_partition_sizes[0]
+            global_out = per_rank * self.tp_size
+            if loaded.shape[0] != global_out:
+                raise ValueError(
+                    f"ColumnShardLoader.load_weight: loaded.shape[0]="
+                    f"{loaded.shape[0]} != global_out={global_out}"
+                )
+            sliced = loaded.narrow(0, self.tp_rank * per_rank, per_rank)
+            param.data.copy_(sliced)
+            return
+
+        if not isinstance(shard_id, int) or isinstance(shard_id, bool):
+            raise TypeError(
+                f"ColumnShardLoader.load_weight: shard_id must be None or int, "
+                f"got {shard_id!r}"
+            )
+        if shard_id < 0 or shard_id >= n_slots:
             raise IndexError(
                 f"shard_id={shard_id} out of range for "
                 f"output_partition_sizes={self.output_partition_sizes}"
@@ -104,7 +142,7 @@ class ColumnShardLoader:
         global_size = per_rank * self.tp_size
         if loaded.shape[0] != global_size:
             raise ValueError(
-                f"ColumnShardLoader.load_shard({shard_id}): loaded.shape[0]="
+                f"ColumnShardLoader.load_weight({shard_id}): loaded.shape[0]="
                 f"{loaded.shape[0]} != global_size={global_size}"
             )
         offset = sum(self.output_partition_sizes[:shard_id])
@@ -123,15 +161,113 @@ class RowShardLoader:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
 
-    def load_full(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
+    def load_weight(
+        self,
+        param: nn.Parameter,
+        loaded: torch.Tensor,
+        shard_id: ShardId = None,
+    ) -> None:
+        if shard_id is not None:
+            raise ValueError(
+                f"RowShardLoader does not support sharded loads "
+                f"(got shard_id={shard_id!r})"
+            )
         shard = loaded.shape[1] // self.tp_size
         if shard * self.tp_size != loaded.shape[1]:
             raise ValueError(
-                f"RowShardLoader.load_full: in_dim={loaded.shape[1]} "
+                f"RowShardLoader.load_weight: in_dim={loaded.shape[1]} "
                 f"not divisible by tp_size={self.tp_size}"
             )
         sliced = loaded.narrow(1, self.tp_rank * shard, shard)
         param.data.copy_(sliced)
+
+
+class VocabShardLoader:
+    """Load a vocab embedding / LM head weight whose disk shape is ``(V_real, D)``
+    into a per-rank parameter of shape ``(V_padded // tp_size, D)``.
+
+    The layer pads ``num_embeddings`` up to ``num_embeddings_padded`` (a multiple
+    of ``tp_size``) so every rank holds the same chunk size. Padding rows that
+    extend past ``num_embeddings`` exist on at most one rank — the trailing
+    rank — and must read as zero so they contribute nothing to the lookup
+    output (after masked all-reduce) or to the LM-head logits.
+
+    Unlike :class:`ColumnShardLoader`, this loader cannot share its dim-0
+    ``narrow`` directly because the disk tensor's outer dim is ``V_real``, not
+    ``V_padded``. We compute the overlap of ``[start, end)`` with
+    ``[0, V_real)`` and only copy that intersection; the rest is zeroed.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_embeddings: int,
+        num_embeddings_padded: int,
+        tp_rank: int,
+        tp_size: int,
+    ) -> None:
+        if num_embeddings_padded % tp_size != 0:
+            raise ValueError(
+                f"VocabShardLoader: num_embeddings_padded={num_embeddings_padded} "
+                f"not divisible by tp_size={tp_size}"
+            )
+        if num_embeddings_padded < num_embeddings:
+            raise ValueError(
+                f"VocabShardLoader: num_embeddings_padded={num_embeddings_padded} "
+                f"< num_embeddings={num_embeddings}"
+            )
+        self.num_embeddings = num_embeddings
+        self.num_embeddings_padded = num_embeddings_padded
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+
+    def load_weight(
+        self,
+        param: nn.Parameter,
+        loaded: torch.Tensor,
+        shard_id: ShardId = None,
+    ) -> None:
+        """Copy this rank's slice of the full ``(V_real, ...)`` table and zero
+        any padding overhang.
+
+        Works for any rank where dim 0 is the vocab dimension: 2-D embedding
+        weights ``(V_real, D)`` and 1-D LM-head biases ``(V_real,)`` both flow
+        through unchanged.
+        """
+        if shard_id is not None:
+            raise ValueError(
+                f"VocabShardLoader does not support sharded loads "
+                f"(got shard_id={shard_id!r})"
+            )
+        per_rank = self.num_embeddings_padded // self.tp_size
+        if param.shape[0] != per_rank:
+            raise ValueError(
+                f"VocabShardLoader.load_weight: param.shape[0]={param.shape[0]} "
+                f"!= per_rank={per_rank}"
+            )
+        if loaded.shape[0] != self.num_embeddings:
+            raise ValueError(
+                f"VocabShardLoader.load_weight: loaded.shape[0]={loaded.shape[0]} "
+                f"!= num_embeddings={self.num_embeddings}"
+            )
+        if loaded.shape[1:] != param.shape[1:]:
+            raise ValueError(
+                f"VocabShardLoader.load_weight: trailing dims mismatch "
+                f"loaded={tuple(loaded.shape)} param={tuple(param.shape)}"
+            )
+
+        start = self.tp_rank * per_rank
+        end = start + per_rank
+        real_start = min(max(start, 0), self.num_embeddings)
+        real_end = min(end, self.num_embeddings)
+        n_real = max(0, real_end - real_start)
+
+        if n_real > 0:
+            sliced = loaded.narrow(0, real_start, n_real)
+            param.data.narrow(0, 0, n_real).copy_(sliced)
+        if n_real < per_rank:
+            # Padding rows on this rank must be exactly zero.
+            param.data.narrow(0, n_real, per_rank - n_real).zero_()
 
 
 class QKVShardLoader(ColumnShardLoader):
@@ -144,9 +280,10 @@ class QKVShardLoader(ColumnShardLoader):
     the disk tensor's outer dim is the un-replicated width and adjacent
     ranks within a replica group read the same slot.
 
-    ``load_full`` and ``load_shard`` are inherited unchanged. Their dim-0
-    narrow happens to work on both the 2-D fused weight and the 1-D fused
-    bias, so we don't need a separate bias path.
+    The fused full-disk path (``shard_id=None``) is unsupported — under
+    GQA the disk fused width would not equal ``sum(output_partition_sizes)
+    * tp_size`` because K/V on disk are un-replicated. Always pass
+    ``shard_id="q"|"k"|"v"`` and feed each natural sub-matrix separately.
     """
 
     _QKV_IDX = {"q": 0, "k": 1, "v": 2}
@@ -169,47 +306,46 @@ class QKVShardLoader(ColumnShardLoader):
             raise ValueError(f"num_kv_replicas must be ≥1, got {num_kv_replicas}")
         self.num_kv_replicas = num_kv_replicas
 
-    def load_qkv(
+    def load_weight(
         self,
         param: nn.Parameter,
         loaded: torch.Tensor,
-        shard_id: str,
+        shard_id: ShardId = None,
     ) -> None:
-        if shard_id not in self._QKV_IDX:
-            raise ValueError(f"shard_id must be one of q/k/v, got {shard_id!r}")
+        if not isinstance(shard_id, str) or shard_id not in self._QKV_IDX:
+            raise ValueError(
+                f"QKVShardLoader.load_weight: shard_id must be one of q/k/v, "
+                f"got {shard_id!r}"
+            )
         idx = self._QKV_IDX[shard_id]
         per_rank = self.output_partition_sizes[idx]
 
-        if idx == 0:
-            # Q is a plain column shard. Disk has the full global Q width.
-            global_size = per_rank * self.tp_size
-            if loaded.shape[0] != global_size:
-                raise ValueError(
-                    f"QKVShardLoader.load_qkv('q'): loaded.shape[0]="
-                    f"{loaded.shape[0]} != global_q={global_size}"
-                )
-            offset = 0
-            sliced = loaded.narrow(0, self.tp_rank * per_rank, per_rank)
-        else:
-            # K and V live on the un-replicated width on disk. This rank
-            # reads from partition (tp_rank // num_kv_replicas), which is
-            # how the same slice gets shared across the replica group.
-            disk_width = per_rank * self.tp_size // self.num_kv_replicas
-            if loaded.shape[0] != disk_width:
-                raise ValueError(
-                    f"QKVShardLoader.load_qkv({shard_id!r}): loaded.shape[0]="
-                    f"{loaded.shape[0]} != disk_width={disk_width}"
-                )
-            offset = sum(self.output_partition_sizes[:idx])
-            kv_rank = self.tp_rank // self.num_kv_replicas
-            sliced = loaded.narrow(0, kv_rank * per_rank, per_rank)
+        # Natural full-tensor width on disk: num_q_heads*head_dim for Q,
+        # num_kv_heads*head_dim for K/V. With GQA replication the K/V
+        # natural width is smaller than per_rank*tp_size — every replica
+        # group of ranks shares the same KV head, so dividing out the
+        # replica count recovers the original head count.
+        replica_factor = 1 if idx == 0 else self.num_kv_replicas
+        natural_width = per_rank * self.tp_size // replica_factor
+        if loaded.shape[0] != natural_width:
+            raise ValueError(
+                f"QKVShardLoader.load_weight({shard_id!r}): loaded.shape[0]="
+                f"{loaded.shape[0]} != natural_width={natural_width}"
+            )
+        # tp_rank picks the slot for Q. For K/V the same slot is shared
+        # across num_kv_replicas adjacent ranks, so we floor-divide.
+        slot_rank = self.tp_rank // replica_factor
+        offset = sum(self.output_partition_sizes[:idx])
+        sliced = loaded.narrow(0, slot_rank * per_rank, per_rank)
 
         param.data.narrow(0, offset, per_rank).copy_(sliced)
 
 
 __all__ = [
-    "ReplicatedLoader",
     "ColumnShardLoader",
-    "RowShardLoader",
     "QKVShardLoader",
+    "ReplicatedLoader",
+    "RowShardLoader",
+    "ShardId",
+    "VocabShardLoader",
 ]

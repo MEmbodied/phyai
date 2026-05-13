@@ -51,6 +51,7 @@ from phyai.layers.loaders import (
     ReplicatedLoader,
     RowShardLoader,
 )
+from phyai.layers.quant import AllocationRequest, WeightSpec
 from phyai.utils.cuda import sm_arch
 
 
@@ -118,6 +119,8 @@ __all__ = [
     "Bf16Spec",
     "Fp8Spec",
     "ActivationView",
+    "AllocationRequest",
+    "WeightSpec",
     "Granularity",
     # loaders
     "ColumnShardLoader",

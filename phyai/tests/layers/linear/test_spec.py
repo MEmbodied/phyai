@@ -9,13 +9,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from phyai.layers.linear.backend import Granularity
-from phyai.layers.linear.spec import (
+from phyai.layers.quant import (
     ActivationView,
+    AllocationRequest,
     Bf16Spec,
     Fp8Spec,
-    _convert_to_channelwise,
+    Granularity,
 )
+from phyai.layers.quant.fp8 import _convert_to_channelwise
 
 
 # ---------------------------------------------------------------------------
@@ -23,22 +24,29 @@ from phyai.layers.linear.spec import (
 # ---------------------------------------------------------------------------
 
 
+def _request(
+    *,
+    weight_shape: tuple[int, ...],
+    logical_widths: list[int] | None = None,
+    params_dtype: torch.dtype = torch.bfloat16,
+) -> AllocationRequest:
+    return AllocationRequest(
+        weight_shape=weight_shape,
+        logical_widths=logical_widths
+        if logical_widths is not None
+        else [weight_shape[0]],
+        fused_dim=0,
+        weight_loader=None,
+        params_dtype=params_dtype,
+    )
+
+
 def test_bf16_allocate_plain():
     layer = nn.Module()
-    Bf16Spec().allocate(
-        layer,
-        input_size_per_partition=32,
-        output_partition_sizes=[64],
-        input_size_global=32,
-        output_size_global=64,
-        params_dtype=torch.bfloat16,
-        weight_loader=None,
-    )
+    Bf16Spec().allocate(layer, _request(weight_shape=(64, 32)))
     assert layer.weight.shape == (64, 32)
     assert layer.weight.dtype == torch.bfloat16
     assert not hasattr(layer, "weight_scale")
-    assert layer.input_size_per_partition == 32
-    assert layer.output_size_per_partition == 64
     assert layer.logical_widths == [64]
 
 
@@ -46,41 +54,24 @@ def test_bf16_allocate_fused_sizes():
     layer = nn.Module()
     Bf16Spec().allocate(
         layer,
-        input_size_per_partition=16,
-        output_partition_sizes=[32, 16, 16],
-        input_size_global=16,
-        output_size_global=64,
-        params_dtype=torch.bfloat16,
-        weight_loader=None,
+        _request(weight_shape=(64, 16), logical_widths=[32, 16, 16]),
     )
     assert layer.weight.shape == (64, 16)
+    assert layer.logical_widths == [32, 16, 16]
 
 
 def test_bf16_respects_params_dtype():
     layer = nn.Module()
     Bf16Spec().allocate(
         layer,
-        input_size_per_partition=16,
-        output_partition_sizes=[16],
-        input_size_global=16,
-        output_size_global=16,
-        params_dtype=torch.float16,
-        weight_loader=None,
+        _request(weight_shape=(16, 16), params_dtype=torch.float16),
     )
     assert layer.weight.dtype == torch.float16
 
 
 def test_bf16_process_after_loading_noop():
     layer = nn.Module()
-    Bf16Spec().allocate(
-        layer,
-        input_size_per_partition=16,
-        output_partition_sizes=[16],
-        input_size_global=16,
-        output_size_global=16,
-        params_dtype=torch.bfloat16,
-        weight_loader=None,
-    )
+    Bf16Spec().allocate(layer, _request(weight_shape=(16, 16)))
     # Fill with deterministic values so torch.equal doesn't trip over NaNs
     # that torch.empty may leave behind.
     layer.weight.data.fill_(0.5)
@@ -89,14 +80,15 @@ def test_bf16_process_after_loading_noop():
     assert torch.equal(layer.weight.data, before)
 
 
-def test_bf16_quantize_activation_identity():
+def test_bf16_does_not_set_size_attrs():
+    """``layer.input_size_per_partition`` etc. are linear-specific now —
+    the spec is op-agnostic and must not write them."""
     layer = nn.Module()
-    x = torch.randn(4, 16, dtype=torch.bfloat16)
-    act = Bf16Spec().quantize_activation(x, layer)
-    assert isinstance(act, ActivationView)
-    assert act.x is x
-    assert act.x_scale is None
-    assert act.granularity == Granularity.PER_TENSOR
+    Bf16Spec().allocate(layer, _request(weight_shape=(64, 32)))
+    assert not hasattr(layer, "input_size_per_partition")
+    assert not hasattr(layer, "output_size_per_partition")
+    assert not hasattr(layer, "input_size_global")
+    assert not hasattr(layer, "output_size_global")
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +101,7 @@ def test_fp8_per_tensor_shapes_pre_and_post_loading():
     layer = nn.Module()
     spec.allocate(
         layer,
-        input_size_per_partition=64,
-        output_partition_sizes=[32, 16],  # two logical matrices
-        input_size_global=64,
-        output_size_global=48,
-        params_dtype=torch.bfloat16,
-        weight_loader=None,
+        _request(weight_shape=(48, 64), logical_widths=[32, 16]),
     )
     assert layer.weight.shape == (48, 64)
     assert layer.weight.dtype == torch.float8_e4m3fn
@@ -130,15 +117,7 @@ def test_fp8_per_tensor_shapes_pre_and_post_loading():
 def test_fp8_per_channel_shapes():
     spec = Fp8Spec(granularity=Granularity.PER_CHANNEL)
     layer = nn.Module()
-    spec.allocate(
-        layer,
-        input_size_per_partition=64,
-        output_partition_sizes=[128],
-        input_size_global=64,
-        output_size_global=128,
-        params_dtype=torch.bfloat16,
-        weight_loader=None,
-    )
+    spec.allocate(layer, _request(weight_shape=(128, 64)))
     assert layer.weight.shape == (128, 64)
     assert layer.weight.dtype == torch.float8_e4m3fn
     assert layer.weight_scale.shape == (128,)
@@ -149,15 +128,7 @@ def test_fp8_per_channel_shapes():
 def test_fp8_block_shapes():
     spec = Fp8Spec(granularity=Granularity.BLOCK, block_shape=(128, 128))
     layer = nn.Module()
-    spec.allocate(
-        layer,
-        input_size_per_partition=256,
-        output_partition_sizes=[384],
-        input_size_global=256,
-        output_size_global=384,
-        params_dtype=torch.bfloat16,
-        weight_loader=None,
-    )
+    spec.allocate(layer, _request(weight_shape=(384, 256)))
     assert layer.weight.shape == (384, 256)
     assert layer.weight_scale.shape == (3, 2)  # 384/128 x 256/128
     assert spec.spec_id == "fp8_block_128_128"
@@ -172,14 +143,20 @@ def test_fp8_block_enforces_divisibility():
     spec = Fp8Spec(granularity=Granularity.BLOCK, block_shape=(128, 128))
     layer = nn.Module()
     with pytest.raises(ValueError, match="not divisible"):
+        spec.allocate(layer, _request(weight_shape=(256, 100)))
+
+
+def test_fp8_rejects_non_2d_shape():
+    spec = Fp8Spec(granularity=Granularity.PER_CHANNEL)
+    layer = nn.Module()
+    with pytest.raises(ValueError, match="2-D weight_shape"):
         spec.allocate(
             layer,
-            input_size_per_partition=100,  # not /128
-            output_partition_sizes=[256],
-            input_size_global=100,
-            output_size_global=256,
-            params_dtype=torch.bfloat16,
-            weight_loader=None,
+            AllocationRequest(
+                weight_shape=(8, 16, 32),
+                logical_widths=[8],
+                weight_loader=None,
+            ),
         )
 
 
@@ -192,17 +169,10 @@ def test_convert_to_channelwise_basic():
 def test_fp8_quantize_activation_per_tensor():
     spec = Fp8Spec(granularity=Granularity.PER_TENSOR)
     layer = nn.Module()
-    spec.allocate(
-        layer,
-        input_size_per_partition=16,
-        output_partition_sizes=[32],
-        input_size_global=16,
-        output_size_global=32,
-        params_dtype=torch.bfloat16,
-        weight_loader=None,
-    )
+    spec.allocate(layer, _request(weight_shape=(32, 16)))
     x = torch.randn(4, 16)
     act = spec.quantize_activation(x, layer)
+    assert isinstance(act, ActivationView)
     assert act.x.dtype == torch.float8_e4m3fn
     assert act.x_scale is layer.input_scale
     assert act.granularity == Granularity.PER_TENSOR
@@ -211,15 +181,7 @@ def test_fp8_quantize_activation_per_tensor():
 def test_fp8_quantize_activation_per_channel_rowwise():
     spec = Fp8Spec(granularity=Granularity.PER_CHANNEL)
     layer = nn.Module()
-    spec.allocate(
-        layer,
-        input_size_per_partition=16,
-        output_partition_sizes=[32],
-        input_size_global=16,
-        output_size_global=32,
-        params_dtype=torch.bfloat16,
-        weight_loader=None,
-    )
+    spec.allocate(layer, _request(weight_shape=(32, 16)))
     x = torch.randn(4, 16) * 5.0
     act = spec.quantize_activation(x, layer)
     assert act.x.dtype == torch.float8_e4m3fn
@@ -229,7 +191,6 @@ def test_fp8_quantize_activation_per_channel_rowwise():
 
 def test_fp8_needs_act_quant_true():
     assert Fp8Spec(granularity=Granularity.PER_CHANNEL).needs_act_quant is True
-    assert Bf16Spec().needs_act_quant is False
 
 
 def test_fp8_spec_id_format():

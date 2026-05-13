@@ -31,7 +31,7 @@ def test_column_load_full_ws1():
     )
     param = _param((8, 4))
     full = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-    loader.load_full(param, full)
+    loader.load_weight(param, full)
     assert torch.equal(param.data, full)
 
 
@@ -44,7 +44,7 @@ def test_column_load_full_ws2_rank1():
     )
     param = _param((4, 4))
     full = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-    loader.load_full(param, full)
+    loader.load_weight(param, full)
     expected = full.narrow(0, 4, 4)
     assert torch.equal(param.data, expected)
 
@@ -57,7 +57,7 @@ def test_column_load_full_shape_mismatch():
     )
     param = _param((4, 4))
     with pytest.raises(ValueError, match="global_out"):
-        loader.load_full(param, torch.zeros(10, 4))
+        loader.load_weight(param, torch.zeros(10, 4))
 
 
 def test_column_load_shard_into_fused_param():
@@ -70,13 +70,13 @@ def test_column_load_shard_into_fused_param():
     param = _param((6, 4))
     # shard 0: global width 8, this rank wants rows 0..4
     disk0 = torch.full((8, 4), 1.0)
-    loader.load_shard(param, disk0, shard_id=0)
+    loader.load_weight(param, disk0, shard_id=0)
     assert torch.all(param.data[:4] == 1.0)
     assert torch.all(param.data[4:] == 0.0)
 
     # shard 1: global width 4, this rank wants rows 0..2
     disk1 = torch.full((4, 4), 7.0)
-    loader.load_shard(param, disk1, shard_id=1)
+    loader.load_weight(param, disk1, shard_id=1)
     assert torch.all(param.data[4:6] == 7.0)
 
 
@@ -89,7 +89,7 @@ def test_column_load_shard_rank_isolation():
     )
     param = _param((4, 4))
     disk = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-    loader.load_shard(param, disk, shard_id=0)
+    loader.load_weight(param, disk, shard_id=0)
     assert torch.equal(param.data, disk.narrow(0, 4, 4))
 
 
@@ -101,7 +101,7 @@ def test_column_load_shard_out_of_range():
     )
     param = _param((4, 4))
     with pytest.raises(IndexError):
-        loader.load_shard(param, torch.zeros(4, 4), shard_id=5)
+        loader.load_weight(param, torch.zeros(4, 4), shard_id=5)
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ def test_row_load_full_ws1():
     loader = RowShardLoader(tp_rank=0, tp_size=1)
     param = _param((4, 8))
     full = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-    loader.load_full(param, full)
+    loader.load_weight(param, full)
     assert torch.equal(param.data, full)
 
 
@@ -121,7 +121,7 @@ def test_row_load_full_ws2_rank0():
     loader = RowShardLoader(tp_rank=0, tp_size=2)
     param = _param((4, 4))
     full = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-    loader.load_full(param, full)
+    loader.load_weight(param, full)
     assert torch.equal(param.data, full.narrow(1, 0, 4))
 
 
@@ -129,7 +129,7 @@ def test_row_load_full_ws2_rank1():
     loader = RowShardLoader(tp_rank=1, tp_size=2)
     param = _param((4, 4))
     full = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-    loader.load_full(param, full)
+    loader.load_weight(param, full)
     assert torch.equal(param.data, full.narrow(1, 4, 4))
 
 
@@ -137,7 +137,7 @@ def test_row_load_full_indivisible():
     loader = RowShardLoader(tp_rank=0, tp_size=2)
     param = _param((4, 3))
     with pytest.raises(ValueError, match="not divisible"):
-        loader.load_full(param, torch.zeros(4, 7))
+        loader.load_weight(param, torch.zeros(4, 7))
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +158,9 @@ def test_qkv_loader_shard_offsets_no_gqa():
     k_full = torch.full((8, 4), 2.0)
     v_full = torch.full((8, 4), 3.0)
 
-    loader.load_qkv(param, q_full, "q")
-    loader.load_qkv(param, k_full, "k")
-    loader.load_qkv(param, v_full, "v")
+    loader.load_weight(param, q_full, "q")
+    loader.load_weight(param, k_full, "k")
+    loader.load_weight(param, v_full, "v")
 
     assert torch.all(param.data[0:8] == 1.0)
     assert torch.all(param.data[8:16] == 2.0)
@@ -181,9 +181,9 @@ def test_qkv_loader_gqa_replicates_kv():
     param = _param((4, 4))  # 2 + 1 + 1
     q_full = torch.full((8, 4), 0.5)
     kv_full = torch.full((2, 4), 9.0)
-    loader.load_qkv(param, q_full, "q")
-    loader.load_qkv(param, kv_full, "k")
-    loader.load_qkv(param, kv_full, "v")
+    loader.load_weight(param, q_full, "q")
+    loader.load_weight(param, kv_full, "k")
+    loader.load_weight(param, kv_full, "v")
 
     # rank 0 → q rows 0..2
     assert torch.all(param.data[0:2] == 0.5)
@@ -202,7 +202,7 @@ def test_qkv_loader_rejects_bad_shard_id():
     )
     param = _param((12, 4))
     with pytest.raises(ValueError, match="q/k/v"):
-        loader.load_qkv(param, torch.zeros(4, 4), "x")
+        loader.load_weight(param, torch.zeros(4, 4), "x")
 
 
 def test_qkv_loader_rejects_bad_num_replicas():
@@ -225,8 +225,8 @@ def test_qkv_loader_q_shape_mismatch():
         tp_size=1,
     )
     param = _param((12, 4))
-    with pytest.raises(ValueError, match="global_q"):
-        loader.load_qkv(param, torch.zeros(8, 4), "q")
+    with pytest.raises(ValueError, match="natural_width"):
+        loader.load_weight(param, torch.zeros(8, 4), "q")
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +238,7 @@ def test_replicated_load_full_copies_2d():
     loader = ReplicatedLoader()
     param = _param((4, 8))
     src = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-    loader.load_full(param, src)
+    loader.load_weight(param, src)
     assert torch.equal(param.data, src)
 
 
@@ -246,7 +246,7 @@ def test_replicated_load_full_copies_1d_bias():
     loader = ReplicatedLoader()
     param = _param((16,))
     src = torch.arange(16, dtype=torch.float32)
-    loader.load_full(param, src)
+    loader.load_weight(param, src)
     assert torch.equal(param.data, src)
 
 
@@ -254,7 +254,7 @@ def test_replicated_load_full_scalar_broadcast():
     """A 1-element saved scalar fills a 1-element parameter."""
     loader = ReplicatedLoader()
     param = _param((1,))
-    loader.load_full(param, torch.tensor([3.5]))
+    loader.load_weight(param, torch.tensor([3.5]))
     assert param.item() == 3.5
 
 
@@ -262,4 +262,4 @@ def test_replicated_load_full_shape_mismatch():
     loader = ReplicatedLoader()
     param = _param((8,))
     with pytest.raises(ValueError, match="shape"):
-        loader.load_full(param, torch.zeros(4))
+        loader.load_weight(param, torch.zeros(4))

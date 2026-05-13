@@ -6,6 +6,7 @@ from phyai_kernel.triton import (
     fused_add_rmsnorm,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
+    masked_embedding_lookup,
     rmsnorm,
     rmsnorm_hf,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "gemma_rmsnorm",
     "jit",
     "jit_utils",
+    "masked_embedding_lookup",
     "rmsnorm",
     "rmsnorm_hf",
 ]

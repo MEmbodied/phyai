@@ -48,6 +48,17 @@ class Mesh:
             self._topo = _infer_topology(self.torch_mesh)
         return self._topo
 
+    def __repr__(self) -> str:
+        names = self.torch_mesh.mesh_dim_names
+        if not names:
+            return f"Mesh(name={self.name!r}, size={self.torch_mesh.size()})"
+        # ``rank/size`` per axis: where this process sits, plus the axis width.
+        # Reads as "tp axis: rank 3 out of 8".
+        parts = [
+            f"{ax}={self.axis_local_rank(ax)}/{self.axis_size(ax)}" for ax in names
+        ]
+        return f"Mesh(name={self.name!r}, {', '.join(parts)})"
+
 
 def _infer_topology(torch_mesh: DeviceMesh) -> Topology:
     """Coarse topology inference. Conservative defaults are fine here —
