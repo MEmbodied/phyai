@@ -15,10 +15,8 @@ Five public entry points:
 
 All kernels are single-pass: each program handles one row, the row is loaded
 into registers/SRAM as a contiguous block padded to ``next_power_of_2(D)``.
-This matches SGLang's ``RMSNormKernel`` shape regime; for ``D`` larger
-than the on-chip block we fall back to a numerically-equivalent two-pass
-kernel. Reductions and the multiply are always done in fp32 to match the
-reference implementations.
+For ``D`` larger than the on-chip block we fall back to a numerically-equivalent
+two-pass kernel. Reductions and the multiply are always done in fp32.
 """
 
 from __future__ import annotations
@@ -67,9 +65,8 @@ def _rmsnorm_fwd_kernel(
         w = w + 1.0
 
     if HF_SEMANTICS:
-        # Cast back to activation dtype before weight multiply (LlamaRMSNorm
-        # in HF transformers). The narrow-dtype multiply costs a tiny bit of
-        # accuracy but matches HF/Qwen exactly.
+        # Cast x_hat back to activation dtype before the weight multiply.
+        # The narrow-dtype multiply costs a tiny bit of accuracy.
         x_hat = x_hat.to(out_ptr.dtype.element_ty)
         out = x_hat * w.to(out_ptr.dtype.element_ty)
     else:
@@ -383,8 +380,7 @@ def rmsnorm_hf(
     """RMSNorm with HuggingFace ``LlamaRMSNorm`` semantics.
 
     Differs from :func:`rmsnorm` only in that the cast back to ``x.dtype``
-    happens BEFORE the weight multiply, matching HF transformers and the
-    Qwen3 q/k norm path. Used by ``rmsnorm_hf`` in sglang's jit_kernel.
+    happens BEFORE the weight multiply.
     """
     _check_inputs(x, weight)
     x2d, _, orig_shape = _flatten_input(x)

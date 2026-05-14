@@ -17,16 +17,12 @@ Two classes, intentionally independent:
   rather than a post-hoc ``tie_weights()`` mutation.
 
 Padding: ``num_embeddings`` is rounded up to a multiple of
-``tp_size * padding_multiple`` (default ``padding_multiple=64``). Padding
-rows are zero-filled by :class:`phyai.layers.loaders.VocabShardLoader`,
-so embeddings of out-of-range token ids are guaranteed-zero rows and
-LM-head logits over padding columns are guaranteed-zero scalars — no
-sampler reindex needed.
-
-Differences from SGLang's ``vocab_parallel_embedding.py`` are documented
-in ``plans/synchronous-stargazing-moler.md``; the most important are:
-no four-section LoRA layout, no ``tie_weights()`` mutation, no
-``method_has_implemented_embedding`` quant-method indirection.
+``tp_size * padding_multiple`` (default ``padding_multiple=64``). The
+trailing rank produces a :class:`~phyai.layers.placement.ZeroPlacement`
+for its padding overhang in addition to the :class:`CopyPlacement` for
+the real-vocab portion, so embeddings of out-of-range token ids are
+guaranteed-zero rows and LM-head logits over padding columns are
+guaranteed-zero scalars — no sampler reindex needed.
 """
 
 from __future__ import annotations
@@ -38,7 +34,13 @@ import torch.nn as nn
 
 import phyai.parallel as P
 from phyai.layers.linear.dispatch import get_linear_dispatcher
-from phyai.layers.loaders import VocabShardLoader
+from phyai.layers.placement import (
+    CopyPlacement,
+    Placement,
+    Slice1D,
+    ZeroPlacement,
+    split_prefix,
+)
 from phyai.layers.quant import AllocationRequest
 from phyai.layers.quant.bf16 import Bf16Spec
 from phyai.layers.vocab_embedding.ops import masked_embedding_lookup
@@ -69,6 +71,50 @@ def _M_of(x: torch.Tensor) -> int:
     return M
 
 
+def _vocab_placements(
+    *,
+    prefix: str,
+    num_embeddings: int,
+    num_embeddings_padded: int,
+    tp_rank: int,
+    tp_size: int,
+) -> list[Placement]:
+    """Per-rank placements for a vocab-parallel weight.
+
+    Both :class:`VocabParallelEmbedding` and the un-tied
+    :class:`ParallelLMHead` write the same on-disk ``(V_real, D)``
+    HF tensor into the same per-rank ``(V_padded // tp_size, D)`` shape,
+    so they share one helper.
+    """
+    parent, own = split_prefix(prefix)
+    hf_base = f"{parent}.{own}" if parent else own
+    per_rank = num_embeddings_padded // tp_size
+    start = tp_rank * per_rank
+    end = start + per_rank
+    real_start = min(max(start, 0), num_embeddings)
+    real_end = min(end, num_embeddings)
+    n_real = max(0, real_end - real_start)
+
+    out: list[Placement] = []
+    if n_real > 0:
+        out.append(
+            CopyPlacement(
+                hf_key=f"{hf_base}.weight",
+                phyai_key=f"{prefix}.weight",
+                src_slices=(Slice1D(0, real_start, n_real),),
+                dst_slices=(Slice1D(0, 0, n_real),),
+            )
+        )
+    if n_real < per_rank:
+        out.append(
+            ZeroPlacement(
+                phyai_key=f"{prefix}.weight",
+                dst_slices=(Slice1D(0, n_real, per_rank - n_real),),
+            )
+        )
+    return out
+
+
 class VocabParallelEmbedding(nn.Module):
     """V-sharded input embedding with masked-lookup + all-reduce.
 
@@ -78,14 +124,17 @@ class VocabParallelEmbedding(nn.Module):
         params_dtype: dtype for the weight tensor; defaults to torch default.
         spec: :class:`phyai.layers.quant.WeightSpec` controlling allocation
             (default :class:`Bf16Spec`).
-        layout: kept for API symmetry; only ``"vocab_parallel"`` is
-            implemented in this version. ``"hidden_parallel"`` (D-shard)
-            and ``"replicated"`` are reserved for future work.
+        layout: must be ``"vocab_parallel"``.
         padding_multiple: per-rank chunks are padded to this multiple.
-            Default 64 (matches SGLang); FP8/INT4 may want 128/256.
+            Default 64; FP8/INT4 may want 128/256.
+        embed_scale: post-lookup scale factor. Default ``1.0`` (no-op).
+            Set to ``hidden_size ** 0.5`` for Gemma / PaliGemma-style scaled
+            input embeddings. Applied at forward time (post-lookup,
+            post-all_reduce) rather than baked into the weight, so that a
+            tied :class:`ParallelLMHead` sees the un-scaled weight.
         axis: mesh axis used for the V split. Default ``"tp"``.
         mesh: mesh name (default ``"model"``).
-        prefix: state-dict prefix; carried for parity with linear layers.
+        prefix: state-dict prefix.
     """
 
     def __init__(
@@ -97,6 +146,7 @@ class VocabParallelEmbedding(nn.Module):
         spec: object | None = None,
         layout: Literal["vocab_parallel"] = "vocab_parallel",
         padding_multiple: int = 64,
+        embed_scale: float = 1.0,
         axis: str = "tp",
         mesh: str = "model",
         prefix: str = "",
@@ -104,19 +154,28 @@ class VocabParallelEmbedding(nn.Module):
         super().__init__()
         if layout != "vocab_parallel":
             raise NotImplementedError(
-                f"VocabParallelEmbedding currently only supports "
-                f"'vocab_parallel' layout; got {layout!r}. (D-shard and "
-                f"replicated layouts are reserved for future work — see "
-                f"plans/synchronous-stargazing-moler.md.)"
+                f"VocabParallelEmbedding only supports 'vocab_parallel' layout; "
+                f"got {layout!r}."
             )
         if num_embeddings <= 0:
             raise ValueError(f"num_embeddings must be positive, got {num_embeddings}")
         if embedding_dim <= 0:
             raise ValueError(f"embedding_dim must be positive, got {embedding_dim}")
+        if not (embed_scale > 0):
+            raise ValueError(f"embed_scale must be positive, got {embed_scale}")
 
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.spec = spec if spec is not None else Bf16Spec()
         self.prefix = prefix
+        self.embed_scale = float(embed_scale)
+        # Only allocate a buffer when scale is non-trivial; the forward
+        # uses ``!= 1.0`` to skip the multiply entirely.
+        if self.embed_scale != 1.0:
+            self.register_buffer(
+                "_embed_scale_t",
+                torch.tensor(self.embed_scale, dtype=torch.float32),
+                persistent=False,
+            )
 
         mesh_obj = resolve_mesh(mesh)
         self.mesh_name = mesh_obj.name
@@ -142,19 +201,12 @@ class VocabParallelEmbedding(nn.Module):
         # but padding rows (pathological V << V_padded case).
         self.shard_end = max(raw_start, min(raw_end, self.num_embeddings))
 
-        loader = VocabShardLoader(
-            num_embeddings=self.num_embeddings,
-            num_embeddings_padded=self.num_embeddings_padded,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-        )
         self.spec.allocate(
             self,
             AllocationRequest(
                 weight_shape=(self.num_embeddings_per_partition, embedding_dim),
                 logical_widths=[self.num_embeddings_per_partition],
                 fused_dim=0,
-                weight_loader=loader,
                 params_dtype=self.params_dtype,
             ),
         )
@@ -168,16 +220,30 @@ class VocabParallelEmbedding(nn.Module):
         )
         if self.tp_size > 1:
             local = P.all_reduce(local, axis=self.axis, mesh=self.mesh_name)
+        if self.embed_scale != 1.0:
+            local = local * self._embed_scale_t.to(local.dtype)
         return local
 
+    def placements(self) -> list[Placement]:
+        return _vocab_placements(
+            prefix=self.prefix,
+            num_embeddings=self.num_embeddings,
+            num_embeddings_padded=self.num_embeddings_padded,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+
     def extra_repr(self) -> str:
-        return (
+        s = (
             f"num_embeddings={self.num_embeddings}, "
             f"embedding_dim={self.embedding_dim}, "
             f"per_partition={self.num_embeddings_per_partition}, "
             f"padded={self.num_embeddings_padded}, "
             f"tp_size={self.tp_size}, axis={self.axis!r}"
         )
+        if self.embed_scale != 1.0:
+            s += f", embed_scale={self.embed_scale}"
+        return s
 
 
 class ParallelLMHead(nn.Module):
@@ -191,7 +257,7 @@ class ParallelLMHead(nn.Module):
     Args:
         embedding_dim: hidden size ``D`` (input dim).
         num_embeddings: real vocab size ``V``.
-        bias: not yet supported in this version (raises if True).
+        bias: must be ``False``.
         params_dtype, spec, padding_multiple, axis, mesh, prefix: as for
             :class:`VocabParallelEmbedding`.
         tied_weight: if provided, the LM head shares this :class:`nn.Parameter`
@@ -222,10 +288,7 @@ class ParallelLMHead(nn.Module):
     ) -> None:
         super().__init__()
         if bias:
-            raise NotImplementedError(
-                "ParallelLMHead bias=True is not supported in this version; "
-                "LM heads in modern LLMs (Llama, Qwen, Gemma) are bias-free."
-            )
+            raise NotImplementedError("ParallelLMHead bias=True is not supported.")
         if num_embeddings <= 0:
             raise ValueError(f"num_embeddings must be positive, got {num_embeddings}")
         if embedding_dim <= 0:
@@ -266,8 +329,7 @@ class ParallelLMHead(nn.Module):
             if self.spec.spec_id != "bf16":
                 raise NotImplementedError(
                     f"ParallelLMHead tied_weight is only supported for "
-                    f"bf16-style specs in this version; got "
-                    f"spec_id={self.spec.spec_id!r}"
+                    f"bf16-style specs; got spec_id={self.spec.spec_id!r}"
                 )
             expected_shape = (self.num_embeddings_per_partition, embedding_dim)
             if tuple(tied_weight.shape) != expected_shape:
@@ -277,23 +339,18 @@ class ParallelLMHead(nn.Module):
                 )
             self.weight = tied_weight
             self.logical_widths = [self.num_embeddings_per_partition]
+            self._tied = True
         else:
-            loader = VocabShardLoader(
-                num_embeddings=self.num_embeddings,
-                num_embeddings_padded=self.num_embeddings_padded,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-            )
             self.spec.allocate(
                 self,
                 AllocationRequest(
                     weight_shape=(self.num_embeddings_per_partition, embedding_dim),
                     logical_widths=[self.num_embeddings_per_partition],
                     fused_dim=0,
-                    weight_loader=loader,
                     params_dtype=self.params_dtype,
                 ),
             )
+            self._tied = False
 
         self.register_parameter("bias", None)
 
@@ -310,6 +367,18 @@ class ParallelLMHead(nn.Module):
         if self.gather_output and self.tp_size > 1:
             y = P.all_gather(y, axis=self.axis, dim=-1, mesh=self.mesh_name)
         return y
+
+    def placements(self) -> list[Placement]:
+        """Empty list when tied — the embedding owns the placements."""
+        if self._tied:
+            return []
+        return _vocab_placements(
+            prefix=self.prefix,
+            num_embeddings=self.num_embeddings,
+            num_embeddings_padded=self.num_embeddings_padded,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
 
     def extra_repr(self) -> str:
         return (

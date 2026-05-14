@@ -4,10 +4,7 @@ Two reasons this is wrapped as ``torch.library.custom_op`` rather than called
 inline from the layer's ``forward``:
 
 * **Graph capture stability.** Dynamo / ``torch.compile`` see an opaque op and
-  do not re-trace the masking + gather path on every call. SGLang's reference
-  implementation relies on ``@torch.compile(dynamic=True)`` to fuse the same
-  pointwise pattern; the custom-op approach is structurally cleaner and avoids
-  having to ``disable=`` it on backends without a working compiler.
+  do not re-trace the masking + gather path on every call.
 
 * **Backend pluggability.** The default implementation forwards to the Triton
   kernel on CUDA and to a pure-PyTorch fallback elsewhere; a future CUDA

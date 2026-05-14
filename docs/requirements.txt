@@ -1,0 +1,9 @@
+sphinx
+pydata-sphinx-theme
+sphinx-design
+sphinxcontrib-napoleon
+myst-parser
+breathe
+exhale
+sphinx-autoapi
+astroid

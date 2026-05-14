@@ -20,6 +20,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import phyai.layers.linear as L
+from phyai.layers.placement import (
+    CopyPlacement,
+    Slice1D,
+    apply_placements,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +174,7 @@ def test_merged_column_construct_fused_weight(fake_mesh):
     assert layer.output_sizes_global == [16, 16]
 
 
-def test_merged_column_loader_addresses_two_shards(fake_mesh):
+def test_merged_column_placements_two_shards(fake_mesh):
     fake_mesh(sizes={"tp": 2})
     _init_default_dispatcher()
     layer = L.MergedColumnParallelLinear(
@@ -178,20 +183,60 @@ def test_merged_column_loader_addresses_two_shards(fake_mesh):
         axis="tp",
         bias=False,
         params_dtype=torch.bfloat16,
+        prefix="model.layers.0.mlp.gate_up_proj",
     )
     # Per-rank partition sizes.
     assert layer.output_partition_sizes == [8, 8]
     assert layer.weight.shape == (16, 16)
 
-    loader = layer.weight.loader
-    # Load shard 0: disk is (16, 16), rank 0 takes rows 0..8.
-    disk = torch.arange(16 * 16, dtype=torch.bfloat16).reshape(16, 16)
-    loader.load_weight(layer.weight, disk, shard_id=0)
-    expected = disk.narrow(0, 0, 8)
-    assert torch.equal(layer.weight.data[:8], expected)
-    # shard 1 lives at rows [8:16).
-    loader.load_weight(layer.weight, disk, shard_id=1)
-    assert torch.equal(layer.weight.data[8:16], expected)
+    plans = layer.placements()
+    # Two CopyPlacements (gate, up) — bias=False so no extras.
+    assert len(plans) == 2
+
+    # gate_proj.weight → first half of dst, src rows 0..8 (rank 0).
+    assert plans[0] == CopyPlacement(
+        hf_key="model.layers.0.mlp.gate_proj.weight",
+        phyai_key="model.layers.0.mlp.gate_up_proj.weight",
+        src_slices=(Slice1D(0, 0, 8),),
+        dst_slices=(Slice1D(0, 0, 8),),
+    )
+    # up_proj.weight → second half of dst.
+    assert plans[1] == CopyPlacement(
+        hf_key="model.layers.0.mlp.up_proj.weight",
+        phyai_key="model.layers.0.mlp.gate_up_proj.weight",
+        src_slices=(Slice1D(0, 0, 8),),
+        dst_slices=(Slice1D(0, 8, 8),),
+    )
+
+    # Apply: feed disk gate/up tensors, check fused weight is laid out
+    # as [gate_rank0; up_rank0].
+    disk_gate = torch.full((16, 16), 1.0, dtype=torch.bfloat16)
+    disk_up = torch.full((16, 16), 2.0, dtype=torch.bfloat16)
+    apply_placements(
+        plans,
+        {
+            "model.layers.0.mlp.gate_proj.weight": disk_gate,
+            "model.layers.0.mlp.up_proj.weight": disk_up,
+        }.__getitem__,
+        {"model.layers.0.mlp.gate_up_proj.weight": layer.weight.data},
+    )
+    assert torch.all(layer.weight.data[0:8] == 1.0)
+    assert torch.all(layer.weight.data[8:16] == 2.0)
+
+
+def test_merged_column_placements_with_custom_hf_names(fake_mesh):
+    fake_mesh(sizes={"tp": 1})
+    _init_default_dispatcher()
+    layer = L.MergedColumnParallelLinear(
+        in_features=16,
+        output_sizes=[8, 8],
+        axis="tp",
+        bias=False,
+        prefix="block.mlp.w12",
+    )
+    plans = layer.placements(hf_names=("w_gate", "w_up"))
+    assert plans[0].hf_key == "block.mlp.w_gate.weight"
+    assert plans[1].hf_key == "block.mlp.w_up.weight"
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +296,7 @@ def test_qkv_linear_rejects_nonmultiple_tp(fake_mesh):
         )
 
 
-def test_qkv_linear_loads_q_k_v_shards(fake_mesh):
+def test_qkv_linear_placements_q_k_v_shards(fake_mesh):
     fake_mesh(sizes={"tp": 1})
     _init_default_dispatcher()
     layer = L.QKVParallelLinear(
@@ -262,21 +307,164 @@ def test_qkv_linear_loads_q_k_v_shards(fake_mesh):
         axis="tp",
         bias=False,
         params_dtype=torch.bfloat16,
+        prefix="model.layers.0.self_attn.qkv_proj",
     )
-    loader = layer.weight.loader
-    assert isinstance(loader, L.QKVShardLoader)
+
+    plans = layer.placements()
+    # Q, K, V — bias=False so 3 placements.
+    assert len(plans) == 3
+    assert [p.hf_key for p in plans] == [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+    ]
+    # All write into qkv_proj.weight at offsets 0 / 8 / 16 (each is 8 rows).
+    assert plans[0].dst_slices == (Slice1D(0, 0, 8),)
+    assert plans[1].dst_slices == (Slice1D(0, 8, 8),)
+    assert plans[2].dst_slices == (Slice1D(0, 16, 8),)
 
     disk_q = torch.full((2 * 4, 16), 1.0, dtype=torch.bfloat16)
     disk_k = torch.full((2 * 4, 16), 2.0, dtype=torch.bfloat16)
     disk_v = torch.full((2 * 4, 16), 3.0, dtype=torch.bfloat16)
-    loader.load_weight(layer.weight, disk_q, "q")
-    loader.load_weight(layer.weight, disk_k, "k")
-    loader.load_weight(layer.weight, disk_v, "v")
-
+    apply_placements(
+        plans,
+        {
+            "model.layers.0.self_attn.q_proj.weight": disk_q,
+            "model.layers.0.self_attn.k_proj.weight": disk_k,
+            "model.layers.0.self_attn.v_proj.weight": disk_v,
+        }.__getitem__,
+        {"model.layers.0.self_attn.qkv_proj.weight": layer.weight.data},
+    )
     # [q | k | v] in fused param
     assert torch.all(layer.weight.data[0:8] == 1.0)
     assert torch.all(layer.weight.data[8:16] == 2.0)
     assert torch.all(layer.weight.data[16:24] == 3.0)
+
+
+def test_qkv_linear_placements_with_custom_hf_names(fake_mesh):
+    fake_mesh(sizes={"tp": 1})
+    _init_default_dispatcher()
+    layer = L.QKVParallelLinear(
+        hidden_size=16,
+        head_dim=4,
+        num_heads=2,
+        num_kv_heads=2,
+        axis="tp",
+        bias=False,
+        prefix="block.attn.qkv_proj",
+    )
+    plans = layer.placements(hf_names={"q": "query", "k": "key", "v": "value"})
+    assert plans[0].hf_key == "block.attn.query.weight"
+    assert plans[1].hf_key == "block.attn.key.weight"
+    assert plans[2].hf_key == "block.attn.value.weight"
+
+
+def test_qkv_linear_placements_gqa_replica_share_kv(fake_mesh):
+    """tp=4 with 2 KV heads: ranks 0/1 share the same K/V slot, 2/3 share the other."""
+    fake_mesh(sizes={"tp": 4}, ranks={"tp": 0})
+    _init_default_dispatcher()
+    layer_r0 = L.QKVParallelLinear(
+        hidden_size=32,
+        head_dim=8,
+        num_heads=8,
+        num_kv_heads=2,
+        axis="tp",
+        bias=False,
+        prefix="block.qkv_proj",
+    )
+    plans_r0 = layer_r0.placements()
+    # K placement at rank 0 — slot_rank = 0 // 2 = 0 → src_slice starts at 0.
+    k_r0 = plans_r0[1]  # plans = [q, k, v]
+    assert k_r0.src_slices == (Slice1D(0, 0, 8),)
+
+    fake_mesh(sizes={"tp": 4}, ranks={"tp": 1})
+    layer_r1 = L.QKVParallelLinear(
+        hidden_size=32,
+        head_dim=8,
+        num_heads=8,
+        num_kv_heads=2,
+        axis="tp",
+        bias=False,
+        prefix="block.qkv_proj",
+    )
+    plans_r1 = layer_r1.placements()
+    # K at rank 1 — slot_rank = 1 // 2 = 0 → SAME src_slice as rank 0.
+    k_r1 = plans_r1[1]
+    assert k_r1.src_slices == k_r0.src_slices
+
+    fake_mesh(sizes={"tp": 4}, ranks={"tp": 2})
+    layer_r2 = L.QKVParallelLinear(
+        hidden_size=32,
+        head_dim=8,
+        num_heads=8,
+        num_kv_heads=2,
+        axis="tp",
+        bias=False,
+        prefix="block.qkv_proj",
+    )
+    plans_r2 = layer_r2.placements()
+    # K at rank 2 — slot_rank = 2 // 2 = 1 → src_slice starts at 8.
+    k_r2 = plans_r2[1]
+    assert k_r2.src_slices == (Slice1D(0, 8, 8),)
+
+
+# ---------------------------------------------------------------------------
+# Replicated / Column / Row placements smoke tests
+# ---------------------------------------------------------------------------
+
+
+def test_replicated_linear_placements(fake_mesh):
+    fake_mesh()
+    _init_default_dispatcher()
+    layer = L.ReplicatedLinear(
+        in_features=4, out_features=8, bias=True, prefix="block.fc"
+    )
+    plans = layer.placements()
+    assert plans[0] == CopyPlacement(
+        hf_key="block.fc.weight", phyai_key="block.fc.weight"
+    )
+    assert plans[1] == CopyPlacement(hf_key="block.fc.bias", phyai_key="block.fc.bias")
+
+
+def test_column_parallel_placements_tp2_rank1(fake_mesh):
+    fake_mesh(sizes={"tp": 2}, ranks={"tp": 1})
+    _init_default_dispatcher()
+    layer = L.ColumnParallelLinear(
+        in_features=16,
+        out_features=32,
+        axis="tp",
+        bias=False,
+        prefix="block.fc",
+    )
+    plans = layer.placements()
+    # per_rank = 16; rank=1 → src_slice starts at 16.
+    assert plans[0].src_slices == (Slice1D(0, 16, 16),)
+    assert plans[0].hf_key == "block.fc.weight"
+
+
+def test_row_parallel_placements_slice_dim1(fake_mesh):
+    fake_mesh(sizes={"tp": 4}, ranks={"tp": 2})
+    _init_default_dispatcher()
+    layer = L.RowParallelLinear(
+        in_features=64,
+        out_features=16,
+        axis="tp",
+        bias=True,
+        prefix="block.out_proj",
+    )
+    plans = layer.placements()
+    # weight: narrow on dim 1 at rank * 16.
+    assert plans[0].src_slices == (Slice1D(1, 32, 16),)
+    # bias: replicated, no slice.
+    assert plans[1].src_slices == ()
+
+
+def test_empty_prefix_rejected(fake_mesh):
+    fake_mesh()
+    _init_default_dispatcher()
+    layer = L.ReplicatedLinear(in_features=4, out_features=8, prefix="")
+    with pytest.raises(ValueError, match="non-empty prefix"):
+        layer.placements()
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +581,7 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
     """
     import phyai.parallel as P
     import phyai.layers.linear as L
+    from phyai.layers.placement import apply_placements
 
     torch.manual_seed(0)
     P.init(layout=(world_size,), mesh_dim_names=("tp",), device="cpu", backend="gloo")
@@ -410,6 +599,7 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
         axis="tp",
         bias=False,
         params_dtype=torch.float32,
+        prefix="col",
     )
     row = L.RowParallelLinear(
         in_features=inter,
@@ -418,9 +608,18 @@ def _w_column_tp2_column_row_equiv(rank, world_size):
         bias=False,
         reduce_results=False,
         params_dtype=torch.float32,
+        prefix="row",
     )
-    col.weight.loader.load_weight(col.weight, W1)
-    row.weight.loader.load_weight(row.weight, W2)
+    apply_placements(
+        col.placements(),
+        {"col.weight": W1}.__getitem__,
+        {"col.weight": col.weight.data},
+    )
+    apply_placements(
+        row.placements(),
+        {"row.weight": W2}.__getitem__,
+        {"row.weight": row.weight.data},
+    )
 
     y_col, _ = col(x)
     assert y_col.shape == (

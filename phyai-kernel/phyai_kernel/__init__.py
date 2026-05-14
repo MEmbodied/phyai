@@ -3,9 +3,11 @@
 from phyai_kernel import jit_utils
 from phyai_kernel.jit_utils import jit
 from phyai_kernel.triton import (
+    adarmsnorm,
     fused_add_rmsnorm,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
+    layernorm,
     masked_embedding_lookup,
     rmsnorm,
     rmsnorm_hf,
@@ -15,11 +17,13 @@ __version__ = "0.1.0"
 
 __all__ = [
     "__version__",
+    "adarmsnorm",
     "fused_add_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
     "jit",
     "jit_utils",
+    "layernorm",
     "masked_embedding_lookup",
     "rmsnorm",
     "rmsnorm_hf",

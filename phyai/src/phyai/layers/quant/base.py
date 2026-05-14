@@ -42,7 +42,6 @@ class AllocationRequest:
     weight_shape: tuple[int, ...]
     logical_widths: list[int]
     fused_dim: int = 0
-    weight_loader: object | None = None
     params_dtype: torch.dtype = torch.bfloat16
     extras: Mapping[str, object] = field(default_factory=dict)
 

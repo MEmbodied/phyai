@@ -2,7 +2,7 @@
 
 Backend authors implement this Protocol. Capability is a pure predicate
 (``can_handle(...) -> bool``) — there is no ``score()`` method; priority
-is the Registry's job (see ``registry.py``).
+is the Registry's job.
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ class Topology:
 class Backend(Protocol):
     """Backend protocol. Pure capability + execute, no internal mode flags.
 
-    `can_handle` is called only on Dispatcher cache miss. Hot path is the
-    cache lookup; see `_dispatch.py`.
+    ``can_handle`` is called only on Dispatcher cache miss; the hot path
+    is the cache lookup.
     """
 
     name: str

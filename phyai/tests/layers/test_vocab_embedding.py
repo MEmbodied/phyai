@@ -6,9 +6,9 @@ so we can exercise construction, weight allocation, masked-lookup, and
 forward without a real process group. Multi-rank correctness lives under
 the existing multiprocess gloo harness and is out of scope here.
 
-We also exercise the loader directly across mocked ``tp_rank`` /
-``tp_size`` combinations — that's enough to validate every shard-bounds
-edge case (padding overhang, all-padding rank, V-evenly-divisible).
+We exercise :func:`_vocab_placements` directly across mocked ``tp_rank``
+/ ``tp_size`` combinations — that covers every shard-bounds edge case
+(padding overhang, all-padding rank, V-evenly-divisible).
 """
 
 from __future__ import annotations
@@ -21,12 +21,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import phyai.layers.linear as L
-from phyai.layers.loaders import VocabShardLoader
+from phyai.layers.placement import (
+    CopyPlacement,
+    Slice1D,
+    ZeroPlacement,
+    apply_placements,
+)
 from phyai.layers.vocab_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
     pad_vocab_to,
 )
+from phyai.layers.vocab_embedding.layers import _vocab_placements
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
 
@@ -105,142 +111,129 @@ def test_pad_vocab_rejects_zero_tp():
 
 
 # --------------------------------------------------------------------------- #
-# VocabShardLoader                                                            #
+# _vocab_placements — covers all shard-bounds edge cases without needing a    #
+# constructed VocabParallelEmbedding (mesh-free).                              #
 # --------------------------------------------------------------------------- #
 
 
-def test_loader_tp1_full_copy():
-    """tp=1 → loader copies the entire disk tensor verbatim."""
+def _apply(plans, hf, dst):
+    apply_placements(plans, hf.__getitem__, dst)
+
+
+def test_placements_tp1_full_copy():
     V, D = 100, 16
-    loader = VocabShardLoader(
-        num_embeddings=V, num_embeddings_padded=V, tp_rank=0, tp_size=1
+    plans = _vocab_placements(
+        prefix="embed",
+        num_embeddings=V,
+        num_embeddings_padded=V,
+        tp_rank=0,
+        tp_size=1,
     )
+    # No padding → one CopyPlacement, no ZeroPlacement.
+    assert len(plans) == 1
+    assert plans[0] == CopyPlacement(
+        hf_key="embed.weight",
+        phyai_key="embed.weight",
+        src_slices=(Slice1D(0, 0, V),),
+        dst_slices=(Slice1D(0, 0, V),),
+    )
+
     disk = torch.arange(V * D, dtype=torch.float32).reshape(V, D)
-    param = nn.Parameter(torch.empty(V, D), requires_grad=False)
-    loader.load_weight(param, disk)
-    assert torch.equal(param.data, disk)
+    dst = torch.zeros(V, D)
+    _apply(plans, {"embed.weight": disk}, {"embed.weight": dst})
+    assert torch.equal(dst, disk)
 
 
-def test_loader_tp4_evenly_divisible():
-    """V evenly divides tp_size: each rank gets a contiguous chunk."""
+def test_placements_tp4_evenly_divisible():
     V, D, tp = 256, 8, 4
     disk = torch.arange(V * D, dtype=torch.float32).reshape(V, D)
     per_rank = V // tp
     for rank in range(tp):
-        loader = VocabShardLoader(
+        plans = _vocab_placements(
+            prefix="embed",
             num_embeddings=V,
             num_embeddings_padded=V,
             tp_rank=rank,
             tp_size=tp,
         )
-        param = nn.Parameter(torch.empty(per_rank, D), requires_grad=False)
-        loader.load_weight(param, disk)
-        expected = disk.narrow(0, rank * per_rank, per_rank)
-        assert torch.equal(param.data, expected)
+        assert len(plans) == 1
+        dst = torch.zeros(per_rank, D)
+        _apply(plans, {"embed.weight": disk}, {"embed.weight": dst})
+        assert torch.equal(dst, disk.narrow(0, rank * per_rank, per_rank))
 
 
-def test_loader_padding_overhang_zeros_tail():
-    """V=100, V_padded=128, tp=4 → rank 3 holds rows [96, 128); 28 are real, 4 are pad."""
+def test_placements_padding_overhang_zeros_tail():
     V, V_padded, D, tp = 100, 128, 8, 4
     disk = torch.randn(V, D, dtype=torch.float32)
     per_rank = V_padded // tp  # 32
 
-    # Rank 3: real rows 96..100 (4 rows), padding 100..128 (28 rows).
-    loader = VocabShardLoader(
+    # Rank 3: real rows 96..100 (4), padding 100..128 (28).
+    plans = _vocab_placements(
+        prefix="embed",
         num_embeddings=V,
         num_embeddings_padded=V_padded,
         tp_rank=3,
         tp_size=tp,
     )
-    param = nn.Parameter(torch.empty(per_rank, D), requires_grad=False)
-    # Pre-fill with non-zero garbage to verify the loader actually zeros the tail.
-    param.data.fill_(7.0)
-    loader.load_weight(param, disk)
+    assert len(plans) == 2  # one Copy, one Zero
+    dst = torch.full((per_rank, D), 7.0)
+    _apply(plans, {"embed.weight": disk}, {"embed.weight": dst})
+    assert torch.equal(dst[:4], disk.narrow(0, 96, 4))
+    assert torch.all(dst[4:] == 0)
 
-    # First 4 rows = disk[96:100]
-    assert torch.equal(param.data[:4], disk.narrow(0, 96, 4))
-    # Remaining 28 rows = exactly zero
-    assert torch.all(param.data[4:] == 0)
-
-    # Rank 0..2 don't see any padding.
+    # Ranks 0..2 don't see padding.
     for rank in range(3):
-        loader_r = VocabShardLoader(
+        plans = _vocab_placements(
+            prefix="embed",
             num_embeddings=V,
             num_embeddings_padded=V_padded,
             tp_rank=rank,
             tp_size=tp,
         )
-        p = nn.Parameter(torch.empty(per_rank, D), requires_grad=False)
-        loader_r.load_weight(p, disk)
-        assert torch.equal(p.data, disk.narrow(0, rank * per_rank, per_rank))
+        assert len(plans) == 1
+        dst = torch.zeros(per_rank, D)
+        _apply(plans, {"embed.weight": disk}, {"embed.weight": dst})
+        assert torch.equal(dst, disk.narrow(0, rank * per_rank, per_rank))
 
 
-def test_loader_pathological_all_padding_rank():
-    """V=20, V_padded=128, tp=4 → rank 1 onwards holds only padding."""
+def test_placements_pathological_all_padding_rank():
     V, V_padded, D, tp = 20, 128, 4, 4
     disk = torch.randn(V, D, dtype=torch.float32)
     per_rank = V_padded // tp  # 32
-    # Rank 1: shard_start=32 > V=20 → entirely padding → entirely zeros.
-    loader = VocabShardLoader(
+    # Rank 1: shard_start=32 > V=20 → entirely padding.
+    plans = _vocab_placements(
+        prefix="embed",
         num_embeddings=V,
         num_embeddings_padded=V_padded,
         tp_rank=1,
         tp_size=tp,
     )
-    param = nn.Parameter(torch.empty(per_rank, D), requires_grad=False)
-    param.data.fill_(9.0)
-    loader.load_weight(param, disk)
-    assert torch.all(param.data == 0)
+    # No real rows → one ZeroPlacement only.
+    assert len(plans) == 1
+    assert isinstance(plans[0], ZeroPlacement)
+    dst = torch.full((per_rank, D), 9.0)
+    _apply(plans, {"embed.weight": disk}, {"embed.weight": dst})
+    assert torch.all(dst == 0)
 
 
-def test_loader_handles_1d_bias():
-    """1-D bias along the V dim flows through the same logic."""
+def test_placements_handles_1d_bias_layout():
+    """1-D source along the V dim flows through the same logic."""
     V, V_padded, tp = 100, 128, 4
     disk_bias = torch.arange(V, dtype=torch.float32)
     per_rank = V_padded // tp
-
-    # Rank 3 has 4 real bias entries + 28 zeros.
-    loader = VocabShardLoader(
+    plans = _vocab_placements(
+        prefix="head",
         num_embeddings=V,
         num_embeddings_padded=V_padded,
         tp_rank=3,
         tp_size=tp,
     )
-    param = nn.Parameter(torch.empty(per_rank), requires_grad=False)
-    param.data.fill_(99.0)
-    loader.load_weight(param, disk_bias)
-    assert torch.equal(param.data[:4], disk_bias.narrow(0, 96, 4))
-    assert torch.all(param.data[4:] == 0)
-
-
-def test_loader_rejects_wrong_shape():
-    loader = VocabShardLoader(
-        num_embeddings=100, num_embeddings_padded=128, tp_rank=0, tp_size=4
-    )
-    param = nn.Parameter(torch.empty(32, 8), requires_grad=False)
-    # Wrong V on disk:
-    with pytest.raises(ValueError, match="loaded.shape\\[0\\]"):
-        loader.load_weight(param, torch.empty(50, 8))
-    # Trailing dim mismatch:
-    with pytest.raises(ValueError, match="trailing dims"):
-        loader.load_weight(param, torch.empty(100, 16))
-
-
-def test_loader_constructor_validates_inputs():
-    with pytest.raises(ValueError, match="not divisible"):
-        VocabShardLoader(
-            num_embeddings=100,
-            num_embeddings_padded=129,  # not divisible by tp=4
-            tp_rank=0,
-            tp_size=4,
-        )
-    with pytest.raises(ValueError, match="< num_embeddings"):
-        VocabShardLoader(
-            num_embeddings=200,
-            num_embeddings_padded=128,
-            tp_rank=0,
-            tp_size=4,
-        )
+    dst = torch.full((per_rank,), 99.0)
+    # Hand-loop apply — apply_placements already covers 2-D; do 1-D here to
+    # confirm dim=0 narrows work for a (per_rank,) tensor.
+    _apply(plans, {"head.weight": disk_bias}, {"head.weight": dst})
+    assert torch.equal(dst[:4], disk_bias.narrow(0, 96, 4))
+    assert torch.all(dst[4:] == 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -254,6 +247,7 @@ def test_embedding_tp1_construct_attrs(fake_mesh):
         num_embeddings=100,
         embedding_dim=16,
         params_dtype=torch.float32,
+        prefix="embed_tokens",
     )
     assert layer.num_embeddings == 100
     assert layer.num_embeddings_padded == 128  # 100 → 128 (multiple of 64)
@@ -262,8 +256,10 @@ def test_embedding_tp1_construct_attrs(fake_mesh):
     assert layer.shard_end == 100  # clamped to V_real
     assert layer.weight.shape == (128, 16)
     assert layer.weight.dtype == torch.float32
-    # Loader is attached for checkpoint loading.
-    assert isinstance(layer.weight.loader, VocabShardLoader)
+    # Placements expose the HF→phyai mapping.
+    plans = layer.placements()
+    assert plans[0].hf_key == "embed_tokens.weight"
+    assert plans[0].phyai_key == "embed_tokens.weight"
 
 
 def test_embedding_tp4_shard_bounds_per_rank(fake_mesh):
@@ -370,6 +366,7 @@ def test_lmhead_tp1_construct_attrs(fake_mesh):
         embedding_dim=16,
         num_embeddings=100,
         params_dtype=torch.float32,
+        prefix="lm_head",
     )
     assert head.num_embeddings == 100
     assert head.num_embeddings_padded == 128
@@ -378,7 +375,9 @@ def test_lmhead_tp1_construct_attrs(fake_mesh):
     assert head.input_size_per_partition == 16
     assert head.output_size_per_partition == 128
     assert head.bias is None
-    assert isinstance(head.weight.loader, VocabShardLoader)
+    # Placements describe the HF→phyai mapping for the un-tied head.
+    plans = head.placements()
+    assert plans[0].hf_key == "lm_head.weight"
 
 
 def test_lmhead_rejects_bias(fake_mesh):
@@ -474,11 +473,20 @@ def test_padding_logits_are_zero_after_load(fake_mesh):
     fake_mesh(sizes={"tp": 1})
     _init_dispatcher()
     V, D = 100, 8
-    head = ParallelLMHead(embedding_dim=D, num_embeddings=V, params_dtype=torch.float32)
+    head = ParallelLMHead(
+        embedding_dim=D,
+        num_embeddings=V,
+        params_dtype=torch.float32,
+        prefix="lm_head",
+    )
 
-    # Simulate a checkpoint load via the attached loader.
+    # Simulate a checkpoint load via placements.
     disk_w = torch.randn(V, D, dtype=torch.float32)
-    head.weight.loader.load_weight(head.weight, disk_w)
+    apply_placements(
+        head.placements(),
+        {"lm_head.weight": disk_w}.__getitem__,
+        {"lm_head.weight": head.weight.data},
+    )
 
     # First V rows match disk; last V_padded - V are zero.
     assert torch.equal(head.weight.data[:V], disk_w)
@@ -488,3 +496,148 @@ def test_padding_logits_are_zero_after_load(fake_mesh):
     x = torch.randn(7, D, dtype=torch.float32)
     logits = head(x)
     assert torch.all(logits[:, V:] == 0)
+
+
+# --------------------------------------------------------------------------- #
+# VocabParallelEmbedding — embed_scale (Gemma / PaliGemma scaled embeddings) #
+# --------------------------------------------------------------------------- #
+
+
+def test_embedding_scale_default_no_buffer(fake_mesh):
+    """Default embed_scale=1.0 should not allocate the scale buffer."""
+    fake_mesh(sizes={"tp": 1})
+    layer = VocabParallelEmbedding(
+        num_embeddings=64, embedding_dim=16, params_dtype=torch.float32
+    )
+    assert layer.embed_scale == 1.0
+    assert not hasattr(layer, "_embed_scale_t")
+
+
+def test_embedding_scale_non_default_registers_buffer(fake_mesh):
+    fake_mesh(sizes={"tp": 1})
+    D = 16
+    layer = VocabParallelEmbedding(
+        num_embeddings=64,
+        embedding_dim=D,
+        embed_scale=D**0.5,
+        params_dtype=torch.float32,
+    )
+    assert layer.embed_scale == D**0.5
+    assert hasattr(layer, "_embed_scale_t")
+    assert layer._embed_scale_t.dtype == torch.float32
+
+
+def test_embedding_scale_invalid_raises(fake_mesh):
+    fake_mesh(sizes={"tp": 1})
+    with pytest.raises(ValueError, match="embed_scale"):
+        VocabParallelEmbedding(num_embeddings=64, embedding_dim=16, embed_scale=0.0)
+    with pytest.raises(ValueError, match="embed_scale"):
+        VocabParallelEmbedding(num_embeddings=64, embedding_dim=16, embed_scale=-1.0)
+
+
+def test_embedding_scale_forward_matches_unscaled_times_scale(fake_mesh):
+    """Output of the scaled embedding equals output of un-scaled * scale."""
+    fake_mesh(sizes={"tp": 1})
+    V, D = 64, 16
+    scale = D**0.5
+    plain = VocabParallelEmbedding(
+        num_embeddings=V, embedding_dim=D, params_dtype=torch.float32
+    )
+    scaled = VocabParallelEmbedding(
+        num_embeddings=V,
+        embedding_dim=D,
+        embed_scale=scale,
+        params_dtype=torch.float32,
+    )
+    nn.init.normal_(plain.weight, std=0.05)
+    plain.weight.data[V:].zero_()
+    # Mirror the same weight onto the scaled layer.
+    scaled.weight.data.copy_(plain.weight.data)
+
+    ids = torch.randint(0, V, (4, 8), dtype=torch.int64)
+    out_plain = plain(ids)
+    out_scaled = scaled(ids)
+    torch.testing.assert_close(out_scaled, out_plain * scale, atol=0, rtol=0)
+
+
+def test_embedding_scale_dtype_matches_input(fake_mesh):
+    """Scale is fp32 internally but result keeps input dtype (Gemma cast pattern)."""
+    fake_mesh(sizes={"tp": 1})
+    V, D = 32, 16
+    layer = VocabParallelEmbedding(
+        num_embeddings=V,
+        embedding_dim=D,
+        embed_scale=D**0.5,
+        params_dtype=torch.bfloat16,
+    )
+    nn.init.normal_(layer.weight, std=0.05)
+    layer.weight.data[V:].zero_()
+    ids = torch.randint(0, V, (4,), dtype=torch.int64)
+    out = layer(ids)
+    assert out.dtype == torch.bfloat16
+
+
+def test_embedding_scale_does_not_mutate_weight(fake_mesh):
+    """Forward-time scale must not mutate the stored weight (this is the whole
+    reason we picked 'A': a tied lm_head must keep seeing the un-scaled weight).
+    """
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    V, D = 64, 16
+    embed = VocabParallelEmbedding(
+        num_embeddings=V,
+        embedding_dim=D,
+        embed_scale=D**0.5,
+        params_dtype=torch.float32,
+    )
+    nn.init.normal_(embed.weight, std=0.02)
+    embed.weight.data[V:].zero_()
+    weight_before = embed.weight.data.clone()
+
+    ids = torch.randint(0, V, (3, 5), dtype=torch.int64)
+    _ = embed(ids)
+
+    torch.testing.assert_close(embed.weight.data, weight_before, atol=0, rtol=0)
+
+
+def test_tied_lmhead_sees_unscaled_weight(fake_mesh):
+    """The point of forward-time scale: tied lm_head logits are NOT scaled.
+
+    Mirrors HF Gemma semantics — embedding output is multiplied by sqrt(D),
+    but the tied lm_head produces ``x @ weight.T`` with the un-scaled weight.
+    """
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    V, D = 64, 16
+    scale = D**0.5
+    embed = VocabParallelEmbedding(
+        num_embeddings=V,
+        embedding_dim=D,
+        embed_scale=scale,
+        params_dtype=torch.float32,
+    )
+    nn.init.normal_(embed.weight, std=0.02)
+    embed.weight.data[V:].zero_()
+    head = ParallelLMHead(
+        embedding_dim=D,
+        num_embeddings=V,
+        tied_weight=embed.weight,
+        params_dtype=torch.float32,
+    )
+
+    x = torch.randn(2, D, dtype=torch.float32)
+    y = head(x)
+    ref = F.linear(x, embed.weight)  # un-scaled
+    ref_scaled = F.linear(x, embed.weight * scale)  # would be wrong
+    torch.testing.assert_close(y, ref, atol=0, rtol=0)
+    # Sanity: scaled reference is meaningfully different.
+    assert not torch.allclose(y, ref_scaled, atol=1e-3)
+
+
+def test_embedding_scale_extra_repr(fake_mesh):
+    fake_mesh(sizes={"tp": 1})
+    layer = VocabParallelEmbedding(num_embeddings=64, embedding_dim=16, embed_scale=4.0)
+    s = repr(layer)
+    assert "embed_scale=4.0" in s
+    plain = VocabParallelEmbedding(num_embeddings=64, embedding_dim=16)
+    assert "embed_scale" not in repr(plain)
