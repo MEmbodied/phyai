@@ -1,10 +1,11 @@
 """Conv{1,2,3}d wrappers tagged for the phyai loader system.
 
 Plain ``torch.nn.Conv{1,2,3}d`` would suffice for compute, but the rest of
-phyai expects every parameter to carry a ``param.loader`` attribute so
-checkpoint loading can dispatch generically. These classes are nothing
-more than ``F.conv{1,2,3}d`` with a :class:`ReplicatedLoader` stamped onto
-weight and bias — no tensor-parallel sharding, no kernel dispatch.
+phyai expects every parameter-bearing layer to expose a ``placements()``
+method so checkpoint loading can dispatch generically. These classes are
+nothing more than ``F.conv{1,2,3}d`` with a replicated
+:class:`~phyai.layers.placement.CopyPlacement` per parameter — no
+tensor-parallel sharding, no kernel dispatch.
 
 Constructor signatures mirror ``torch.nn.Conv{1,2,3}d`` so existing
 configs drop in unchanged: ``int`` / tuple / ``"same"`` / ``"valid"``
@@ -21,7 +22,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.layers.loaders import ReplicatedLoader
+from phyai.layers.placement import (
+    CopyPlacement,
+    Placement,
+    split_prefix,
+)
 
 _size_1_t = Union[int, Tuple[int]]
 _size_2_t = Union[int, Tuple[int, int]]
@@ -48,8 +53,8 @@ class _ConvNd(nn.Module):
     ``forward`` with the matching ``F.conv{1,2,3}d``. The weight has the
     canonical PyTorch layout
     ``(out_channels, in_channels // groups, *kernel_size)``, so HuggingFace
-    / ``nn.Conv*`` checkpoints copy in straight through
-    :class:`ReplicatedLoader`.
+    / ``nn.Conv*`` checkpoints copy in straight through a replicated
+    :class:`~phyai.layers.placement.CopyPlacement`.
     """
 
     _ndim: int
@@ -66,6 +71,7 @@ class _ConvNd(nn.Module):
         bias: bool,
         padding_mode: str,
         dtype: torch.dtype | None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if groups <= 0:
@@ -100,6 +106,7 @@ class _ConvNd(nn.Module):
         self.dilation = dilation
         self.groups = groups
         self.padding_mode = padding_mode
+        self.prefix = prefix
 
         # F.pad takes pads in reverse axis order with each axis getting
         # (left, right). Only used when padding_mode != "zeros", but it's
@@ -114,15 +121,31 @@ class _ConvNd(nn.Module):
             torch.empty(weight_shape, dtype=dtype),
             requires_grad=False,
         )
-        self.weight.loader = ReplicatedLoader()  # type: ignore[attr-defined]
         if bias:
             self.bias = nn.Parameter(
                 torch.zeros(out_channels, dtype=dtype),
                 requires_grad=False,
             )
-            self.bias.loader = ReplicatedLoader()  # type: ignore[attr-defined]
         else:
             self.register_parameter("bias", None)
+
+    def placements(self) -> list[Placement]:
+        parent, own = split_prefix(self.prefix)
+        hf_base = f"{parent}.{own}" if parent else own
+        out: list[Placement] = [
+            CopyPlacement(
+                hf_key=f"{hf_base}.weight",
+                phyai_key=f"{self.prefix}.weight",
+            )
+        ]
+        if self.bias is not None:
+            out.append(
+                CopyPlacement(
+                    hf_key=f"{hf_base}.bias",
+                    phyai_key=f"{self.prefix}.bias",
+                )
+            )
+        return out
 
     @staticmethod
     def _build_reversed_pad(
@@ -203,6 +226,7 @@ class Conv1d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__(
             in_channels,
@@ -215,6 +239,7 @@ class Conv1d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            prefix=prefix,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -239,6 +264,7 @@ class Conv2d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__(
             in_channels,
@@ -251,6 +277,7 @@ class Conv2d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            prefix=prefix,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -275,6 +302,7 @@ class Conv3d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__(
             in_channels,
@@ -287,6 +315,7 @@ class Conv3d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            prefix=prefix,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

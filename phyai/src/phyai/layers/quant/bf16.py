@@ -30,7 +30,6 @@ class Bf16Spec:
             torch.empty(*request.weight_shape, dtype=request.params_dtype),
             requires_grad=False,
         )
-        layer.weight.loader = request.weight_loader  # type: ignore[attr-defined]
         layer.logical_widths = list(request.logical_widths)
 
     def process_after_loading(self, layer: nn.Module) -> None:

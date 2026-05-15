@@ -74,7 +74,10 @@ class Fp8Spec:
             torch.empty(out_per_rank, in_per_rank, dtype=self.weight_dtype),
             requires_grad=False,
         )
-        layer.weight.loader = request.weight_loader  # type: ignore[attr-defined]
+        # TODO(quant-scales-from-disk): weight_scale / input_scale are
+        # initialised to ones below and never loaded from disk. A future
+        # fp8-quantised checkpoint will need extra placements (declared
+        # by either this spec or the layer) to land their scales.
 
         if self.granularity == Granularity.PER_TENSOR:
             layer.weight_scale = nn.Parameter(

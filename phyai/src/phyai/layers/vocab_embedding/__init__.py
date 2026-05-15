@@ -37,20 +37,7 @@ from phyai.layers.vocab_embedding.layers import (
 )
 
 
-def init() -> None:
-    """No-op for now; reserved for future kernel-registry priming.
-
-    Mirrors :func:`phyai.layers.linear.init`. Currently the only piece of
-    state the package owns is the ``phyai::masked_embedding_lookup``
-    custom op, which self-registers on module import — calling :func:`init`
-    is therefore unnecessary today, but the symbol exists so callers can
-    write the same boilerplate they use for ``phyai.layers.linear``.
-    """
-    return None
-
-
 __all__ = [
-    "init",
     "VocabParallelEmbedding",
     "ParallelLMHead",
     "pad_vocab_to",

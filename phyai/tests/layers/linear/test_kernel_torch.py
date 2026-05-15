@@ -52,7 +52,6 @@ def _build_layer(spec, *, N, K, device, dtype=torch.bfloat16, bias=False):
             weight_shape=(N, K),
             logical_widths=[N],
             fused_dim=0,
-            weight_loader=None,
             params_dtype=dtype,
         ),
     )

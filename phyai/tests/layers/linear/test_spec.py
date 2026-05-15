@@ -36,7 +36,6 @@ def _request(
         if logical_widths is not None
         else [weight_shape[0]],
         fused_dim=0,
-        weight_loader=None,
         params_dtype=params_dtype,
     )
 
@@ -155,7 +154,6 @@ def test_fp8_rejects_non_2d_shape():
             AllocationRequest(
                 weight_shape=(8, 16, 32),
                 logical_widths=[8],
-                weight_loader=None,
             ),
         )
 
