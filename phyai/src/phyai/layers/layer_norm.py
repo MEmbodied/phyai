@@ -71,6 +71,15 @@ class RMSNorm(nn.Module):
         hyphen, and case are normalized.
     dtype:
         Optional weight dtype. Defaults to the global default dtype.
+        **flashinfer caveat**: the CUDA RMSNorm / GemmaRMSNorm /
+        FusedAddRMSNorm kernels do *not* check weight dtype — they
+        ``static_cast`` the weight pointer to the input ``c_type`` (fp16
+        or bf16) inside the dispatch macro. Passing an fp32 weight when
+        the input is bf16 silently produces garbage. So when
+        ``backend="flashinfer"``, ``dtype`` must match the dtype of the
+        tensor that will be normalized (typically ``torch.bfloat16``);
+        do *not* leave it as the fp32 default. The ``"phyai-kernel"``
+        Triton path accepts any floating dtype.
 
     The forward signature is ``forward(x, residual=None)``:
 
@@ -215,9 +224,13 @@ class LayerNorm(nn.Module):
         kernel's add becomes a no-op.
     dtype:
         Optional weight / bias dtype. Defaults to the global default.
-        flashinfer's CUDA kernel needs ``gamma`` / ``beta`` in fp32, so
-        the wrapper upcasts on the way in regardless of ``dtype``. The
-        Triton kernel accepts any floating dtype natively.
+        flashinfer's CUDA kernel hard-checks ``gamma`` / ``beta`` in
+        fp32 (``norm.cu`` aborts otherwise), so this wrapper overrides
+        the caller's ``dtype`` to ``torch.float32`` when
+        ``backend="flashinfer"`` — the parameters are allocated in fp32
+        once at construction and the hot path can hand the buffers to
+        the kernel directly, no per-forward cast. The Triton kernel
+        accepts any floating dtype natively.
     prefix:
         Dotted state-dict prefix for placement loading.
 
@@ -247,19 +260,24 @@ class LayerNorm(nn.Module):
         self.has_bias = bias
         self.prefix = prefix
 
+        # flashinfer's CUDA layernorm hard-requires fp32 gamma/beta. Pre-allocate
+        # in fp32 once so the hot path skips the per-forward cast. phyai-kernel's
+        # Triton path accepts any floating dtype, so honor the caller's ``dtype``.
+        param_dtype = torch.float32 if self.backend == "flashinfer" else dtype
+
         self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=dtype), requires_grad=False
+            torch.ones(hidden_size, dtype=param_dtype), requires_grad=False
         )
         if bias:
             self.bias = nn.Parameter(
-                torch.zeros(hidden_size, dtype=dtype), requires_grad=False
+                torch.zeros(hidden_size, dtype=param_dtype), requires_grad=False
             )
         else:
             self.register_parameter("bias", None)
 
         self._layernorm = self._load_kernel(self.backend)
-        # flashinfer needs fp32 gamma/beta. Cache a zero ``beta`` buffer
-        # for ``bias=False`` so we don't allocate one per forward.
+        # flashinfer always reads ``beta``. With ``bias=False`` we still need a
+        # zero buffer to feed the kernel — kept in fp32 to match the contract.
         if self.backend == "flashinfer" and not bias:
             self.register_buffer(
                 "_zero_beta",
@@ -284,13 +302,10 @@ class LayerNorm(nn.Module):
             x = x.contiguous().reshape(-1, orig_shape[-1])
 
         if self.backend == "flashinfer":
-            # CUDA kernel signature: (input bf16, gamma fp32, beta fp32, eps).
-            gamma = self.weight.data.to(torch.float32)
-            if self.has_bias:
-                beta = self.bias.data.to(torch.float32)
-            else:
-                beta = self._zero_beta
-            out = self._layernorm(x, gamma, beta, self.variance_epsilon)
+            # gamma / beta are pre-allocated in fp32 (see __init__) — hand the
+            # buffers to the CUDA kernel directly, no per-forward cast.
+            beta = self.bias.data if self.has_bias else self._zero_beta
+            out = self._layernorm(x, self.weight.data, beta, self.variance_epsilon)
         else:
             # Triton kernel handles any dtype on weight/bias and accepts
             # ``bias=None`` directly — pass weight/bias.data through.

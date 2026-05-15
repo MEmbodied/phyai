@@ -32,10 +32,16 @@ Both narrow chains are applied left-to-right: ``narrow(d0).narrow(d1)``.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
 import torch
+
+from phyai.utils.logging import this_rank_log
+
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -130,6 +136,20 @@ def apply_placements(
                     f"placement shape mismatch at {p.phyai_key!r}: "
                     f"dst={tuple(dst.shape)} src={tuple(src.shape)} "
                     f"(hf_key={p.hf_key!r})"
+                )
+            if src.dtype != dst.dtype:
+                # ``Tensor.copy_`` silently casts when dtypes differ. Warn so
+                # surprises like an fp32 HF norm being downcast to bf16 (precision
+                # loss) or a flashinfer-fp32 dst absorbing a bf16 ckpt (lossless
+                # but unexpected) show up in the load log instead of disappearing.
+                this_rank_log(
+                    _logger,
+                    logging.WARNING,
+                    "placement dtype mismatch at %r: casting %s -> %s " "(hf_key=%r)",
+                    p.phyai_key,
+                    src.dtype,
+                    dst.dtype,
+                    p.hf_key,
                 )
             dst.copy_(src)
         else:
