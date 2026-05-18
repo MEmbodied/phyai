@@ -31,7 +31,7 @@ cuda_only = pytest.mark.skipif(
 def _ref_cos_sin(
     pos_ids: torch.Tensor, rotary_dim: int, theta: float, *, double: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Same recipe as transformers' GemmaRotaryEmbedding (rotate_half)."""
+    """Reference cos/sin for rotate-half RoPE."""
     inv_freq = 1.0 / (
         theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
     )

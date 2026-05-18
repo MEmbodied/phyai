@@ -36,14 +36,10 @@ class PairedCache:
     """Full + SWA dual pool with synchronised inserts and per-step SWA evict."""
 
     def __init__(self, cfg: PairedCacheConfig) -> None:
-        self._cfg = cfg
+        self.cfg = cfg
         self.full: PrefixCache = cfg.full.build()
         self.swa: PrefixCache = cfg.swa.build()
-        self._window = int(cfg.window_size)
-
-    @property
-    def window_size(self) -> int:
-        return self._window
+        self.window_size = int(cfg.window_size)
 
     @property
     def cur_step(self) -> int:
@@ -86,7 +82,7 @@ class PairedCache:
         """
         self.full.advance_step(int(n_new_atoms))
         self.swa.advance_step(int(n_new_atoms))
-        cutoff = max(0, self.swa.current_step - self._window)
+        cutoff = max(0, self.swa.current_step - self.window_size)
         return self.swa.evict_by_named_predicate(Tier.DEVICE, "step_le", int(cutoff))
 
     def stats(self) -> dict[str, int]:
@@ -96,5 +92,5 @@ class PairedCache:
             "swa_avail": self.swa.available(Tier.DEVICE),
             "swa_active": self.swa.active(Tier.DEVICE),
             "cur_step": int(self.cur_step),
-            "window_size": self._window,
+            "window_size": self.window_size,
         }

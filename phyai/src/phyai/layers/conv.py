@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from phyai.engine_config import get_engine_config
 from phyai.weights.shards import replicated
 
 _size_1_t = Union[int, Tuple[int]]
@@ -67,6 +68,7 @@ class _ConvNd(nn.Module):
         bias: bool,
         padding_mode: str,
         dtype: torch.dtype | None,
+        device: torch.device | str | None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -93,6 +95,8 @@ class _ConvNd(nn.Module):
                 raise ValueError(
                     "padding='same' is incompatible with strided convolutions"
                 )
+        if device is None:
+            device = get_engine_config().device
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -114,12 +118,12 @@ class _ConvNd(nn.Module):
 
         weight_shape = (out_channels, in_channels // groups) + tuple(kernel_size)
         self.weight = nn.Parameter(
-            torch.empty(weight_shape, dtype=dtype),
+            torch.empty(weight_shape, dtype=dtype, device=device),
             requires_grad=False,
         )
         if bias:
             self.bias = nn.Parameter(
-                torch.zeros(out_channels, dtype=dtype),
+                torch.zeros(out_channels, dtype=dtype, device=device),
                 requires_grad=False,
             )
         else:
@@ -211,6 +215,7 @@ class Conv1d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -224,6 +229,7 @@ class Conv1d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            device,
             prefix=prefix,
         )
 
@@ -249,6 +255,7 @@ class Conv2d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -262,6 +269,7 @@ class Conv2d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            device,
             prefix=prefix,
         )
 
@@ -287,6 +295,7 @@ class Conv3d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -300,6 +309,7 @@ class Conv3d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            device,
             prefix=prefix,
         )
 

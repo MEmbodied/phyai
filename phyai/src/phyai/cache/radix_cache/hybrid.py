@@ -32,47 +32,43 @@ class HybridCache:
 
     def __init__(self, cfg: HybridCacheConfig) -> None:
         kv = cfg.kv.build()
-        self._impl = HybridPrefixCache(kv, cfg.num_mamba_slots)
-        self._layer_kinds = tuple(cfg.layer_kinds)
+        self.hybrid = HybridPrefixCache(kv, cfg.num_mamba_slots)
+        self.layer_kinds = tuple(cfg.layer_kinds)
 
     @property
     def kv(self) -> PrefixCache:
-        return self._impl.kv
-
-    @property
-    def hybrid(self) -> HybridPrefixCache:
-        return self._impl
+        return self.hybrid.kv
 
     @property
     def num_layers(self) -> int:
-        return len(self._layer_kinds)
+        return len(self.layer_kinds)
 
     def is_mamba_layer(self, layer_id: int) -> bool:
-        return self._layer_kinds[layer_id] == "mamba"
+        return self.layer_kinds[layer_id] == "mamba"
 
     def match(self, atoms: bytes) -> HybridMatchResult:
-        return self._impl.match(atoms)
+        return self.hybrid.match(atoms)
 
     def allocate_mamba_slot(self) -> Optional[MambaSlot]:
-        return self._impl.allocate_mamba_slot()
+        return self.hybrid.allocate_mamba_slot()
 
     def attach_mamba(self, node_handle: int, slot: MambaSlot) -> None:
-        self._impl.attach_mamba(node_handle, slot)
+        self.hybrid.attach_mamba(node_handle, slot)
 
     def detach_mamba(self, node_handle: int) -> Optional[MambaSlot]:
-        return self._impl.detach_mamba(node_handle)
+        return self.hybrid.detach_mamba(node_handle)
 
     def ensure_mamba_capacity_by_evict(self, n: int) -> bool:
-        return self._impl.ensure_mamba_capacity_by_evict(n)
+        return self.hybrid.ensure_mamba_capacity_by_evict(n)
 
     @property
     def available_slots(self) -> int:
-        return self._impl.available_slots
+        return self.hybrid.available_slots
 
     @property
     def total_slots(self) -> int:
-        return self._impl.total_slots
+        return self.hybrid.total_slots
 
     @property
     def active_slots(self) -> int:
-        return self._impl.active_slots
+        return self.hybrid.active_slots

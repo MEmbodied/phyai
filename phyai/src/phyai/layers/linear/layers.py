@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 import phyai.parallel as P
+from phyai.engine_config import get_engine_config
 from phyai.layers.linear.dispatch import get_linear_dispatcher
 from phyai.layers.linear.spec import Bf16Spec
 from phyai.layers.quant import AllocationRequest
@@ -53,6 +54,7 @@ class LinearBase(nn.Module):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -61,6 +63,7 @@ class LinearBase(nn.Module):
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.skip_bias_add = skip_bias_add
         self.spec = spec if spec is not None else Bf16Spec()
+        self.device = device if device is not None else get_engine_config().device
         self.prefix = prefix
         self._bias_requested = bias
 
@@ -100,6 +103,7 @@ class ReplicatedLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -109,6 +113,7 @@ class ReplicatedLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            device=device,
             prefix=prefix,
         )
         self.spec.allocate(
@@ -118,6 +123,7 @@ class ReplicatedLinear(LinearBase):
                 logical_widths=[out_features],
                 fused_dim=0,
                 params_dtype=self.params_dtype,
+                device=self.device,
             ),
         )
         self.input_size_per_partition = in_features
@@ -126,7 +132,7 @@ class ReplicatedLinear(LinearBase):
         self.output_size_global = out_features
         if bias:
             self.bias = nn.Parameter(
-                torch.zeros(out_features, dtype=self.params_dtype),
+                torch.zeros(out_features, dtype=self.params_dtype, device=self.device),
                 requires_grad=False,
             )
         else:
@@ -178,6 +184,7 @@ class ColumnParallelLinear(LinearBase):
         spec: object | None = None,
         output_sizes: list[int] | None = None,
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -187,6 +194,7 @@ class ColumnParallelLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            device=device,
             prefix=prefix,
         )
         mesh_obj = resolve_mesh(mesh)
@@ -220,6 +228,7 @@ class ColumnParallelLinear(LinearBase):
                 logical_widths=per_rank_sizes,
                 fused_dim=0,
                 params_dtype=self.params_dtype,
+                device=self.device,
             ),
         )
         self.input_size_per_partition = in_features
@@ -229,7 +238,9 @@ class ColumnParallelLinear(LinearBase):
 
         if bias:
             self.bias = nn.Parameter(
-                torch.zeros(sum(per_rank_sizes), dtype=self.params_dtype),
+                torch.zeros(
+                    sum(per_rank_sizes), dtype=self.params_dtype, device=self.device
+                ),
                 requires_grad=False,
             )
         else:
@@ -287,6 +298,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         spec: object | None = None,
         hf_legs: Sequence[str] | None = None,
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -301,6 +313,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             spec=spec,
             output_sizes=output_sizes,
             mesh=mesh,
+            device=device,
             prefix=prefix,
         )
         legs = tuple(hf_legs) if hf_legs is not None else self.DEFAULT_HF_LEGS
@@ -368,6 +381,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         spec: object | None = None,
         hf_legs: Mapping[str, str] | None = None,
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         mesh_obj = resolve_mesh(mesh)
@@ -406,6 +420,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             spec=spec,
             output_sizes=[q_size, kv_size, kv_size],
             mesh=mesh,
+            device=device,
             prefix=prefix,
         )
         self.num_kv_replicas = num_kv_replicas
@@ -479,6 +494,7 @@ class RowParallelLinear(LinearBase):
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -488,6 +504,7 @@ class RowParallelLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            device=device,
             prefix=prefix,
         )
         mesh_obj = resolve_mesh(mesh)
@@ -513,6 +530,7 @@ class RowParallelLinear(LinearBase):
                 logical_widths=[out_features],
                 fused_dim=0,
                 params_dtype=self.params_dtype,
+                device=self.device,
             ),
         )
         self.input_size_per_partition = in_per_rank
@@ -523,7 +541,7 @@ class RowParallelLinear(LinearBase):
             # RowParallel bias is global (only rank 0 adds it at forward), so
             # every rank loads the full disk tensor unsliced.
             self.bias = nn.Parameter(
-                torch.zeros(out_features, dtype=self.params_dtype),
+                torch.zeros(out_features, dtype=self.params_dtype, device=self.device),
                 requires_grad=False,
             )
         else:

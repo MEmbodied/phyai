@@ -13,32 +13,32 @@ class MultimodalCache:
     """Modality-keyed dictionary of :class:`PrefixCache` instances."""
 
     def __init__(self, configs: Mapping[Modality, CacheConfig]) -> None:
-        self._caches: dict[Modality, PrefixCache] = {
+        self.caches: dict[Modality, PrefixCache] = {
             m: cfg.build() for m, cfg in configs.items()
         }
-        self._configs: dict[Modality, CacheConfig] = dict(configs)
+        self.configs: dict[Modality, CacheConfig] = dict(configs)
 
     def __getitem__(self, m: Modality) -> PrefixCache:
-        return self._caches[m]
+        return self.caches[m]
 
     def __contains__(self, m: Modality) -> bool:
-        return m in self._caches
+        return m in self.caches
 
     def __iter__(self):  # pragma: no cover
-        return iter(self._caches)
+        return iter(self.caches)
 
     def keys(self):  # pragma: no cover
-        return self._caches.keys()
+        return self.caches.keys()
 
     def items(self):
-        return self._caches.items()
+        return self.caches.items()
 
     def values(self):
-        return self._caches.values()
+        return self.caches.values()
 
     def stats(self) -> dict[Modality, dict[str, int]]:
         out: dict[Modality, dict[str, int]] = {}
-        for m, c in self._caches.items():
+        for m, c in self.caches.items():
             row: dict[str, int] = {}
             for tier in Tier:
                 if c.tier_enabled(tier):
@@ -54,24 +54,22 @@ class MultiPatternCache:
     """
 
     def __init__(self, configs: Mapping[str, CacheConfig]) -> None:
-        self._caches: dict[str, PrefixCache] = {
-            k: c.build() for k, c in configs.items()
-        }
+        self.caches: dict[str, PrefixCache] = {k: c.build() for k, c in configs.items()}
 
     def cache_of(self, pattern: str) -> PrefixCache:
-        return self._caches[pattern]
+        return self.caches[pattern]
 
     def __getitem__(self, pattern: str) -> PrefixCache:
-        return self._caches[pattern]
+        return self.caches[pattern]
 
     def __contains__(self, pattern: str) -> bool:
-        return pattern in self._caches
+        return pattern in self.caches
 
     def keys(self):  # pragma: no cover
-        return self._caches.keys()
+        return self.caches.keys()
 
     def items(self):  # pragma: no cover
-        return self._caches.items()
+        return self.caches.items()
 
 
 class NestedCache:
@@ -83,19 +81,19 @@ class NestedCache:
     """
 
     def __init__(self, children: Mapping[Any, Any]) -> None:
-        self._children: dict[Any, Any] = dict(children)
+        self.children: dict[Any, Any] = dict(children)
 
     def __getitem__(self, key: Any) -> Any:
-        return self._children[key]
+        return self.children[key]
 
     def __contains__(self, key: Any) -> bool:
-        return key in self._children
+        return key in self.children
 
     def keys(self):  # pragma: no cover
-        return self._children.keys()
+        return self.children.keys()
 
     def items(self):  # pragma: no cover
-        return self._children.items()
+        return self.children.items()
 
     def values(self):  # pragma: no cover
-        return self._children.values()
+        return self.children.values()

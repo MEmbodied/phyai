@@ -69,9 +69,12 @@ class Fp8Spec:
                 f"got {request.weight_shape!r}"
             )
         out_per_rank, in_per_rank = request.weight_shape
+        device = request.device
 
         layer.weight = nn.Parameter(
-            torch.empty(out_per_rank, in_per_rank, dtype=self.weight_dtype),
+            torch.empty(
+                out_per_rank, in_per_rank, dtype=self.weight_dtype, device=device
+            ),
             requires_grad=False,
         )
         # TODO(quant-scales-from-disk): weight_scale / input_scale are
@@ -81,16 +84,20 @@ class Fp8Spec:
 
         if self.granularity == Granularity.PER_TENSOR:
             layer.weight_scale = nn.Parameter(
-                torch.ones(len(request.logical_widths), dtype=torch.float32),
+                torch.ones(
+                    len(request.logical_widths),
+                    dtype=torch.float32,
+                    device=device,
+                ),
                 requires_grad=False,
             )
             layer.input_scale = nn.Parameter(
-                torch.ones(1, dtype=torch.float32),
+                torch.ones(1, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
         elif self.granularity == Granularity.PER_CHANNEL:
             layer.weight_scale = nn.Parameter(
-                torch.ones(out_per_rank, dtype=torch.float32),
+                torch.ones(out_per_rank, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
         elif self.granularity == Granularity.BLOCK:
@@ -111,6 +118,7 @@ class Fp8Spec:
                     out_per_rank // bn,
                     in_per_rank // bk,
                     dtype=torch.float32,
+                    device=device,
                 ),
                 requires_grad=False,
             )

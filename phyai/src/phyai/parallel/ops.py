@@ -19,6 +19,8 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from phyai.utils.cuda import current_device
+
 from phyai.parallel.backend import Op
 from phyai.parallel.dispatch import get_dispatcher
 from phyai.parallel.mesh import Mesh
@@ -394,11 +396,7 @@ def recv(
 ) -> Tensor:
     mesh_obj = resolve_mesh(mesh)
     if device is None:
-        device = torch.device(
-            f"cuda:{torch.cuda.current_device()}"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        device = current_device()
     output = torch.empty(tuple(shape), dtype=dtype, device=device)
     if mesh_obj.axis_size(axis) <= 1:
         # ws=1: no peer to receive from. Caller's bug if they reach this,
@@ -445,7 +443,5 @@ def barrier(
         output=None,
         _mesh_name=mesh_obj.name,
         _axis=axis,
-        _device=torch.device("cuda")
-        if torch.cuda.is_available()
-        else torch.device("cpu"),
+        _device=current_device(),
     )

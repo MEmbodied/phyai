@@ -26,6 +26,25 @@ def device_capability(
     return torch.cuda.get_device_capability(device)
 
 
+def current_device() -> torch.device:
+    """Return the current device for tensor allocation.
+
+    Picks the active CUDA device when CUDA is available, otherwise
+    ``cpu``. ``torch.cuda.current_device()`` returns an int rank, but
+    callers typically want a ``torch.device`` they can pass to
+    ``.to(...)`` or ``torch.empty(..., device=...)``; this wraps the
+    rank into a ``torch.device("cuda", rank)``.
+
+    Use this in place of hard-coded ``"cuda"`` / ``"cpu"`` strings so
+    a process started under ``CUDA_VISIBLE_DEVICES=...`` lands on the
+    intended device, and CPU-only dev / CI environments degrade
+    gracefully.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 def sm_arch(
     device: "torch.device | str | int | None" = None,
 ) -> int:

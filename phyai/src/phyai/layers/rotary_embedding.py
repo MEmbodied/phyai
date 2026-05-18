@@ -1,6 +1,6 @@
 """RoPE with a selectable kernel backend.
 
-Llama / Qwen / Gemma / PaliGemma all rotate Q and K with the rotate-half
+Most modern transformer decoders rotate Q and K with the rotate-half
 (NeoX-style) variant of RoPE; :class:`NoStateAttention` is by design a
 pure attention op and expects rotation to happen before it. This module
 fills that gap.
@@ -49,6 +49,8 @@ from typing import Callable, Tuple
 
 import torch
 import torch.nn as nn
+
+from phyai.engine_config import get_engine_config
 
 
 _VALID_BACKENDS: tuple[str, ...] = ("flashinfer", "eager")
@@ -113,7 +115,8 @@ def _llama3_inv_freq(
 ) -> tuple[torch.Tensor, float]:
     """Llama 3.1 piecewise-smooth scaling.
 
-    Mirrors :func:`transformers.modeling_rope_utils._compute_llama3_parameters`.
+    Implements the piecewise-smooth long-context scaling described in the
+    Llama 3 technical report.
     """
     inv_freq, _ = _default_inv_freq(rotary_dim, theta, device=device)
     low_freq_wavelen = original_max_position_embeddings / low_freq_factor
@@ -157,7 +160,7 @@ ROPE_INV_FREQ_FNS: dict[str, Callable[..., tuple[torch.Tensor, float]]] = {
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """``[a, b] -> [-b, a]`` along the last dim — the NeoX/Llama RoPE rotation."""
+    """``[a, b] -> [-b, a]`` along the last dim — the NeoX-style RoPE rotation."""
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((-x2, x1), dim=-1)
@@ -172,12 +175,12 @@ def apply_rotary_pos_emb(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotate-half RoPE with caller-supplied ``cos`` / ``sin``.
 
-    Mirrors transformers' :func:`apply_rotary_pos_emb`. ``cos`` and ``sin``
-    must already be sized to the full ``head_dim`` (i.e. each half
-    duplicated). ``unsqueeze_dim`` controls which axis becomes the head
-    axis after broadcasting:
+    NeoX-style rotate-half convention. ``cos`` and ``sin`` must already be
+    sized to the full ``head_dim`` (i.e. each half duplicated).
+    ``unsqueeze_dim`` controls which axis becomes the head axis after
+    broadcasting:
 
-    * ``unsqueeze_dim=1`` for ``q (B, H, S, D)`` (transformers default),
+    * ``unsqueeze_dim=1`` for ``q (B, H, S, D)`` (HF default),
     * ``unsqueeze_dim=2`` for ``q (B, S, H, D)``,
     * ``unsqueeze_dim=-2`` for ragged ``q (nnz, H, D)`` or any "head is
       second-to-last" layout.
@@ -239,8 +242,8 @@ class RotaryEmbedding(nn.Module):
         Cache size along the sequence axis. ``position_ids`` must be
         ``< max_position_embeddings``.
     rope_theta:
-        RoPE base wavelength. Llama / Qwen ``1e4``, Llama 3.1 ``5e5``,
-        Gemma ``1e4``, etc.
+        RoPE base wavelength. Common values: ``1e4`` for short-context
+        configs, ``5e5`` (or larger) for long-context configs.
     rope_type:
         ``"default"``, ``"linear"``, or ``"llama3"``. ``"yarn"``,
         ``"dynamic"``, ``"longrope"`` raise NotImplementedError.
@@ -252,14 +255,17 @@ class RotaryEmbedding(nn.Module):
     partial_rotary_factor:
         Fraction of ``head_dim`` that gets rotated. Default ``1.0``.
     interleave:
-        ``False`` (default): NeoX / rotate-half geometry — used by Llama,
-        Qwen, Gemma, PaliGemma. ``True``: GPT-J / NeoX-old even/odd
-        geometry. flashinfer maps ``is_neox = not interleave``.
+        ``False`` (default): NeoX-style rotate-half geometry (the
+        common case for modern transformer decoders). ``True``:
+        GPT-J / NeoX-old even/odd geometry. flashinfer maps
+        ``is_neox = not interleave``.
     backend:
         ``"flashinfer"`` (default) or ``"eager"``.
     device:
-        Where to allocate the cache. Module is otherwise CPU-pinned at
-        construction; ``.to(device)`` moves the buffer.
+        Where to allocate the cache. Defaults to
+        :attr:`phyai.engine_config.EngineConfig.device` (typically
+        ``"cuda"``); pass an explicit ``"cpu"`` / ``"cuda:N"`` to
+        override. ``.to(device)`` later still works.
     """
 
     def __init__(
@@ -309,6 +315,8 @@ class RotaryEmbedding(nn.Module):
         self.partial_rotary_factor = partial_rotary_factor
         self.interleave = interleave
         self.backend = _resolve_backend(backend)
+        if device is None:
+            device = get_engine_config().device
 
         if self.backend == "flashinfer":
             # Fail fast at construction rather than at first forward.

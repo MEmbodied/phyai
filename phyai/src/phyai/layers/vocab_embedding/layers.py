@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 
 import phyai.parallel as P
+from phyai.engine_config import get_engine_config
 from phyai.layers.linear.dispatch import get_linear_dispatcher
 from phyai.layers.quant import AllocationRequest
 from phyai.layers.quant.bf16 import Bf16Spec
@@ -78,8 +79,8 @@ class VocabParallelEmbedding(nn.Module):
         padding_multiple: per-rank chunks are padded to this multiple.
             Default 64; FP8/INT4 may want 128/256.
         embed_scale: post-lookup scale factor. Default ``1.0`` (no-op).
-            Set to ``hidden_size ** 0.5`` for Gemma / PaliGemma-style scaled
-            input embeddings. Applied at forward time (post-lookup,
+            Set to ``hidden_size ** 0.5`` for scaled-input-embedding
+            architectures. Applied at forward time (post-lookup,
             post-all_reduce) rather than baked into the weight, so that a
             tied :class:`ParallelLMHead` sees the un-scaled weight.
         axis: mesh axis used for the V split. Default ``"tp"``.
@@ -99,6 +100,7 @@ class VocabParallelEmbedding(nn.Module):
         embed_scale: float = 1.0,
         axis: str = "tp",
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -116,6 +118,7 @@ class VocabParallelEmbedding(nn.Module):
 
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.spec = spec if spec is not None else Bf16Spec()
+        self.device = device if device is not None else get_engine_config().device
         self.prefix = prefix
         self.embed_scale = float(embed_scale)
         # Only allocate a buffer when scale is non-trivial; the forward
@@ -123,7 +126,7 @@ class VocabParallelEmbedding(nn.Module):
         if self.embed_scale != 1.0:
             self.register_buffer(
                 "_embed_scale_t",
-                torch.tensor(self.embed_scale, dtype=torch.float32),
+                torch.tensor(self.embed_scale, dtype=torch.float32, device=self.device),
                 persistent=False,
             )
 
@@ -158,6 +161,7 @@ class VocabParallelEmbedding(nn.Module):
                 logical_widths=[self.num_embeddings_per_partition],
                 fused_dim=0,
                 params_dtype=self.params_dtype,
+                device=self.device,
             ),
         )
 
@@ -229,6 +233,7 @@ class ParallelLMHead(nn.Module):
         gather_output: bool = False,
         axis: str = "tp",
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -241,6 +246,7 @@ class ParallelLMHead(nn.Module):
 
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.spec = spec if spec is not None else Bf16Spec()
+        self.device = device if device is not None else get_engine_config().device
         self.prefix = prefix
 
         mesh_obj = resolve_mesh(mesh)
@@ -293,6 +299,7 @@ class ParallelLMHead(nn.Module):
                     logical_widths=[self.num_embeddings_per_partition],
                     fused_dim=0,
                     params_dtype=self.params_dtype,
+                    device=self.device,
                 ),
             )
             self._tied = False
