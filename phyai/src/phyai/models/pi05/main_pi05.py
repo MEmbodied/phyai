@@ -4,10 +4,10 @@ Two pieces, both consumed by :class:`~phyai.engine.Engine`:
 
 * :class:`PI05Args` — typed arg bundle. Carries the safetensors weight
   paths, an optional :class:`PI05Config` (defaults to ``pi05_base``),
-  and the model-specific scheduler knob ``batch_size``.
+  and the model-specific scheduler knob ``max_batch_size``.
 * :class:`PI05Entry` — :class:`~phyai.engine.Entry` subclass that
   builds a :class:`PI05Model`, runs :func:`load_pretrained`,
-  constructs and warms a :class:`PI05SingleBatchScheduler`, then
+  constructs and warms a :class:`PI05WS1Scheduler`, then
   forwards :meth:`step` to it.
 
 Importing this module registers ``PI05Entry`` with the engine via
@@ -36,9 +36,9 @@ from phyai.engine import Engine, Entry, EntryArgs
 from phyai.engine_config import get_engine_config
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
-from phyai.models.pi05.scheduler_single_batch_pi05 import (
+from phyai.models.pi05.scheduler_ws1_pi05 import (
     PI05Request,
-    PI05SingleBatchScheduler,
+    PI05WS1Scheduler,
 )
 from phyai.weights import load_pretrained
 
@@ -108,7 +108,7 @@ class PI05Args(EntryArgs):
 
     weights_paths: list[str | Path] = field(default_factory=list)
     config: PI05Config = field(default_factory=PI05Config)
-    batch_size: int = 1
+    max_batch_size: int = 1
     weight_remap: Callable[[str], str | None] | dict[str, str] | None = None
     weight_strict: bool = True
 
@@ -124,7 +124,7 @@ class PI05Entry(Entry):
         # Default-init the slots so :meth:`step` / :meth:`close` can
         # check for "setup not yet run" without an attr-exists guard.
         self.model: PI05Model | None = None
-        self.scheduler: PI05SingleBatchScheduler | None = None
+        self.scheduler: PI05WS1Scheduler | None = None
 
     def setup(self, args: PI05Args) -> None:  # type: ignore[override]
         """Build model, load weights, construct + warm the scheduler."""
@@ -139,9 +139,9 @@ class PI05Entry(Entry):
                 strict=args.weight_strict,
             )
 
-        self.scheduler = PI05SingleBatchScheduler(
+        self.scheduler = PI05WS1Scheduler(
             self.model,
-            batch_size=args.batch_size,
+            max_batch_size=args.max_batch_size,
             device=eng.device.target,
             use_cuda_graph=eng.runtime.use_cuda_graph,
         )

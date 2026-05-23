@@ -8,13 +8,12 @@ The package ships the full pi0.5 inference path:
   gemma_300m action expert with
   :class:`~phyai.layers.attention.DiffusionAttention`, action/time
   heads, and the parameter-only :class:`PI05Model` container).
-* :mod:`batch_layout_pi05` — index / packing helpers the scheduler invokes
-  once per inference (cu_seqlens, write-indices, padded prefix layout,
-  joint paged_kv_indices interleave).
 * :mod:`model_runner_pi05` — the three runners (vision / LLM / expert)
   that wrap captured CUDA graphs around the modeling code.
-* :mod:`scheduler_single_batch_pi05` — single-batch end-to-end inference
-  orchestrator.
+* :mod:`scheduler_ws1_pi05` — single-card (world_size=1) end-to-end
+  inference orchestrator with multi-batch support. Owns the
+  pi0.5-specific batch-layout helpers (cu_seqlens, write-indices,
+  padded prefix layout, joint paged_kv_indices interleave).
 
 Training is not in scope here; this package is inference-only.
 """
@@ -45,22 +44,6 @@ from phyai.models.pi05.modeling_pi05 import (
     VisionTowerWrapper,
     create_sinusoidal_pos_embedding,
 )
-from phyai.models.pi05.batch_layout_pi05 import (
-    broadcast_cond_to_tokens,
-    build_full_indptrs,
-    build_joint_last_page_len,
-    build_joint_paged_kv_indices,
-    build_pos_ids_from_indptr,
-    build_prefix_indptrs,
-    build_prefix_last_page_len,
-    build_prefix_padded_pos_ids,
-    build_prefix_padded_write_indices,
-    build_prefix_paged_kv_indices,
-    build_suffix_indptrs,
-    build_suffix_pos_ids,
-    build_suffix_write_indices,
-    pack_prefix_per_sample_padded,
-)
 
 
 __all__ = [
@@ -86,19 +69,4 @@ __all__ = [
     "SiglipVisionModel",
     "VisionTowerWrapper",
     "create_sinusoidal_pos_embedding",
-    # Batch layout helpers
-    "broadcast_cond_to_tokens",
-    "build_full_indptrs",
-    "build_joint_last_page_len",
-    "build_joint_paged_kv_indices",
-    "build_pos_ids_from_indptr",
-    "build_prefix_indptrs",
-    "build_prefix_last_page_len",
-    "build_prefix_padded_pos_ids",
-    "build_prefix_padded_write_indices",
-    "build_prefix_paged_kv_indices",
-    "build_suffix_indptrs",
-    "build_suffix_pos_ids",
-    "build_suffix_write_indices",
-    "pack_prefix_per_sample_padded",
 ]

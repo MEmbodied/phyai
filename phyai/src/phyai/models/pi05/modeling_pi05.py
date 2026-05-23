@@ -1,13 +1,13 @@
 """pi0.5 inference model — vision + language + action expert (modules only).
 
 Module layout for the pi0.5 inference path. Configs live in
-:mod:`configuration_pi05`; ragged-layout helpers (``cu_seqlens``,
-write-indices, padded packing) live in :mod:`batch_layout_pi05`; runners
-and scheduler live in :mod:`model_runner_pi05` and
-:mod:`scheduler_single_batch_pi05`. This file owns the ``nn.Module``
-classes only — every parameter declares its own ``hf_keys`` so
-:func:`phyai.weights.load_pretrained` fills the model from
-``pi05_base/model.safetensors`` without a remap.
+:mod:`configuration_pi05`; runners and scheduler live in
+:mod:`model_runner_pi05` and :mod:`scheduler_ws1_pi05` — the
+scheduler also owns the pi0.5-specific ragged-layout helpers
+(``cu_seqlens``, write-indices, padded packing). This file owns the
+``nn.Module`` classes only — every parameter declares its own
+``hf_keys`` so :func:`phyai.weights.load_pretrained` fills the model
+from ``pi05_base/model.safetensors`` without a remap.
 
 Sections (top -> bottom):
 
@@ -1198,7 +1198,7 @@ class PI05Model(nn.Module):
     through ``stack(h, position_ids, [cond,] rope, ctx)``. No
     top-level forward lives here — the runners + scheduler in
     :mod:`phyai.models.pi05.model_runner_pi05` and
-    :mod:`phyai.models.pi05.scheduler_single_batch_pi05` orchestrate
+    :mod:`phyai.models.pi05.scheduler_ws1_pi05` orchestrate
     the two-phase prefix / Euler-step execution.
 
     The shared :attr:`rope` is *not* registered on the layers (its
