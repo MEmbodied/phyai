@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -286,3 +287,155 @@ def test_double_claim_raises(tmp_path: Path, fake_mesh):
     save_file({}, str(tmp_path / "x.safetensors"))
     with pytest.raises(RuntimeError, match="claimed by two params"):
         load_pretrained(layer, [tmp_path / "x.safetensors"], strict=False)
+
+
+# --------------------------------------------------------------------------- #
+# Source resolution: folder / single file / iterable forms accepted.          #
+# --------------------------------------------------------------------------- #
+
+
+def _make_replicated(prefix: str = "mod.fc") -> "L.ReplicatedLinear":
+    return L.ReplicatedLinear(
+        in_features=4,
+        out_features=8,
+        bias=True,
+        params_dtype=torch.float32,
+        prefix=prefix,
+    )
+
+
+def test_load_from_folder_single_safetensors(tmp_path: Path, fake_mesh):
+    """source = checkpoint folder containing model.safetensors."""
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    save_file(
+        {"mod.fc.weight": src_w, "mod.fc.bias": src_b},
+        str(tmp_path / "model.safetensors"),
+    )
+    report = load_pretrained(layer, tmp_path)
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+    torch.testing.assert_close(layer.weight.data, src_w)
+    torch.testing.assert_close(layer.bias.data, src_b)
+
+
+def test_load_from_folder_str_path(tmp_path: Path, fake_mesh):
+    """source = str path to a folder."""
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    save_file(
+        {"mod.fc.weight": src_w, "mod.fc.bias": src_b},
+        str(tmp_path / "model.safetensors"),
+    )
+    report = load_pretrained(layer, str(tmp_path))
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+
+
+def test_load_from_folder_with_index(tmp_path: Path, fake_mesh):
+    """source = folder using model.safetensors.index.json across two shards."""
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    save_file(
+        {"mod.fc.weight": src_w},
+        str(tmp_path / "model-00001-of-00002.safetensors"),
+    )
+    save_file(
+        {"mod.fc.bias": src_b},
+        str(tmp_path / "model-00002-of-00002.safetensors"),
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 4 * (8 * 4 + 8)},
+                "weight_map": {
+                    "mod.fc.weight": "model-00001-of-00002.safetensors",
+                    "mod.fc.bias": "model-00002-of-00002.safetensors",
+                },
+            }
+        )
+    )
+    report = load_pretrained(layer, tmp_path)
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+    torch.testing.assert_close(layer.weight.data, src_w)
+    torch.testing.assert_close(layer.bias.data, src_b)
+
+
+def test_load_from_single_file_path(tmp_path: Path, fake_mesh):
+    """source = a single file path (str or Path), not a folder."""
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    shard = tmp_path / "shard.safetensors"
+    save_file({"mod.fc.weight": src_w, "mod.fc.bias": src_b}, str(shard))
+
+    # Path
+    report = load_pretrained(layer, shard)
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+
+    # str
+    layer2 = _make_replicated(prefix="mod.fc")
+    report = load_pretrained(layer2, str(shard))
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+
+
+def test_load_from_iterable_of_str(tmp_path: Path, fake_mesh):
+    """source = iterable of str (existing-iterable contract preserved)."""
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    a = tmp_path / "a.safetensors"
+    b = tmp_path / "b.safetensors"
+    save_file({"mod.fc.weight": src_w}, str(a))
+    save_file({"mod.fc.bias": src_b}, str(b))
+    report = load_pretrained(layer, [str(a), str(b)])
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+
+
+def test_load_from_empty_folder_raises(tmp_path: Path, fake_mesh):
+    """source = folder with no safetensors files → FileNotFoundError."""
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    with pytest.raises(FileNotFoundError, match="no safetensors shards"):
+        load_pretrained(layer, tmp_path)
+
+
+def test_load_unexpected_keys_with_dropping_remap_via_folder(tmp_path: Path, fake_mesh):
+    """End-to-end: folder source + remap dropping a known-unwanted key.
+
+    Mirrors the pi05 ``_compose_remap`` use case where the upstream
+    checkpoint carries an ``lm_head`` tensor that has no phyai param to
+    land in.
+    """
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    save_file(
+        {
+            "mod.fc.weight": src_w,
+            "mod.fc.bias": src_b,
+            "drop.this.weight": torch.zeros(2),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    report = load_pretrained(
+        layer,
+        tmp_path,
+        remap=lambda k: None if k.startswith("drop.") else k,
+    )
+    assert "drop.this.weight" not in report.unexpected
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
