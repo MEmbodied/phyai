@@ -143,7 +143,7 @@ def masked_embedding_lookup(
 
     # Block sizes — small enough to keep occupancy high on common D=2048..8192
     # widths, large enough that BLOCK_M overhead amortises. Autotune later if
-    # profile shows it matters; for now these are good defaults on H100/A100.
+    # profile shows it matters.
     BLOCK_M = 64
     BLOCK_D = 128 if D >= 128 else triton.next_power_of_2(D)
 

@@ -5,12 +5,11 @@ input/output collectives) and delegate everything else to ``self.spec``
 and the dispatcher. No fp8 / cutlass / marlin branches live here — the
 decision tree is pushed into :class:`KernelDispatcher`.
 
-Each layer exposes :meth:`placements` returning a list of
-:class:`~phyai.layers.placement.Placement` describing how this rank's
-parameters relate to the upstream HF state dict. The TP / GQA / fuse
-math is local to that method (computed from the layer's stored
-``tp_rank`` / ``tp_size`` / ``output_partition_sizes`` / replica
-factors), so the model loader sees a flat data structure.
+Weight loading is param-attached: each layer's ``__init__`` (after
+``spec.allocate``) sets ``param.hf_keys`` and ``param.weight_loader``
+using the shared factories in :mod:`phyai.weights.shards`. The
+top-level :func:`phyai.weights.load_pretrained` walks
+``named_parameters`` and dispatches; no per-model boilerplate.
 """
 
 from __future__ import annotations
@@ -22,16 +21,12 @@ import torch
 import torch.nn as nn
 
 import phyai.parallel as P
+from phyai.engine_config import get_engine_config
 from phyai.layers.linear.dispatch import get_linear_dispatcher
 from phyai.layers.linear.spec import Bf16Spec
-from phyai.layers.placement import (
-    CopyPlacement,
-    Placement,
-    Slice1D,
-    split_prefix,
-)
 from phyai.layers.quant import AllocationRequest
 from phyai.parallel.state import resolve_mesh
+from phyai.weights.shards import _Leg, fused, replicated, sharded
 
 
 def _M_of(x: torch.Tensor) -> int:
@@ -59,6 +54,7 @@ class LinearBase(nn.Module):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -67,8 +63,34 @@ class LinearBase(nn.Module):
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.skip_bias_add = skip_bias_add
         self.spec = spec if spec is not None else Bf16Spec()
+        self.device = (
+            device if device is not None else get_engine_config().device.target
+        )
         self.prefix = prefix
         self._bias_requested = bias
+
+    def post_load(self) -> None:
+        """Spec-driven post-load fixup (e.g. fp8 per-tensor -> per-channel)."""
+        proc = getattr(self.spec, "process_after_loading", None)
+        if callable(proc):
+            proc(self)
+
+    @staticmethod
+    def _attach_optional_scales(layer: nn.Module, hf_base: str) -> None:
+        """Attach hf_keys/weight_loader/optional=True to spec-allocated scales.
+
+        ``Fp8Spec`` (and any future quant spec) creates ``weight_scale`` /
+        ``input_scale`` as parameters on the layer. They are absent in
+        non-quant checkpoints, so they're marked optional — missing keys
+        don't raise under ``strict=True`` and the spec's
+        :meth:`process_after_loading` handles any shape fixup.
+        """
+        for name in ("weight_scale", "input_scale"):
+            p = getattr(layer, name, None)
+            if isinstance(p, nn.Parameter):
+                p.hf_keys = [(f"{hf_base}.{name}", None)]
+                p.weight_loader = replicated()
+                p.optional = True
 
 
 class ReplicatedLinear(LinearBase):
@@ -83,6 +105,7 @@ class ReplicatedLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -92,6 +115,7 @@ class ReplicatedLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            device=device,
             prefix=prefix,
         )
         self.spec.allocate(
@@ -101,6 +125,7 @@ class ReplicatedLinear(LinearBase):
                 logical_widths=[out_features],
                 fused_dim=0,
                 params_dtype=self.params_dtype,
+                device=self.device,
             ),
         )
         self.input_size_per_partition = in_features
@@ -109,11 +134,19 @@ class ReplicatedLinear(LinearBase):
         self.output_size_global = out_features
         if bias:
             self.bias = nn.Parameter(
-                torch.zeros(out_features, dtype=self.params_dtype),
+                torch.zeros(out_features, dtype=self.params_dtype, device=self.device),
                 requires_grad=False,
             )
         else:
             self.register_parameter("bias", None)
+
+        if prefix:
+            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.weight_loader = replicated()
+            if self.bias is not None:
+                self.bias.hf_keys = [(f"{prefix}.bias", None)]
+                self.bias.weight_loader = replicated()
+            self._attach_optional_scales(self, prefix)
 
     def forward(
         self,
@@ -130,24 +163,6 @@ class ReplicatedLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
         y = kernel.apply(self, x, bias)
         return y, (self.bias if self.skip_bias_add else None)
-
-    def placements(self) -> list[Placement]:
-        parent, own = split_prefix(self.prefix)
-        hf_base = f"{parent}.{own}" if parent else own
-        out: list[Placement] = [
-            CopyPlacement(
-                hf_key=f"{hf_base}.weight",
-                phyai_key=f"{self.prefix}.weight",
-            )
-        ]
-        if self.bias is not None:
-            out.append(
-                CopyPlacement(
-                    hf_key=f"{hf_base}.bias",
-                    phyai_key=f"{self.prefix}.bias",
-                )
-            )
-        return out
 
 
 class ColumnParallelLinear(LinearBase):
@@ -171,6 +186,7 @@ class ColumnParallelLinear(LinearBase):
         spec: object | None = None,
         output_sizes: list[int] | None = None,
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -180,10 +196,12 @@ class ColumnParallelLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            device=device,
             prefix=prefix,
         )
         mesh_obj = resolve_mesh(mesh)
         self.mesh_name = mesh_obj.name
+        self._mesh = mesh_obj
         self.axis = axis
         self.sp_axis = sp_axis
         self.gather_output = gather_output
@@ -212,6 +230,7 @@ class ColumnParallelLinear(LinearBase):
                 logical_widths=per_rank_sizes,
                 fused_dim=0,
                 params_dtype=self.params_dtype,
+                device=self.device,
             ),
         )
         self.input_size_per_partition = in_features
@@ -221,11 +240,23 @@ class ColumnParallelLinear(LinearBase):
 
         if bias:
             self.bias = nn.Parameter(
-                torch.zeros(sum(per_rank_sizes), dtype=self.params_dtype),
+                torch.zeros(
+                    sum(per_rank_sizes), dtype=self.params_dtype, device=self.device
+                ),
                 requires_grad=False,
             )
         else:
             self.register_parameter("bias", None)
+
+        # Non-fused column-parallel: subclasses (Merged / QKV) override
+        # by re-attaching after super().__init__ returns.
+        if prefix and len(per_rank_sizes) == 1:
+            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.weight_loader = sharded(dim=0, axis=axis, mesh=mesh_obj)
+            if self.bias is not None:
+                self.bias.hf_keys = [(f"{prefix}.bias", None)]
+                self.bias.weight_loader = sharded(dim=0, axis=axis, mesh=mesh_obj)
+            self._attach_optional_scales(self, prefix)
 
     def forward(
         self,
@@ -249,42 +280,11 @@ class ColumnParallelLinear(LinearBase):
             y = P.all_gather(y, axis=self.axis, dim=-1)
         return y, (self.bias if self.skip_bias_add else None)
 
-    def placements(self) -> list[Placement]:
-        """Non-fused column-parallel: one HF tensor → one phyai param.
-
-        Subclasses override for fused layouts (gate/up, q/k/v).
-        """
-        if len(self.output_partition_sizes) != 1:
-            raise NotImplementedError(
-                f"{type(self).__name__} has {len(self.output_partition_sizes)} "
-                f"output partitions; subclass must override placements()."
-            )
-        parent, own = split_prefix(self.prefix)
-        hf_base = f"{parent}.{own}" if parent else own
-        per_rank = self.output_size_per_partition
-        src_slice = (Slice1D(0, self.tp_rank * per_rank, per_rank),)
-        out: list[Placement] = [
-            CopyPlacement(
-                hf_key=f"{hf_base}.weight",
-                phyai_key=f"{self.prefix}.weight",
-                src_slices=src_slice,
-            )
-        ]
-        if self.bias is not None:
-            out.append(
-                CopyPlacement(
-                    hf_key=f"{hf_base}.bias",
-                    phyai_key=f"{self.prefix}.bias",
-                    src_slices=src_slice,
-                )
-            )
-        return out
-
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
     """Gate/up-style fused ColumnParallelLinear; ``output_sizes=[gate, up]``."""
 
-    DEFAULT_HF_NAMES: tuple[str, ...] = ("gate_proj", "up_proj")
+    DEFAULT_HF_LEGS: tuple[str, ...] = ("gate_proj", "up_proj")
 
     def __init__(
         self,
@@ -298,7 +298,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        hf_legs: Sequence[str] | None = None,
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -313,46 +315,43 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             spec=spec,
             output_sizes=output_sizes,
             mesh=mesh,
+            device=device,
             prefix=prefix,
         )
-
-    def placements(
-        self,
-        *,
-        hf_names: Sequence[str] | None = None,
-    ) -> list[Placement]:
-        names = tuple(hf_names) if hf_names is not None else self.DEFAULT_HF_NAMES
-        if len(names) != len(self.output_partition_sizes):
+        legs = tuple(hf_legs) if hf_legs is not None else self.DEFAULT_HF_LEGS
+        if len(legs) != len(self.output_partition_sizes):
             raise ValueError(
-                f"hf_names length {len(names)} != output_partition_sizes "
+                f"hf_legs length {len(legs)} != output_partition_sizes "
                 f"{len(self.output_partition_sizes)}"
             )
-        parent, _ = split_prefix(self.prefix)
-        out: list[Placement] = []
-        offset = 0
-        for hf_name, per_rank in zip(names, self.output_partition_sizes):
-            hf_base = f"{parent}.{hf_name}" if parent else hf_name
-            src_slice = (Slice1D(0, self.tp_rank * per_rank, per_rank),)
-            dst_slice = (Slice1D(0, offset, per_rank),)
-            out.append(
-                CopyPlacement(
-                    hf_key=f"{hf_base}.weight",
-                    phyai_key=f"{self.prefix}.weight",
-                    src_slices=src_slice,
-                    dst_slices=dst_slice,
+        self.hf_legs = legs
+
+        if prefix:
+            parent = prefix.rpartition(".")[0]
+            leg_dict: dict[int, _Leg] = {}
+            keys: list[tuple[str, int]] = []
+            bias_keys: list[tuple[str, int]] = []
+            offset = 0
+            for i, (leg_name, per_rank) in enumerate(
+                zip(legs, self.output_partition_sizes)
+            ):
+                hf_base = f"{parent}.{leg_name}" if parent else leg_name
+                leg_dict[i] = _Leg(
+                    offset=offset, size=per_rank, dim=0, axis=axis, replicate=1
                 )
+                keys.append((f"{hf_base}.weight", i))
+                if self.bias is not None:
+                    bias_keys.append((f"{hf_base}.bias", i))
+                offset += per_rank
+            self.weight.hf_keys = keys
+            self.weight.weight_loader = fused(
+                fuse_dim=0, legs=leg_dict, mesh=self._mesh
             )
             if self.bias is not None:
-                out.append(
-                    CopyPlacement(
-                        hf_key=f"{hf_base}.bias",
-                        phyai_key=f"{self.prefix}.bias",
-                        src_slices=src_slice,
-                        dst_slices=dst_slice,
-                    )
+                self.bias.hf_keys = bias_keys
+                self.bias.weight_loader = fused(
+                    fuse_dim=0, legs=leg_dict, mesh=self._mesh
                 )
-            offset += per_rank
-        return out
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -360,11 +359,11 @@ class QKVParallelLinear(ColumnParallelLinear):
 
     When ``tp_size`` exceeds ``num_kv_heads``, K and V are replicated
     ``tp_size // num_kv_heads`` times so every rank has a full set.
-    The replica logic appears in :meth:`placements` as
-    ``slot_rank = tp_rank // replica_factor``.
+    The replica logic shows up in the ``fused(...)`` loader's
+    ``_Leg(replicate=...)`` for the K and V legs.
     """
 
-    DEFAULT_HF_NAMES: Mapping[str, str] = MappingProxyType(
+    DEFAULT_HF_LEGS: Mapping[str, str] = MappingProxyType(
         {"q": "q_proj", "k": "k_proj", "v": "v_proj"}
     )
 
@@ -382,7 +381,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
+        hf_legs: Mapping[str, str] | None = None,
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         mesh_obj = resolve_mesh(mesh)
@@ -421,6 +422,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             spec=spec,
             output_sizes=[q_size, kv_size, kv_size],
             mesh=mesh,
+            device=device,
             prefix=prefix,
         )
         self.num_kv_replicas = num_kv_replicas
@@ -428,47 +430,49 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
 
-    def placements(
-        self,
-        *,
-        hf_names: Mapping[str, str] | None = None,
-    ) -> list[Placement]:
-        names = hf_names or self.DEFAULT_HF_NAMES
+        legs = dict(hf_legs) if hf_legs is not None else dict(self.DEFAULT_HF_LEGS)
         for required in ("q", "k", "v"):
-            if required not in names:
-                raise ValueError(
-                    f"hf_names missing key {required!r}; got {dict(names)!r}"
-                )
-        parent, _ = split_prefix(self.prefix)
-        out: list[Placement] = []
-        offset = 0
-        for slot, kind in enumerate(("q", "k", "v")):
-            per_rank = self.output_partition_sizes[slot]
-            replica_factor = 1 if kind == "q" else self.num_kv_replicas
-            slot_rank = self.tp_rank // replica_factor
-            hf_name = names[kind]
-            hf_base = f"{parent}.{hf_name}" if parent else hf_name
-            src_slice = (Slice1D(0, slot_rank * per_rank, per_rank),)
-            dst_slice = (Slice1D(0, offset, per_rank),)
-            out.append(
-                CopyPlacement(
-                    hf_key=f"{hf_base}.weight",
-                    phyai_key=f"{self.prefix}.weight",
-                    src_slices=src_slice,
-                    dst_slices=dst_slice,
-                )
+            if required not in legs:
+                raise ValueError(f"hf_legs missing key {required!r}; got {legs!r}")
+        self.hf_legs = legs
+
+        if prefix:
+            parent = prefix.rpartition(".")[0]
+            q_local, k_local, v_local = self.output_partition_sizes
+            leg_dict: dict[str, _Leg] = {
+                "q": _Leg(offset=0, size=q_local, dim=0, axis=axis, replicate=1),
+                "k": _Leg(
+                    offset=q_local,
+                    size=k_local,
+                    dim=0,
+                    axis=axis,
+                    replicate=num_kv_replicas,
+                ),
+                "v": _Leg(
+                    offset=q_local + k_local,
+                    size=v_local,
+                    dim=0,
+                    axis=axis,
+                    replicate=num_kv_replicas,
+                ),
+            }
+            keys: list[tuple[str, str]] = []
+            bias_keys: list[tuple[str, str]] = []
+            for kind in ("q", "k", "v"):
+                hf_name = legs[kind]
+                hf_base = f"{parent}.{hf_name}" if parent else hf_name
+                keys.append((f"{hf_base}.weight", kind))
+                if self.bias is not None:
+                    bias_keys.append((f"{hf_base}.bias", kind))
+            self.weight.hf_keys = keys
+            self.weight.weight_loader = fused(
+                fuse_dim=0, legs=leg_dict, mesh=self._mesh
             )
             if self.bias is not None:
-                out.append(
-                    CopyPlacement(
-                        hf_key=f"{hf_base}.bias",
-                        phyai_key=f"{self.prefix}.bias",
-                        src_slices=src_slice,
-                        dst_slices=dst_slice,
-                    )
+                self.bias.hf_keys = bias_keys
+                self.bias.weight_loader = fused(
+                    fuse_dim=0, legs=leg_dict, mesh=self._mesh
                 )
-            offset += per_rank
-        return out
 
 
 class RowParallelLinear(LinearBase):
@@ -492,6 +496,7 @@ class RowParallelLinear(LinearBase):
         params_dtype: torch.dtype | None = None,
         spec: object | None = None,
         mesh: str = "model",
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -501,10 +506,12 @@ class RowParallelLinear(LinearBase):
             skip_bias_add=skip_bias_add,
             params_dtype=params_dtype,
             spec=spec,
+            device=device,
             prefix=prefix,
         )
         mesh_obj = resolve_mesh(mesh)
         self.mesh_name = mesh_obj.name
+        self._mesh = mesh_obj
         self.axis = axis
         self.sp_axis = sp_axis
         self.tp_size = mesh_obj.axis_size(axis)
@@ -525,6 +532,7 @@ class RowParallelLinear(LinearBase):
                 logical_widths=[out_features],
                 fused_dim=0,
                 params_dtype=self.params_dtype,
+                device=self.device,
             ),
         )
         self.input_size_per_partition = in_per_rank
@@ -535,11 +543,20 @@ class RowParallelLinear(LinearBase):
             # RowParallel bias is global (only rank 0 adds it at forward), so
             # every rank loads the full disk tensor unsliced.
             self.bias = nn.Parameter(
-                torch.zeros(out_features, dtype=self.params_dtype),
+                torch.zeros(out_features, dtype=self.params_dtype, device=self.device),
                 requires_grad=False,
             )
         else:
             self.register_parameter("bias", None)
+
+        if prefix:
+            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.weight_loader = sharded(dim=1, axis=axis, mesh=mesh_obj)
+            if self.bias is not None:
+                # Bias is replicated for row-parallel — full copy, no slice.
+                self.bias.hf_keys = [(f"{prefix}.bias", None)]
+                self.bias.weight_loader = replicated()
+            self._attach_optional_scales(self, prefix)
 
     def forward(
         self,
@@ -571,24 +588,3 @@ class RowParallelLinear(LinearBase):
             else:
                 y = P.all_reduce(y, axis=self.axis)
         return y, (self.bias if self.skip_bias_add else None)
-
-    def placements(self) -> list[Placement]:
-        parent, own = split_prefix(self.prefix)
-        hf_base = f"{parent}.{own}" if parent else own
-        shard = self.input_size_per_partition
-        out: list[Placement] = [
-            CopyPlacement(
-                hf_key=f"{hf_base}.weight",
-                phyai_key=f"{self.prefix}.weight",
-                src_slices=(Slice1D(1, self.tp_rank * shard, shard),),
-            )
-        ]
-        if self.bias is not None:
-            # Bias is replicated for row-parallel — full copy, no slice.
-            out.append(
-                CopyPlacement(
-                    hf_key=f"{hf_base}.bias",
-                    phyai_key=f"{self.prefix}.bias",
-                )
-            )
-        return out

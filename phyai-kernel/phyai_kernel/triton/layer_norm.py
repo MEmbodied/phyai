@@ -25,7 +25,7 @@ import triton
 import triton.language as tl
 
 # Largest single-block row width. Same budget as rms_norm.py — 8192 fp32
-# lanes = 32 KiB per row, well within per-SM SRAM on Ampere/Hopper/Blackwell.
+# lanes = 32 KiB per row, well within per-SM SRAM on modern CUDA architectures.
 _SINGLE_BLOCK_MAX = 8192
 
 

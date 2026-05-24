@@ -118,7 +118,7 @@ class vGPU:
     def close(self) -> None:
         """Release backend resources. Idempotent.
 
-        Order: synchronise stream → backend ``destroy`` → drop pool ref.
+        Order: synchronise stream -> backend ``destroy`` -> drop pool ref.
         Sync ensures no enqueued op is still in flight when the green ctx
         goes away; the MemPool reclaims its segments once the allocator
         observes its refcount drop to zero (live tensors keep it alive

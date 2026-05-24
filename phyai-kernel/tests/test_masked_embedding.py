@@ -106,7 +106,7 @@ def test_masked_embedding_full_shard_matches_reference(
 
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype
-    # No reductions, no fp32 promotion → bit-exact for every dtype.
+    # No reductions, no fp32 promotion -> bit-exact for every dtype.
     assert torch.equal(
         actual, expected
     ), f"mismatch at shape={shape} D={embedding_dim} dtype={dtype}"
@@ -118,7 +118,7 @@ def test_masked_embedding_full_shard_matches_reference(
 def test_masked_embedding_partial_shard_zeros_out_of_range(
     shape: tuple[int, ...], embedding_dim: int, dtype: torch.dtype
 ):
-    """Rank holds [256, 512); ids span the full vocab → about half are zeroed."""
+    """Rank holds [256, 512); ids span the full vocab -> about half are zeroed."""
     V_global = 1024
     shard_start, shard_end = 256, 512
     V_per_rank = shard_end - shard_start

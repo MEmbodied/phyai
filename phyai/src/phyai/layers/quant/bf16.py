@@ -27,7 +27,11 @@ class Bf16Spec:
 
     def allocate(self, layer: nn.Module, request: AllocationRequest) -> None:
         layer.weight = nn.Parameter(
-            torch.empty(*request.weight_shape, dtype=request.params_dtype),
+            torch.empty(
+                *request.weight_shape,
+                dtype=request.params_dtype,
+                device=request.device,
+            ),
             requires_grad=False,
         )
         layer.logical_widths = list(request.logical_widths)

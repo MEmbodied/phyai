@@ -36,7 +36,7 @@ def init(
       - ``torch.distributed`` is initialised with ``world_size > 1``;
       - the target device is not a CUDA device;
       - CUDA is unavailable; or
-      - the device's compute capability is below 8.0 (Ampere).
+      - the device's compute capability is below 8.0.
 
     May be called more than once; the latest call wins for backend
     selection.

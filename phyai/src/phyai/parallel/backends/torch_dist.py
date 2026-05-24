@@ -49,7 +49,7 @@ class NcclBackend:
     }
 
     def __init__(self) -> None:
-        # Op → bound method dispatch table. Built per-instance so the
+        # Op -> bound method dispatch table. Built per-instance so the
         # bound methods capture self.
         self._handlers: dict[Op, callable] = {
             Op.ALL_REDUCE: self._all_reduce,

@@ -11,6 +11,9 @@ dependencies = [
     "phyai-utils-tools",
 ]
 
+[tool.ruff.format]
+preview = false
+
 [tool.uv]
 package = false
 

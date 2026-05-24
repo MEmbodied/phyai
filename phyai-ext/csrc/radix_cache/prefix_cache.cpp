@@ -69,7 +69,7 @@ std::size_t prefix_cache::collect_units_into(tree_node* end, tier t, std::int32_
     if (auto* r = n->resource(t)) total += r->size_in_units();
   }
   if (total > capacity || out == nullptr) return total;
-  // Second pass: walk root → end (reverse the parent chain) and copy in order.
+  // Second pass: walk root -> end (reverse the parent chain) and copy in order.
   std::vector<tree_node*> chain;
   chain.reserve(16);
   for (tree_node* n = end; n != nullptr; n = n->parent()) {
@@ -481,7 +481,7 @@ void prefix_cache::touch_step(tree_node* node) {
 
 std::uint64_t prefix_cache::node_path_hash(const tree_node* node) const {
   if (node == nullptr || node == tree_.root()) return 0;
-  // Walk root → node, hashing each segment. Using xxh3 on the concatenated
+  // Walk root -> node, hashing each segment. Using xxh3 on the concatenated
   // bytes is equivalent to a single hash over the full path.
   std::vector<const tree_node*> chain;
   for (const tree_node* n = node; n != nullptr && n != tree_.root(); n = n->parent()) { chain.push_back(n); }

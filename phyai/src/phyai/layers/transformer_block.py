@@ -1,7 +1,21 @@
-"""NoStateTransformerBlock — a highly configurable prefill-only transformer block.
+"""TransformerBlock — unified pre-norm / sandwich-norm transformer block.
 
-One block, two normalisation topologies, optional Q/K head-dim norm, no
-KV cache:
+One class for three attention flavors, chosen by the ``attn_kind``
+argument:
+
+* ``attn_kind="attention"`` (default) → :class:`Attention`. No KV
+  cache. Suitable for SigLIP-style vision encoders or any prefill-only
+  path. Forward takes ``cu_seqlens_q`` / ``cu_seqlens_kv`` for ragged
+  input or builds a default ctx from the q/k layout.
+* ``attn_kind="ar"`` (requires ``layer_idx: int``) → :class:`ARAttention`
+  bound to that ``layer_id``. LM-side paged attention. Forward expects
+  an ``attn_ctx`` from the runner; K/V get scattered into
+  ``attn_ctx.kv_pool`` at ``attn_ctx.write_indices``.
+* ``attn_kind="diffusion"`` (requires ``layer_idx: int``) →
+  :class:`DiffusionAttention` bound to that ``layer_id``. Action-expert
+  / diffusion paged attention. Same forward shape as ``"ar"``.
+
+Two normalisation topologies, optional Q/K head-dim norm:
 
 * **Pre-norm** (Llama / Qwen2 / Qwen2.5 / Qwen3 / Mistral / Phi3 /
   SigLIP encoder)::
@@ -19,22 +33,37 @@ on the per-head ``head_dim`` axis after the QKV projection and before
 RoPE — used by Gemma3 (gemma-style ``(1+w)`` RMS) and Qwen3 (standard
 RMS).
 
+Branch-free forward
+-------------------
+Every optional knob is resolved at __init__ into a concrete module slot
+(:class:`torch.nn.Identity` stand-ins for the disabled cases) plus a
+bound :attr:`_attn_forward` method pointer that captures the differing
+:class:`Attention` / :class:`ARAttention` / :class:`DiffusionAttention`
+call signatures. ``forward()`` itself contains zero ``if`` statements.
+
 Knob matrix
 -----------
 
 ================  ========================================================
 group             knobs
 ================  ========================================================
+mode              ``attn_kind`` (``"attention"`` / ``"ar"`` /
+                  ``"diffusion"``); ``layer_idx`` (forbidden for
+                  ``"attention"``, required for the other two)
 norm              ``norm_type`` (rmsnorm / gemma_rmsnorm / layernorm),
                   ``norm_eps``, ``norm_bias`` (LN only), ``norm_backend``,
                   ``sandwich_norm`` (off → 2 norms; on → 4 norms)
 attention         ``num_heads``, ``num_kv_heads``, ``head_dim``,
-                  ``attn_causal``, ``attn_sliding_window``,
-                  ``attn_logits_soft_cap``, ``attn_scale``,
+                  ``attn_causal``, ``attn_sliding_window``
+                  (``"attention"`` only),
+                  ``attn_logits_soft_cap`` (``"attention"`` only),
+                  ``attn_scale``,
                   ``attn_bias`` (q/k/v), ``attn_out_bias`` (o-proj),
                   ``attn_qk_norm`` (per-head Q/K norm), ``attn_backend``
 RoPE              ``rope`` (a :class:`RotaryEmbedding` instance shared
-                  across layers, or ``None`` for vision encoders)
+                  across layers, or ``None`` for vision encoders / when
+                  positions don't apply); ``precompute_rope`` (Pattern A
+                  vs Pattern B — see "RoPE patterns" below)
 MLP               ``intermediate_size``, ``mlp_gated``, ``mlp_activation``,
                   ``mlp_bias``
 TP                ``axis`` / ``sp_axis`` / ``mesh``
@@ -54,14 +83,42 @@ SigLIP, for the QKV side).
 
 Forward
 -------
-``forward(x, position_ids=None, cu_seqlens_q=None, cu_seqlens_kv=None) -> y``
+``forward(x, *, positions=None, attn_ctx=None, cu_seqlens_q=None, cu_seqlens_kv=None, rope_cos=None, rope_sin=None) -> y``
 
 * ``x``: ``(B, S, hidden_size)`` for padded batches, ``(nnz, hidden_size)``
   for ragged. Output preserves the leading shape.
-* ``position_ids``: required when ``rope`` is set — ``(B, S)`` / ``(S,)``
-  for padded, ``(nnz,)`` for ragged.
-* ``cu_seqlens_q`` / ``cu_seqlens_kv``: int32 ``(B+1,)`` for ragged input,
-  passed through to :class:`NoStateAttention`.
+* ``positions``: required in **Pattern A** (``precompute_rope=False``,
+  the default) — ``(B, S)`` / ``(S,)`` for padded, ``(nnz,)`` for ragged.
+  Ignored in Pattern B.
+* ``rope_cos`` / ``rope_sin``: required in **Pattern B**
+  (``precompute_rope=True``) — pre-gathered cos/sin tensors from
+  :meth:`RotaryEmbedding.compute_cos_sin`. Ignored in Pattern A.
+* ``attn_ctx``: required for ``attn_kind="ar"`` / ``"diffusion"``
+  (the runner builds the right ctx type per stack); optional for
+  ``attn_kind="attention"`` (:class:`Attention` builds a default ctx
+  if absent).
+* ``cu_seqlens_q`` / ``cu_seqlens_kv``: int32 ``(B+1,)`` for ragged
+  input in ``attn_kind="attention"``. Ignored in the paged kinds (the
+  paged attention reads cu_seqlens off the runner-built ``attn_ctx``).
+
+RoPE patterns
+-------------
+* **Pattern A** (``precompute_rope=False``, default): per-layer fused
+  gather-and-rotate via :meth:`RotaryEmbedding.forward(positions, q, k)`.
+  Argument order is ``(positions, q, k)`` to match the kernel's
+  position-then-rotation contract. The flashinfer kernel does the
+  position → cos/sin lookup in-kernel.
+* **Pattern B** (``precompute_rope=True``): the caller (typically the
+  stack) calls :meth:`RotaryEmbedding.compute_cos_sin(positions)` once,
+  then threads the resulting ``(cos, sin)`` to every layer's forward as
+  ``rope_cos`` / ``rope_sin``. Each layer skips the cache gather and
+  runs only the rotation via :meth:`RotaryEmbedding.apply_with_cos_sin`.
+  Helpful for cuda-graph capture (one less kernel inside the captured
+  region per layer) and deep stacks where the gather appears in profiles.
+
+The pattern is fixed at construction; :meth:`forward` dispatches via a
+bound :attr:`_apply_rope` method pointer with zero ``if`` on rope
+configuration.
 
 Norm-position keys
 ------------------
@@ -87,35 +144,54 @@ is always ``mlp``.
 
 Limitations
 -----------
-* Prefill only. No KV cache, no radix.
-* No append-prefill mode. Q and K must share token count.
+* Paged kinds (``"ar"`` / ``"diffusion"``) do not yet accept
+  ``attn_sliding_window`` / ``attn_logits_soft_cap`` (raises
+  :class:`NotImplementedError` at construction); the paged attention
+  classes do not surface them today.
+* No append-prefill mode in no-cache mode. Q and K must share token
+  count.
 * No fused FP8 RoPE / Q/K quant.
 * No cross-attention (decoder-only / encoder-only).
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
 
 import torch
 import torch.nn as nn
 
-from phyai.layers.attention.no_state_attention import NoStateAttention
+from phyai.layers.attention.ar import ARAttention, ARAttnCtx
+from phyai.layers.attention.attention import Attention, AttnCtx
+from phyai.layers.attention.diffusion import DiffusionAttention, DiffusionAttnCtx
 from phyai.layers.layer_norm import GemmaRMSNorm, LayerNorm, RMSNorm
 from phyai.layers.linear.layers import (
     QKVParallelLinear,
     RowParallelLinear,
 )
 from phyai.layers.mlp.dense_mlp import DenseMLP
-from phyai.layers.placement import Placement
 
 
-# Required keys in ``norm_hf_names`` per topology. The block is a
-# structural primitive; the actual HF strings live in the model file
-# (``models/{family}/__init__.py`` once those exist).
-_REQUIRED_NORM_KEYS_PRE: frozenset[str] = frozenset({"input_norm", "pre_ff_norm"})
-_REQUIRED_NORM_KEYS_SANDWICH: frozenset[str] = frozenset(
-    {"input_norm", "post_attn_norm", "pre_ff_norm", "post_ff_norm"}
+# HuggingFace de-facto norm naming defaults. Llama / Qwen2 / Qwen3 / Mistral /
+# Phi3 / Olmo all use ``input_layernorm`` + ``post_attention_layernorm``;
+# Gemma2 / Gemma3 add ``pre_feedforward_layernorm`` + ``post_feedforward_layernorm``
+# for the sandwich-norm topology. The mapping is ``phyai_slot -> hf_default``.
+# The user-facing override dict is keyed by ``hf_default`` (recognisable to anyone
+# coming from a HuggingFace modeling file) and gets resolved to the slot internally.
+_HF_NORM_NAMES_PRE: Mapping[str, str] = MappingProxyType(
+    {
+        "input_norm": "input_layernorm",
+        "pre_ff_norm": "post_attention_layernorm",
+    }
+)
+_HF_NORM_NAMES_SANDWICH: Mapping[str, str] = MappingProxyType(
+    {
+        "input_norm": "input_layernorm",
+        "post_attn_norm": "post_attention_layernorm",
+        "pre_ff_norm": "pre_feedforward_layernorm",
+        "post_ff_norm": "post_feedforward_layernorm",
+    }
 )
 
 _VALID_NORM_TYPES: tuple[str, ...] = ("rmsnorm", "gemma_rmsnorm", "layernorm")
@@ -153,17 +229,90 @@ def _make_norm(
     )
 
 
-class NoStateTransformerBlock(nn.Module):
-    """Configurable pre-norm / sandwich-norm transformer block (no KV cache).
+def _validate_norm_hf_names(
+    overrides: Mapping[str, str] | None, sandwich: bool
+) -> dict[str, str]:
+    """Resolve the actual HF source name for each norm slot.
+
+    ``overrides`` is keyed by **HuggingFace default names**
+    (``"input_layernorm"`` etc.) — the same names users see in any
+    HF modeling file. A missing entry uses the HF default itself.
+    ``None`` means use HF defaults for everything (covers Llama /
+    Qwen / Gemma / Mistral / Phi3 — the common case).
+
+    Returns a ``{phyai_slot -> actual_hf_source_name}`` map for
+    internal use by :func:`_norm_prefix_for`.
+    """
+    defaults = _HF_NORM_NAMES_SANDWICH if sandwich else _HF_NORM_NAMES_PRE
+    out = dict(defaults)
+    if overrides is None:
+        return out
+    hf_to_slot = {hf_default: slot for slot, hf_default in defaults.items()}
+    unknown = set(overrides) - set(hf_to_slot)
+    if unknown:
+        topo = "sandwich-norm" if sandwich else "pre-norm"
+        raise ValueError(
+            f"norm_hf_names has unknown keys {sorted(unknown)!r} for "
+            f"{topo} topology; expected subset of "
+            f"{sorted(hf_to_slot.keys())!r}."
+        )
+    for hf_default, actual in overrides.items():
+        out[hf_to_slot[hf_default]] = actual
+    return out
+
+
+def _norm_prefix_for(prefix: str, position: str, names: Mapping[str, str]) -> str:
+    own = names[position]
+    return f"{prefix}.{own}" if prefix else own
+
+
+def _split_qkv(
+    fused: torch.Tensor,
+    leading: torch.Size,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split fused QKV projection into ``(q, k, v)`` shaped ``(..., heads, head_dim)``."""
+    q_dim = q_heads * head_dim
+    kv_dim = kv_heads * head_dim
+    q, k, v = fused.split([q_dim, kv_dim, kv_dim], dim=-1)
+    q = q.reshape(*leading, q_heads, head_dim)
+    k = k.reshape(*leading, kv_heads, head_dim)
+    v = v.reshape(*leading, kv_heads, head_dim)
+    return q, k, v
+
+
+class TransformerBlock(nn.Module):
+    """Configurable transformer block with optional KV cache.
 
     See module docstring for the full topology and knob list. The class
     composes existing phyai primitives:
     :class:`QKVParallelLinear` →
     (optional Q/K norm) →
-    (optional :class:`RotaryEmbedding`) →
-    :class:`NoStateAttention` →
+    (optional :class:`RotaryEmbedding`, two patterns) →
+    :class:`Attention` (when ``attn_kind="attention"``),
+    :class:`ARAttention` (when ``attn_kind="ar"``), or
+    :class:`DiffusionAttention` (when ``attn_kind="diffusion"``) →
     :class:`RowParallelLinear` (output proj) →
     :class:`DenseMLP`, with norms inserted per the chosen topology.
+
+    Two RoPE patterns, both branchless in :meth:`forward`:
+
+    * **Pattern A** (default, ``precompute_rope=False``): per-layer fused
+      gather-and-rotate via :meth:`RotaryEmbedding.forward`. Forward
+      caller passes ``positions`` only.
+    * **Pattern B** (``precompute_rope=True``): caller pre-computes
+      ``(rope_cos, rope_sin)`` once at the top of the layer loop via
+      :meth:`RotaryEmbedding.compute_cos_sin` and threads the tensors
+      through every layer's forward as ``rope_cos`` / ``rope_sin``;
+      the layer applies them via :meth:`RotaryEmbedding.apply_with_cos_sin`,
+      skipping the per-layer cache gather. Useful for cuda-graph capture
+      (one less kernel inside the captured region per layer) and deep
+      stacks where the position lookup shows up in profiles.
+
+    The pattern is fixed at construction; :meth:`forward` dispatches via
+    a bound method pointer (zero ``if`` on configuration).
     """
 
     def __init__(
@@ -173,9 +322,12 @@ class NoStateTransformerBlock(nn.Module):
         num_heads: int,
         intermediate_size: int,
         *,
-        # ---- HF naming (required — the divergent ones) ----------------- #
-        norm_hf_names: Mapping[str, str],
-        attn_out_hf_name: str,
+        # ---- Attention kind toggle ------------------------------------- #
+        attn_kind: Literal["attention", "ar", "diffusion"] = "attention",
+        layer_idx: int | None = None,
+        # ---- HF naming (defaults match Llama / Qwen / Gemma conventions) ---- #
+        norm_hf_names: Mapping[str, str] | None = None,
+        attn_out_hf_name: str = "o_proj",
         # ---- Attention dims --------------------------------------------- #
         num_kv_heads: int | None = None,
         head_dim: int | None = None,
@@ -190,8 +342,10 @@ class NoStateTransformerBlock(nn.Module):
         attn_out_bias: bool | None = None,
         attn_qk_norm: bool = False,
         attn_backend: str = "flashinfer",
+        attn_backend_kwargs: dict[str, Any] | None = None,
         # ---- RoPE ------------------------------------------------------- #
         rope: nn.Module | None = None,
+        precompute_rope: bool = False,
         # ---- MLP -------------------------------------------------------- #
         mlp_gated: bool = True,
         mlp_activation: str = "silu",
@@ -244,16 +398,21 @@ class NoStateTransformerBlock(nn.Module):
         self.sandwich_norm = sandwich_norm
         self.norm_type = norm_type
         self.attn_qk_norm_enabled = attn_qk_norm
+        self.layer_idx = layer_idx
+        self.attn_kind = attn_kind
         self.prefix = prefix
-        self.rope = rope
 
-        # Naming knobs
+        # Naming knobs. ``norm_hf_names=None`` uses HF defaults for the
+        # chosen topology (covers Llama / Qwen / Gemma / Mistral / Phi3).
+        # When passed, keys are HF default names (``"input_layernorm"``
+        # etc.) so the override dict reads naturally; values are the
+        # actual HF source names in this checkpoint.
         self.attn_out_hf_name = attn_out_hf_name
         self.attn_qkv_hf_names = (
             dict(attn_qkv_hf_names) if attn_qkv_hf_names is not None else None
         )
         self.mlp_gated_hf_names = tuple(mlp_gated_hf_names)
-        self._norm_hf_names = self._validate_norm_hf_names(norm_hf_names, sandwich_norm)
+        self._norm_hf_names = _validate_norm_hf_names(norm_hf_names, sandwich_norm)
 
         # Sub-prefixes
         attn_prefix = f"{prefix}.self_attn" if prefix else "self_attn"
@@ -268,25 +427,30 @@ class NoStateTransformerBlock(nn.Module):
             dtype=params_dtype,
         )
         self.input_norm = _make_norm(
-            norm_type, prefix=self._norm_prefix("input_norm"), **norm_kwargs
+            norm_type,
+            prefix=_norm_prefix_for(prefix, "input_norm", self._norm_hf_names),
+            **norm_kwargs,
         )
         self.pre_ff_norm = _make_norm(
-            norm_type, prefix=self._norm_prefix("pre_ff_norm"), **norm_kwargs
+            norm_type,
+            prefix=_norm_prefix_for(prefix, "pre_ff_norm", self._norm_hf_names),
+            **norm_kwargs,
         )
         if sandwich_norm:
             self.post_attn_norm = _make_norm(
                 norm_type,
-                prefix=self._norm_prefix("post_attn_norm"),
+                prefix=_norm_prefix_for(prefix, "post_attn_norm", self._norm_hf_names),
                 **norm_kwargs,
             )
             self.post_ff_norm = _make_norm(
                 norm_type,
-                prefix=self._norm_prefix("post_ff_norm"),
+                prefix=_norm_prefix_for(prefix, "post_ff_norm", self._norm_hf_names),
                 **norm_kwargs,
             )
         else:
-            self.post_attn_norm = None
-            self.post_ff_norm = None
+            # Identity stand-ins so forward never branches on ``sandwich_norm``.
+            self.post_attn_norm = nn.Identity()
+            self.post_ff_norm = nn.Identity()
 
         # ---- Attention: QKV → (Q/K norm) → (RoPE) → attn → O ----------- #
         self.qkv_proj = QKVParallelLinear(
@@ -300,6 +464,7 @@ class NoStateTransformerBlock(nn.Module):
             bias=attn_bias,
             params_dtype=params_dtype,
             spec=spec_qkv,
+            hf_legs=self.attn_qkv_hf_names,
             mesh=mesh,
             prefix=f"{attn_prefix}.qkv_proj",
         )
@@ -310,7 +475,7 @@ class NoStateTransformerBlock(nn.Module):
         # Optional per-head Q/K norm (Gemma3 / Qwen3). Operates on
         # ``head_dim`` (each Q/K head normalised independently). Names
         # ``q_norm`` / ``k_norm`` are universal across the families that
-        # use this hook today.
+        # use this hook today. Identity stand-ins when disabled.
         if attn_qk_norm:
             self.q_norm = _make_norm(
                 norm_type,
@@ -331,19 +496,96 @@ class NoStateTransformerBlock(nn.Module):
                 prefix=f"{attn_prefix}.k_norm",
             )
         else:
-            self.q_norm = None
-            self.k_norm = None
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
 
-        self.attn = NoStateAttention(
-            num_heads=self.q_heads_local,
-            head_dim=head_dim,
-            num_kv_heads=self.kv_heads_local,
-            scale=attn_scale,
-            causal=attn_causal,
-            sliding_window=attn_sliding_window,
-            logits_soft_cap=attn_logits_soft_cap,
-            backend=attn_backend,
-        )
+        # RoPE — three modes wired at __init__ via a bound dispatcher
+        # method pointer. The hot path calls ``self._apply_rope(...)`` —
+        # zero ``if`` on rope configuration. ``self._rope_input_kind``
+        # picks the input-validation branch in :meth:`forward`.
+        #
+        # * ``rope=None``                       → passthrough (no rotation)
+        # * ``precompute_rope=False`` (default) → Pattern A: fused per-layer
+        # * ``precompute_rope=True``            → Pattern B: caller-supplied cos/sin
+        if rope is None:
+            self.rope = None
+            self._apply_rope = self._apply_rope_passthrough
+            self._rope_input_kind = "none"
+        elif precompute_rope:
+            self.rope = rope
+            self._apply_rope = self._apply_rope_precomputed
+            self._rope_input_kind = "cos_sin"
+        else:
+            self.rope = rope
+            self._apply_rope = self._apply_rope_per_layer
+            self._rope_input_kind = "positions"
+
+        # Attention sub-module + bound forward-method pointer. The
+        # method-pointer write at __init__ replaces a runtime ``if`` in
+        # the hot path with a single attribute lookup.
+        if attn_kind == "attention":
+            if layer_idx is not None:
+                raise ValueError(
+                    f"attn_kind='attention' must have layer_idx=None, "
+                    f"got layer_idx={layer_idx}."
+                )
+            self.attn = Attention(
+                num_heads=self.q_heads_local,
+                head_dim=head_dim,
+                num_kv_heads=self.kv_heads_local,
+                scale=attn_scale,
+                causal=attn_causal,
+                sliding_window=attn_sliding_window,
+                logits_soft_cap=attn_logits_soft_cap,
+                backend=attn_backend,
+                backend_kwargs=attn_backend_kwargs,
+            )
+            self._attn_forward = self._attn_forward_attention
+        elif attn_kind == "ar":
+            if layer_idx is None:
+                raise ValueError("attn_kind='ar' requires layer_idx: int.")
+            if attn_sliding_window is not None or attn_logits_soft_cap is not None:
+                raise NotImplementedError(
+                    "attn_sliding_window / attn_logits_soft_cap are not yet "
+                    "supported in the AR (paged) path; ARAttention does not "
+                    "accept them today."
+                )
+            self.attn = ARAttention(
+                num_heads=self.q_heads_local,
+                head_dim=head_dim,
+                layer_id=layer_idx,
+                num_kv_heads=self.kv_heads_local,
+                scale=attn_scale,
+                causal=attn_causal,
+                backend=attn_backend,
+                backend_kwargs=attn_backend_kwargs,
+            )
+            self._attn_forward = self._attn_forward_ar
+        elif attn_kind == "diffusion":
+            if layer_idx is None:
+                raise ValueError("attn_kind='diffusion' requires layer_idx: int.")
+            if attn_sliding_window is not None or attn_logits_soft_cap is not None:
+                raise NotImplementedError(
+                    "attn_sliding_window / attn_logits_soft_cap are not yet "
+                    "supported in the diffusion (paged) path; "
+                    "DiffusionAttention does not accept them today."
+                )
+            self.attn = DiffusionAttention(
+                num_heads=self.q_heads_local,
+                head_dim=head_dim,
+                layer_id=layer_idx,
+                num_kv_heads=self.kv_heads_local,
+                scale=attn_scale,
+                causal=attn_causal,
+                backend=attn_backend,
+                backend_kwargs=attn_backend_kwargs,
+            )
+            self._attn_forward = self._attn_forward_diffusion
+        else:
+            raise ValueError(
+                f"Unknown attn_kind {attn_kind!r}; expected one of "
+                f"'attention', 'ar', 'diffusion'."
+            )
 
         self.o_proj = RowParallelLinear(
             in_features=num_heads * head_dim,
@@ -371,38 +613,91 @@ class NoStateTransformerBlock(nn.Module):
             params_dtype=params_dtype,
             spec_in=spec_mlp_in,
             spec_out=spec_mlp_out,
+            gated_hf_legs=self.mlp_gated_hf_names,
             mesh=mesh,
             prefix=mlp_prefix,
         )
 
     # ------------------------------------------------------------------ #
-    # Naming validation                                                  #
+    # Attention dispatch — bound at __init__ so forward has no ``if``    #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _validate_norm_hf_names(
-        names: Mapping[str, str], sandwich: bool
-    ) -> dict[str, str]:
-        required = _REQUIRED_NORM_KEYS_SANDWICH if sandwich else _REQUIRED_NORM_KEYS_PRE
-        keys = set(names.keys())
-        missing = required - keys
-        extra = keys - required
-        if missing or extra:
-            topo = "sandwich-norm" if sandwich else "pre-norm"
-            parts: list[str] = []
-            if missing:
-                parts.append(f"missing keys {sorted(missing)!r}")
-            if extra:
-                parts.append(f"unexpected keys {sorted(extra)!r}")
-            raise ValueError(
-                f"norm_hf_names invalid for {topo} topology — "
-                f"{'; '.join(parts)}. Required: {sorted(required)!r}."
-            )
-        return dict(names)
+    def _attn_forward_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_ctx: Any,
+        cu_seqlens_q: torch.Tensor | None,
+        cu_seqlens_kv: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return self.attn(
+            q,
+            k,
+            v,
+            ctx=attn_ctx,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+        )
 
-    def _norm_prefix(self, position: str) -> str:
-        own = self._norm_hf_names[position]
-        return f"{self.prefix}.{own}" if self.prefix else own
+    def _attn_forward_ar(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_ctx: Any,
+        cu_seqlens_q: torch.Tensor | None,  # noqa: ARG002 — interface match
+        cu_seqlens_kv: torch.Tensor | None,  # noqa: ARG002 — interface match
+    ) -> torch.Tensor:
+        return self.attn(q, k, v, attn_ctx)
+
+    def _attn_forward_diffusion(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_ctx: Any,
+        cu_seqlens_q: torch.Tensor | None,  # noqa: ARG002 — interface match
+        cu_seqlens_kv: torch.Tensor | None,  # noqa: ARG002 — interface match
+    ) -> torch.Tensor:
+        return self.attn(q, k, v, attn_ctx)
+
+    # ------------------------------------------------------------------ #
+    # RoPE dispatch — bound at __init__ so forward has no ``if`` on rope #
+    # ------------------------------------------------------------------ #
+
+    def _apply_rope_passthrough(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor | None,  # noqa: ARG002 — interface match
+        rope_cos: torch.Tensor | None,  # noqa: ARG002 — interface match
+        rope_sin: torch.Tensor | None,  # noqa: ARG002 — interface match
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return q, k
+
+    def _apply_rope_per_layer(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor | None,
+        rope_cos: torch.Tensor | None,  # noqa: ARG002 — interface match
+        rope_sin: torch.Tensor | None,  # noqa: ARG002 — interface match
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Pattern A: per-layer fused gather-and-rotate.
+        return self.rope(positions, q, k)
+
+    def _apply_rope_precomputed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor | None,  # noqa: ARG002 — interface match
+        rope_cos: torch.Tensor | None,
+        rope_sin: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Pattern B: caller passed pre-gathered cos/sin (one gather per
+        # stack, amortised across N layers). Apply rotation only.
+        return self.rope.apply_with_cos_sin(q, k, rope_cos, rope_sin)
 
     # ------------------------------------------------------------------ #
     # Forward                                                            #
@@ -412,111 +707,79 @@ class NoStateTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        position_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        attn_ctx: AttnCtx | ARAttnCtx | DiffusionAttnCtx | None = None,
         cu_seqlens_q: torch.Tensor | None = None,
         cu_seqlens_kv: torch.Tensor | None = None,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Input contract — cheap checks against `self`-stored constants.
+        # NOT configuration branches (those are eliminated at __init__
+        # via Identity stand-ins + the bound ``self._attn_forward`` /
+        # ``self._apply_rope`` pointers).
         if x.dim() not in (2, 3):
             raise ValueError(
-                f"x must be 2-D (ragged) or 3-D (padded), got shape "
-                f"{tuple(x.shape)}."
+                f"x must be 2-D (ragged) or 3-D (padded), got shape {tuple(x.shape)}."
             )
         if x.shape[-1] != self.hidden_size:
             raise ValueError(
                 f"x last dim {x.shape[-1]} != hidden_size={self.hidden_size}."
             )
-        if self.rope is not None and position_ids is None:
-            raise ValueError("rope is set but no position_ids passed to forward.")
+        if self._rope_input_kind == "positions" and positions is None:
+            raise ValueError(
+                "rope is set (Pattern A) but no positions passed to forward."
+            )
+        if self._rope_input_kind == "cos_sin" and (
+            rope_cos is None or rope_sin is None
+        ):
+            raise ValueError(
+                "precompute_rope=True (Pattern B) but rope_cos / rope_sin "
+                "missing from forward kwargs."
+            )
 
         # ---- Attention sub-block --------------------------------------- #
         residual = x
         h = self.input_norm(x)
-        q, k, v = self._qkv_split(h)
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        if self.rope is not None:
-            q, k = self.rope(q, k, position_ids)
-        attn_out = self.attn(
-            q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv
+        fused, _ = self.qkv_proj(h)
+        q, k, v = _split_qkv(
+            fused,
+            x.shape[:-1],
+            self.q_heads_local,
+            self.kv_heads_local,
+            self.head_dim,
         )
-        # (..., q_heads_local, head_dim) -> (..., q_heads_local * head_dim)
-        attn_out = attn_out.reshape(
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q, k = self._apply_rope(q, k, positions, rope_cos, rope_sin)
+        attn_out = self._attn_forward(q, k, v, attn_ctx, cu_seqlens_q, cu_seqlens_kv)
+        attn_flat = attn_out.reshape(
             *attn_out.shape[:-2], self.q_heads_local * self.head_dim
         )
-        attn_out, _ = self.o_proj(attn_out)
-        if self.post_attn_norm is not None:
-            attn_out = self.post_attn_norm(attn_out)
-        h = residual + attn_out
+        out, _ = self.o_proj(attn_flat)
+        out = self.post_attn_norm(out)
+        h = residual + out
 
         # ---- MLP sub-block --------------------------------------------- #
         residual = h
         m = self.pre_ff_norm(h)
         m = self.mlp(m)
-        if self.post_ff_norm is not None:
-            m = self.post_ff_norm(m)
+        m = self.post_ff_norm(m)
         return residual + m
-
-    def _qkv_split(
-        self, h: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run QKVParallelLinear and split the fused output into (q, k, v).
-
-        Output shapes:
-            * 3-D padded ``h (B, S, hidden_size)``:
-              q ``(B, S, q_heads_local, head_dim)``,
-              k/v ``(B, S, kv_heads_local, head_dim)``.
-            * 2-D ragged ``h (nnz, hidden_size)``:
-              q ``(nnz, q_heads_local, head_dim)``,
-              k/v ``(nnz, kv_heads_local, head_dim)``.
-        """
-        fused, _ = self.qkv_proj(h)
-        q_dim = self.q_heads_local * self.head_dim
-        kv_dim = self.kv_heads_local * self.head_dim
-        q, k, v = fused.split([q_dim, kv_dim, kv_dim], dim=-1)
-        leading = h.shape[:-1]
-        q = q.reshape(*leading, self.q_heads_local, self.head_dim)
-        k = k.reshape(*leading, self.kv_heads_local, self.head_dim)
-        v = v.reshape(*leading, self.kv_heads_local, self.head_dim)
-        return q, k, v
-
-    # ------------------------------------------------------------------ #
-    # Placements                                                         #
-    # ------------------------------------------------------------------ #
-
-    def placements(self) -> list[Placement]:
-        """Concatenate placements from every parameter-bearing child."""
-        out: list[Placement] = []
-        out += self.input_norm.placements()
-        out += self.pre_ff_norm.placements()
-        if self.post_attn_norm is not None:
-            out += self.post_attn_norm.placements()
-        if self.post_ff_norm is not None:
-            out += self.post_ff_norm.placements()
-
-        qkv_kwargs: dict[str, Any] = {}
-        if self.attn_qkv_hf_names is not None:
-            qkv_kwargs["hf_names"] = self.attn_qkv_hf_names
-        out += self.qkv_proj.placements(**qkv_kwargs)
-        if self.q_norm is not None:
-            out += self.q_norm.placements()
-            out += self.k_norm.placements()
-        out += self.o_proj.placements()
-        out += self.mlp.placements(gated_in_names=self.mlp_gated_hf_names)
-        return out
-
-    # ------------------------------------------------------------------ #
 
     def extra_repr(self) -> str:
         s = (
             f"hidden_size={self.hidden_size}, num_heads={self.num_heads}, "
             f"num_kv_heads={self.num_kv_heads}, head_dim={self.head_dim}, "
             f"intermediate_size={self.intermediate_size}, "
-            f"norm_type={self.norm_type!r}, sandwich_norm={self.sandwich_norm}"
+            f"norm_type={self.norm_type!r}, sandwich_norm={self.sandwich_norm}, "
+            f"attn_kind={self.attn_kind!r}"
         )
+        if self.layer_idx is not None:
+            s += f", layer_idx={self.layer_idx}"
         if self.attn_qk_norm_enabled:
             s += ", attn_qk_norm=True"
         return s
 
 
-__all__ = ["NoStateTransformerBlock"]
+__all__ = ["TransformerBlock"]

@@ -1,0 +1,29 @@
+---
+title: "欢迎使用 PhyAI"
+description: "一起让 AGI 照进现实！"
+icon: 'star'
+mode: "wide"
+---
+
+import { SetupCard } from "/snippets/setup-card.jsx"
+
+# PhyAI 是什么
+
+**PhyAI**（**Phy**sical **AI** Inference Framework，意为“物理 AI 推理框架”，读作 “phi”）是一个面向物理 AI 模型的高性能推理框架，支持 VLA、WAM 等模型及更多扩展场景，可同时用于云端服务和端侧部署。
+
+# 安装
+
+<SetupCard
+  rows={{
+    "OS": ["Ubuntu"],
+    "Package": [
+      ["Package", "not upload to pypi yet"],
+      ["Source", `git clone https://github.com/MEmbodied/phyai
+cd phyai
+uv sync`],
+      ["Docker", "not upload yet"]
+    ],
+    "Device": ["Cloud/Consumer"],
+    "Compute Platform": ["CUDA 13.0"],
+  }}
+/>

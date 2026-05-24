@@ -1,0 +1,200 @@
+---
+title: "单卡推理 PI0.5"
+description: "PhyAI 如何在单卡上推理 pi0.5"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="pi0.5 (pi05_base)"
+  subtitle="Vision-Language-Action · 单卡推理"
+  icon="π"
+  rows={{
+    "模型类型": "VLA",
+    "权重": <a href="https://huggingface.co/lerobot/pi05_base" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/lerobot/pi05_base</a>,
+    "标签": ["VLA", "flow-matching", "PaliGemma", "SigLIP", "single-GPU"],
+    "图像输入": "3 路 RGB · 224×224",
+    "Tokenizer 长度": "200",
+    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">PI05WS1Scheduler</code>,
+    "参数精度": "bf16",
+    "论文": <a href="https://www.pi.website/blog/pi05" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">pi.website/blog/pi05</a>,
+  }}
+/>
+
+# 概述
+
+π0.5 是 Physical Intelligence 推出的视觉-语言-动作（VLA）模型，基于机器人演示数据和大规模多模态数据共同训练，能够在未见过的真实开放世界环境中执行长时程任务，并具备泛化能力。
+
+本页文档专注于 `ws1` 即 `world_size=1`,单 rank、不走分布式。本页全部内容都围绕这套单卡配置。 `entry` 是 `PI05WS1Scheduler`。
+
+![PI0.5 模型执行流程](/images/models/pi05/inference_pipeline.svg)
+
+# 架构
+
+PhyAI 的 <Tooltip headline="Engine + plugin" tip="Engine.__init__ 按固定顺序跑(config、CUDA、dist、parallel、linear),然后按名字解析插件并调用其 setup()。每个插件声明一个 Entry 子类 + 一个 EntryArgs 子类。">引擎 + 插件契约</Tooltip>把 pi0.5 推理拆成四块协作组件:
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/pi05" defaultOpen>
+    <Tree.File name="main_pi05.py" />
+    <Tree.File name="scheduler_ws1_pi05.py" />
+    <Tree.File name="model_runner_pi05.py" />
+    <Tree.File name="modeling_pi05.py" />
+    <Tree.File name="configuration_pi05.py" />
+    <Tree.File name="img_preprocess_pi05.py" />
+    <Tree.File name="tokenization_pi05.py" />
+  </Tree.Folder>
+</Tree>
+
+下面这张动图展示了 phyai 的 3 个 model runner 是怎么和 scheduler 协作的,以及 engine 初始化是怎么衔接到 `scheduler.setup()` 和 `scheduler.step()` 的。
+
+![PhyAI Engine ↔ Scheduler ↔ 3 Runners 生命周期](/images/models/pi05/engine_lifecycle.svg)
+
+# 运行 pi0.5
+
+<Steps>
+  <Step title="拿到权重">
+    准备一份 `pi05_base` safetensors checkpoint, 可以从 huggingface 下载:
+
+    ```
+    https://huggingface.co/lerobot/pi05_base
+    ```
+  </Step>
+
+  <Step title="构造 Engine">
+    插件名是 `"pi05"`。引擎一次性完成 setup、权重加载和 graph 捕获。
+
+    ```python
+    import torch
+    from pathlib import Path
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.models.pi05.main_pi05 import PI05Args
+
+    engine = Engine(
+        EngineArgs(
+            plugin="pi05",
+            plugin_args=PI05Args(
+                checkpoint_dir=Path("/path/to/pi05_base/"),
+                max_batch_size=4,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                runtime=RuntimeConfig(use_cuda_graph=True),
+            ),
+        )
+    )
+    ```
+
+    `max_batch_size` 固定捕获图的 batch 维度。按你即将提交的最大 batch 来选;比这小的 batch 在内部自动填充。
+    <Warning>batch 的 cuda graph 分桶优化在 WS=1 的时候没有开启</Warning>
+  </Step>
+
+  <Step title="构造请求">
+    `PI05Request` 携带每步推理的输入:
+
+    | 字段 | Shape | 备注 |
+    | --- | --- | --- |
+    | `pixel_values` | `(B, 3, 3, H, W)` | 每个 robot 3 路摄像头 × 3 通道,`H = W = image_size` |
+    | `input_ids` | `(B, tokenizer_max_length)` int64 | 右侧用 0 填充 |
+    | `lang_lens` | `(B,)` int64 | 每个样本未填充前的真实长度 |
+    | `noise` | `(B, chunk_size, max_action_dim)` 或 `None` | 可选;为 `None` 时调度器内部采新的 Gaussian |
+
+    `B` 可以是 `[1, max_batch_size]` 区间内的任意值。张量构造在引擎所在的 device 上;调度器会校验 shape,不一致会立即抛错。
+  </Step>
+
+  <Step title="运行一步">
+    ```python
+    actions = engine.step(request)  # (actual_B, chunk_size, max_action_dim)
+    ```
+
+    填充在返回前已经切掉 —— 你拿到的张量首维就是真实的 batch。
+  </Step>
+
+  <Step title="关闭引擎">
+    ```python
+    engine.close()
+    ```
+
+    释放调度器侧的缓冲,拆掉捕获的 cuda graph。
+  </Step>
+</Steps>
+
+# 端到端示例
+
+`examples/run_pi05.py` 用确定性 dummy 输入跑了 `max_batch_size ∈ {1, 4}` 的全路径,并包含多 batch 等价性检查。运行命令:
+
+```bash
+uv run python examples/run_pi05.py --checkpoint /path/to/pi0.5
+```
+
+脚本会打印每阶段的 latency 统计(3 次预热 + 30 次计时的 mean / median / std / min / max)以及等价性检查的 `PASS` 行。把 `--checkpoint` 后的路径改成你本地的 checkpoint 路径即可。
+
+# 当前限制
+
+- 仅支持单卡。Tensor parallel、continuous batching、preemption 都不在 `PI05WS1Scheduler` 的范围内。
+- `max_batch_size` 在引擎构造时就固定。要改尺寸,必须把引擎拆掉重建。
+- Vision tower 是按真实 robot 数顺序 replay 的,没在摄像头维度上 batch。
+
+# 完整代码
+
+```python
+from pathlib import Path
+
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi05.configuration_pi05 import PI05Config
+from phyai.models.pi05.main_pi05 import PI05Args
+from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request
+from phyai.utils import load_config
+
+CHECKPOINT_DIR = Path("/path/to/pi05_base/")  # 改成你本地的权重目录
+BATCH_SIZE = 1
+
+cfg = load_config(CHECKPOINT_DIR, PI05Config)
+device = torch.device("cuda")
+dtype = torch.bfloat16
+
+# 1. 构造 Engine —— 一次性完成 setup、权重加载、CUDA graph 捕获
+engine = Engine(
+    EngineArgs(
+        plugin="pi05",
+        plugin_args=PI05Args(
+            checkpoint_dir=CHECKPOINT_DIR,
+            max_batch_size=BATCH_SIZE,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=True),
+        ),
+    )
+)
+try:
+    # 2. 构造 dummy request: 随机像素 + 单 token prompt
+    input_ids = torch.zeros(
+        BATCH_SIZE, cfg.tokenizer_max_length, dtype=torch.int64, device=device
+    )
+    input_ids[:, 0] = 2  # 任意非 pad token id
+    request = PI05Request(
+        pixel_values=torch.rand(
+            BATCH_SIZE,
+            3,
+            3,
+            cfg.vision.image_size,
+            cfg.vision.image_size,
+            dtype=dtype,
+            device=device,
+        ),
+        input_ids=input_ids,
+        lang_lens=torch.ones(BATCH_SIZE, dtype=torch.int64, device=device),
+    )
+
+    # 3. 跑一步推理
+    actions = engine.step(request)
+    print(f"action chunk shape={tuple(actions.shape)}, dtype={actions.dtype}")
+finally:
+    # 4. 释放 scheduler 缓冲、拆掉捕获的 cuda graph
+    engine.close()
+```

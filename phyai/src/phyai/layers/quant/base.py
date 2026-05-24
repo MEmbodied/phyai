@@ -34,6 +34,11 @@ class AllocationRequest:
     merged MLP, etc. ``fused_dim`` says which dim the widths sum over;
     both linear and embedding use ``0``.
 
+    ``device`` is the device every parameter the spec allocates lands
+    on. The layer fills it from its own resolved device (see each
+    layer's ``device`` kwarg), which in turn defaults to
+    :attr:`phyai.engine_config.EngineConfig.device`.
+
     ``extras`` is the controlled escape hatch for op-specific config a
     spec may want to look at without polluting the core fields. Prefer
     a typed Protocol over stuffing things here.
@@ -43,6 +48,7 @@ class AllocationRequest:
     logical_widths: list[int]
     fused_dim: int = 0
     params_dtype: torch.dtype = torch.bfloat16
+    device: str | torch.device | None = None
     extras: Mapping[str, object] = field(default_factory=dict)
 
 

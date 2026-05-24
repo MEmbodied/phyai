@@ -1,4 +1,4 @@
-"""DenseMLP — forward parity, placements, and weight-load equivalence."""
+"""DenseMLP — forward parity, attached-loader smoke tests, weight-load equivalence."""
 
 from __future__ import annotations
 
@@ -11,11 +11,6 @@ import torch.nn.functional as F
 
 import phyai.layers.linear as L
 from phyai.layers.mlp import DenseMLP
-from phyai.layers.placement import (
-    CopyPlacement,
-    Slice1D,
-    apply_placements,
-)
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
 
@@ -143,11 +138,11 @@ def test_unknown_activation_rejected(fake_mesh):
 
 
 # ---------------------------------------------------------------------------
-# Placements
+# Attached-loader smoke tests
 # ---------------------------------------------------------------------------
 
 
-def test_placements_gated_default_names(fake_mesh):
+def test_attach_gated_default_names(fake_mesh):
     fake_mesh()
     _init_dispatcher()
     m = DenseMLP(
@@ -158,28 +153,16 @@ def test_placements_gated_default_names(fake_mesh):
         bias=False,
         prefix="model.layers.3.mlp",
     )
-    plans = m.placements()
-    assert len(plans) == 3  # gate, up (into gate_up_proj), down
-    assert plans[0] == CopyPlacement(
-        hf_key="model.layers.3.mlp.gate_proj.weight",
-        phyai_key="model.layers.3.mlp.gate_up_proj.weight",
-        src_slices=(Slice1D(0, 0, 16),),
-        dst_slices=(Slice1D(0, 0, 16),),
-    )
-    assert plans[1] == CopyPlacement(
-        hf_key="model.layers.3.mlp.up_proj.weight",
-        phyai_key="model.layers.3.mlp.gate_up_proj.weight",
-        src_slices=(Slice1D(0, 0, 16),),
-        dst_slices=(Slice1D(0, 16, 16),),
-    )
-    assert plans[2] == CopyPlacement(
-        hf_key="model.layers.3.mlp.down_proj.weight",
-        phyai_key="model.layers.3.mlp.down_proj.weight",
-        src_slices=(Slice1D(1, 0, 16),),  # row-parallel, dim=1 narrow
-    )
+    # gate_up_proj is a fused MergedColumn with two HF source legs.
+    assert m.gate_up_proj.weight.hf_keys == [
+        ("model.layers.3.mlp.gate_proj.weight", 0),
+        ("model.layers.3.mlp.up_proj.weight", 1),
+    ]
+    # down_proj is row-parallel; one source.
+    assert m.down_proj.weight.hf_keys == [("model.layers.3.mlp.down_proj.weight", None)]
 
 
-def test_placements_gated_custom_names(fake_mesh):
+def test_attach_gated_custom_legs(fake_mesh):
     fake_mesh()
     _init_dispatcher()
     m = DenseMLP(
@@ -187,14 +170,16 @@ def test_placements_gated_custom_names(fake_mesh):
         intermediate_size=16,
         activation="silu",
         gated=True,
+        gated_hf_legs=("w_gate", "w_up"),
         prefix="block.mlp",
     )
-    plans = m.placements(gated_in_names=("w_gate", "w_up"))
-    assert plans[0].hf_key == "block.mlp.w_gate.weight"
-    assert plans[1].hf_key == "block.mlp.w_up.weight"
+    assert m.gate_up_proj.weight.hf_keys == [
+        ("block.mlp.w_gate.weight", 0),
+        ("block.mlp.w_up.weight", 1),
+    ]
 
 
-def test_placements_plain(fake_mesh):
+def test_attach_plain_path(fake_mesh):
     fake_mesh()
     _init_dispatcher()
     m = DenseMLP(
@@ -205,13 +190,10 @@ def test_placements_plain(fake_mesh):
         bias=True,
         prefix="vision.encoder.layers.0.mlp",
     )
-    plans = m.placements()
-    # fc1.weight + fc1.bias + fc2.weight + fc2.bias = 4
-    assert len(plans) == 4
-    assert plans[0].hf_key == "vision.encoder.layers.0.mlp.fc1.weight"
-    assert plans[1].hf_key == "vision.encoder.layers.0.mlp.fc1.bias"
-    assert plans[2].hf_key == "vision.encoder.layers.0.mlp.fc2.weight"
-    assert plans[3].hf_key == "vision.encoder.layers.0.mlp.fc2.bias"
+    assert m.fc1.weight.hf_keys == [("vision.encoder.layers.0.mlp.fc1.weight", None)]
+    assert m.fc1.bias.hf_keys == [("vision.encoder.layers.0.mlp.fc1.bias", None)]
+    assert m.fc2.weight.hf_keys == [("vision.encoder.layers.0.mlp.fc2.weight", None)]
+    assert m.fc2.bias.hf_keys == [("vision.encoder.layers.0.mlp.fc2.bias", None)]
 
 
 # ---------------------------------------------------------------------------
@@ -225,19 +207,10 @@ cuda_only = pytest.mark.skipif(
 
 
 def _load_gated(m: DenseMLP, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor):
-    """Load three HF-style tensors via the placement protocol."""
-    apply_placements(
-        m.placements(),
-        {
-            f"{m.prefix}.gate_proj.weight": gate,
-            f"{m.prefix}.up_proj.weight": up,
-            f"{m.prefix}.down_proj.weight": down,
-        }.__getitem__,
-        {
-            f"{m.prefix}.gate_up_proj.weight": m.gate_up_proj.weight.data,
-            f"{m.prefix}.down_proj.weight": m.down_proj.weight.data,
-        },
-    )
+    """Load three HF-style tensors via the param-attached weight_loader."""
+    m.gate_up_proj.weight.weight_loader(m.gate_up_proj.weight, gate, 0)
+    m.gate_up_proj.weight.weight_loader(m.gate_up_proj.weight, up, 1)
+    m.down_proj.weight.weight_loader(m.down_proj.weight, down, None)
 
 
 @cuda_only

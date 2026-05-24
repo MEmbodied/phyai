@@ -1,16 +1,24 @@
 """Shared utilities for ``phyai.layers.attention``.
 
 The flashinfer split-k scratch is process-global and per-device. Every
-:class:`~phyai.layers.attention.NoStateAttention` instance — and any
-future attention layer that uses flashinfer — falls back to this buffer
-when the caller doesn't pass an explicit ``fi_workspace``. Sharing one
-scratch across every layer keeps memory flat regardless of model depth.
+attention backend that uses flashinfer (the no-cache
+:class:`~phyai.layers.attention.attention.Attention` stack, the AR
+:class:`~phyai.layers.attention.ar.ARAttention` stack, and the
+:class:`~phyai.layers.attention.diffusion.DiffusionAttention` stack)
+falls back to this buffer when the caller doesn't pass an explicit
+``fi_workspace``. Sharing one scratch across every layer keeps memory
+flat regardless of model depth.
 
 Sizing
 ------
-* Default: 128 MiB (1× flashinfer's recommendation).
-* Override via the ``PHYAI_FLASHINFER_WORKSPACE_BYTES`` env var (positive
-  integer, in bytes). Malformed values are rejected at lookup time.
+* Default: ``RuntimeConfig.flashinfer_workspace_bytes`` (128 MiB out of
+  the box, 1x flashinfer's recommendation).
+* Override the engine-level value via ``PHYAI_FLASHINFER_WORKSPACE_BYTES``
+  (overlaid onto :class:`~phyai.engine_config.RuntimeConfig` by
+  :meth:`EngineConfig.from_env`) or by passing a bespoke
+  :class:`~phyai.engine_config.EngineConfig` to the engine. The
+  resolver consults the :class:`EngineConfig` singleton — no direct
+  env reads here.
 * The first caller for a given device may also pass ``workspace_bytes``
   to :func:`get_global_fi_workspace`; once the buffer for that device
   exists, the parameter is ignored.
@@ -26,41 +34,27 @@ multi-GPU processes get one buffer per device rather than one total.
 
 from __future__ import annotations
 
-import os
-
 import torch
 
-
-# flashinfer split-k scratch. Default is 1× the upstream-recommended
-# 128 MiB; bump it via the ``PHYAI_FLASHINFER_WORKSPACE_BYTES`` env var
-# when larger head counts or long-context prefill push split-k off the
-# fast path.
-_FI_WORKSPACE_BYTES_DEFAULT: int = 128 * 1024 * 1024
-_FI_WORKSPACE_BYTES_ENV: str = "PHYAI_FLASHINFER_WORKSPACE_BYTES"
+from phyai.engine_config import get_engine_config
 
 
 def resolve_workspace_bytes(override: int | None = None) -> int:
     """Resolve the flashinfer scratch size.
 
-    Order of precedence: explicit ``override`` → env var → default.
-    Raises :class:`ValueError` for non-positive or malformed inputs.
+    Order of precedence: explicit ``override`` ->
+    :class:`~phyai.engine_config.RuntimeConfig.flashinfer_workspace_bytes`
+    on the :class:`EngineConfig` singleton (which has already absorbed
+    any ``PHYAI_FLASHINFER_WORKSPACE_BYTES`` env override). Raises
+    :class:`ValueError` for non-positive ``override``; the engine config
+    is validated at construction time so the singleton value is always
+    a positive int.
     """
     if override is not None:
         if override <= 0:
             raise ValueError(f"workspace_bytes={override} must be positive.")
         return override
-    raw = os.environ.get(_FI_WORKSPACE_BYTES_ENV)
-    if raw is None:
-        return _FI_WORKSPACE_BYTES_DEFAULT
-    try:
-        n = int(raw)
-    except ValueError as e:
-        raise ValueError(
-            f"{_FI_WORKSPACE_BYTES_ENV}={raw!r} must be an integer (bytes)."
-        ) from e
-    if n <= 0:
-        raise ValueError(f"{_FI_WORKSPACE_BYTES_ENV}={n} must be positive.")
-    return n
+    return get_engine_config().runtime.flashinfer_workspace_bytes
 
 
 # Process-global flashinfer scratch. Keyed on
@@ -80,9 +74,11 @@ def get_global_fi_workspace(
     """Get-or-create the process-global flashinfer scratch on ``device``.
 
     Allocated lazily on first call for each device. Size comes from
-    ``workspace_bytes`` if given, else the
-    ``PHYAI_FLASHINFER_WORKSPACE_BYTES`` env var, else ``128 MiB``.
-    Subsequent calls for the same device return the same tensor.
+    ``workspace_bytes`` if given, else
+    :attr:`~phyai.engine_config.RuntimeConfig.flashinfer_workspace_bytes`
+    on the :class:`EngineConfig` singleton (which absorbs the
+    ``PHYAI_FLASHINFER_WORKSPACE_BYTES`` env override). Subsequent calls
+    for the same device return the same tensor.
 
     ``workspace_bytes`` only applies when the buffer for ``device`` has
     not been allocated yet; it is *not* a per-instance override. To

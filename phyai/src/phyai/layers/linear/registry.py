@@ -4,17 +4,58 @@ A kernel is registered once with an optional
 ``prefer_for={(spec_id, regime)}`` hint; the Registry orders candidates
 by (preferred-for-this-probe, registration-order, capture-safe) and
 ``Policy.select`` returns one.
+
+Concrete kernels in :mod:`phyai.layers.linear.backends` use the
+:func:`register_linear_kernel` decorator to declare themselves at
+import time; :func:`phyai.layers.linear.init` then materialises a fresh
+:class:`LinearKernelRegistry` from those declarations.
 """
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, TypeVar, runtime_checkable
 
 import torch
 
 from phyai.layers.linear.backend import KernelProbe, LinearKernel
 from phyai.parallel.exceptions import NoBackendError
 from phyai.parallel.state import Mode
+
+
+_LinearKernelT = TypeVar("_LinearKernelT", bound=type[LinearKernel])
+
+
+# Kernel declarations gathered at import time. Each entry is
+# ``(cls, prefer_for)``; :func:`phyai.layers.linear.init` walks the list
+# in declaration order to build a :class:`LinearKernelRegistry`.
+_KERNEL_REGISTRATIONS: list[tuple[type, frozenset[tuple[str, str]]]] = []
+
+
+def register_linear_kernel(
+    *,
+    prefer_for: set[tuple[str, str]] | None = None,
+) -> Callable[[_LinearKernelT], _LinearKernelT]:
+    """Class decorator: declare a :class:`LinearKernel` for registration.
+
+    The class itself is recorded — it is *not* instantiated until
+    :func:`phyai.layers.linear.init` runs, so importing a backend
+    module is cheap and free of CUDA / driver side effects. Use the
+    optional ``prefer_for`` keyword to declare ``(spec_id, regime)``
+    tuples this kernel should win on (e.g. ``{("bf16", "prefill")}``);
+    everything else falls through to registration order.
+    """
+    captured: frozenset[tuple[str, str]] = frozenset(prefer_for or ())
+
+    def deco(cls: _LinearKernelT) -> _LinearKernelT:
+        _KERNEL_REGISTRATIONS.append((cls, captured))
+        return cls
+
+    return deco
+
+
+def list_registered_linear_kernels() -> list[tuple[type, frozenset[tuple[str, str]]]]:
+    """Return the kernel declarations gathered so far, in import order."""
+    return list(_KERNEL_REGISTRATIONS)
 
 
 def _regime_of(M_bucket: int) -> str:
@@ -140,7 +181,14 @@ class DefaultPolicy:
 
 
 class ForcedPolicy:
-    """Honour ``PHYAI_FORCE_LINEAR_KERNEL=<name>`` if set."""
+    """Pick the kernel registered under ``name``.
+
+    Sourced from
+    :attr:`~phyai.engine_config.RuntimeConfig.force_linear_kernel`
+    (which absorbs ``PHYAI_FORCE_LINEAR_KERNEL`` in
+    :meth:`EngineConfig.from_env`); applied by
+    :class:`~phyai.layers.linear.dispatch.KernelDispatcher` when set.
+    """
 
     def __init__(
         self,

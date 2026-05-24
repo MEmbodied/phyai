@@ -55,7 +55,7 @@ def _ref_adarmsnorm(
 
 
 def _broadcast_modulation(x: torch.Tensor, modulation: torch.Tensor) -> torch.Tensor:
-    """Mirror lerobot's ``unsqueeze(1)`` for 3-D ``x`` × 2-D ``modulation``."""
+    """Mirror lerobot's ``unsqueeze(1)`` for 3-D ``x`` x 2-D ``modulation``."""
     if x.dim() == 3 and modulation.dim() == 2:
         return modulation.unsqueeze(1)
     return modulation
@@ -165,14 +165,14 @@ def test_adarmsnorm_3d_per_token(hidden: int, dtype: torch.dtype):
 
 
 # --------------------------------------------------------------------------- #
-# Per-batch broadcast (``cond_leading=(B,)`` → broadcasts across S)            #
+# Per-batch broadcast (``cond_leading=(B,)`` -> broadcasts across S)            #
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.parametrize("hidden", _HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_adarmsnorm_3d_broadcast_over_seq(hidden: int, dtype: torch.dtype):
-    """``x=(B, S, D)`` × ``modulation=(B, 3D)``: pi0.5 action-expert pattern.
+    """``x=(B, S, D)`` x ``modulation=(B, 3D)``: pi0.5 action-expert pattern.
 
     The kernel infers ``group_size = S`` and broadcasts each modulation row
     across the sequence axis. Gate output shape mirrors the broadcast-shaped
@@ -339,7 +339,9 @@ def test_phyai_layers_adarmsnorm_module_matches_reference():
     actual_out, actual_gate = layer(x, cond)
 
     # Reference path: re-run the projection and the eager math.
-    modulation = layer.dense(cond).unsqueeze(1)
+    # ReplicatedLinear.forward returns (y, optional_bias) — unpack the
+    # tensor before broadcasting over the seq axis.
+    modulation = layer.dense(cond)[0].unsqueeze(1)
     expected_out, expected_gate = _ref_adarmsnorm(x, modulation, layer.variance_epsilon)
     torch.testing.assert_close(actual_out, expected_out, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(actual_gate, expected_gate, rtol=2e-2, atol=2e-2)
@@ -387,18 +389,23 @@ def test_phyai_layers_adarmsnorm_torch_backend_matches_kernel_backend():
     torch.testing.assert_close(gate_k, gate_t, rtol=2e-2, atol=2e-2)
 
 
-def test_phyai_layers_adarmsnorm_placements():
+def test_phyai_layers_adarmsnorm_weight_loader_keys():
+    """AdaRMSNorm exposes its inner ``dense.weight`` / ``dense.bias`` to
+    the generic safetensors loader via ``param.hf_keys`` (the new weight
+    loading API replacing the old ``placements()`` method)."""
     pytest.importorskip("phyai.layers")
     from phyai.layers import AdaRMSNorm
 
     layer = AdaRMSNorm(
         hidden_size=64, cond_dim=64, prefix="m.l0.input_layernorm", backend="torch"
     )
-    placements = layer.placements()
-    keys = {(p.hf_key, p.phyai_key) for p in placements}
+    keys: set[tuple[str, str]] = set()
+    for name, param in layer.named_parameters():
+        for hf_key, _shard_id in getattr(param, "hf_keys", []):
+            keys.add((hf_key, name))
     assert keys == {
-        ("m.l0.input_layernorm.dense.weight", "m.l0.input_layernorm.dense.weight"),
-        ("m.l0.input_layernorm.dense.bias", "m.l0.input_layernorm.dense.bias"),
+        ("m.l0.input_layernorm.dense.weight", "dense.weight"),
+        ("m.l0.input_layernorm.dense.bias", "dense.bias"),
     }
 
 

@@ -5,11 +5,14 @@ callers like :func:`phyai.vgpu.topology.round_up_sm_count` expect, and
 raises if CUDA is unavailable. :func:`sm_arch` returns the packed integer
 form (``major * 10 + minor``) used for kernel dispatch keys, with a
 graceful ``0`` fallback so init paths stay safe on developer laptops or
-in forked subprocesses. :func:`print_topology` dumps a per-device
-summary plus a peer-access matrix for the local node;
-:func:`print_distributed_topology` extends that to a multi-node
-:mod:`torch.distributed` group with per-host IB HCAs and GPU↔NIC
-affinity from ``nvidia-smi topo -m``.
+in forked subprocesses. :func:`init_cuda` / :func:`init_cublas` are the
+discrete bootstrap entry points the engine and tests call to pin device
++ default dtype and tune cuBLAS/cuDNN — each is independently callable
+so callers can opt into pieces without committing to the full engine
+orchestration. :func:`print_topology` dumps a per-device summary plus a
+peer-access matrix for the local node; :func:`print_distributed_topology`
+extends that to a multi-node :mod:`torch.distributed` group with per-host
+IB HCAs and GPU↔NIC affinity from ``nvidia-smi topo -m``.
 """
 
 from __future__ import annotations
@@ -26,6 +29,25 @@ def device_capability(
     return torch.cuda.get_device_capability(device)
 
 
+def current_device() -> torch.device:
+    """Return the current device for tensor allocation.
+
+    Picks the active CUDA device when CUDA is available, otherwise
+    ``cpu``. ``torch.cuda.current_device()`` returns an int rank, but
+    callers typically want a ``torch.device`` they can pass to
+    ``.to(...)`` or ``torch.empty(..., device=...)``; this wraps the
+    rank into a ``torch.device("cuda", rank)``.
+
+    Use this in place of hard-coded ``"cuda"`` / ``"cpu"`` strings so
+    a process started under ``CUDA_VISIBLE_DEVICES=...`` lands on the
+    intended device, and CPU-only dev / CI environments degrade
+    gracefully.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 def sm_arch(
     device: "torch.device | str | int | None" = None,
 ) -> int:
@@ -38,6 +60,36 @@ def sm_arch(
         # parent that already initialized CUDA).
         return 0
     return major * 10 + minor
+
+
+def init_cuda(
+    device: "torch.device | str",
+    params_dtype: torch.dtype,
+) -> torch.dtype:
+    """Pin the CUDA current device and the process default dtype.
+
+    Returns the previously-set ``torch.get_default_dtype()`` so
+    :meth:`Engine.close` can restore it. CPU device is a no-op for the
+    device half (``torch.cuda.set_device`` is skipped) but the dtype
+    pin still happens — fp32 / fp64 weights need it just as much.
+    """
+    saved = torch.get_default_dtype()
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type == "cuda":
+        torch.cuda.set_device(dev.index if dev.index is not None else 0)
+    torch.set_default_dtype(params_dtype)
+    return saved
+
+
+def init_cublas() -> None:
+    """Tune cuBLAS / cuDNN for inference workloads.
+
+    Currently a no-op placeholder — the discrete entry point is in
+    place so future tuning (allow_tf32 toggles, ``CUBLAS_WORKSPACE_CONFIG``,
+    cuDNN benchmark mode) lands in one well-named function rather than
+    drifting into ``Engine.__init__``.
+    """
+    return None
 
 
 def print_topology(*, file: TextIO | None = None) -> None:

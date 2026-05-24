@@ -1,0 +1,283 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 480"
+     font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1.4"/>
+      <feOffset dx="0" dy="1"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.18"/></feComponentTransfer>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="960" height="480" fill="#fafbfc"/>
+
+  <!-- Copyright (top-left) -->
+  <text x="24" y="32" font-size="12" font-weight="700" fill="#003399">PhyAI</text>
+  <text x="24" y="48" font-size="10" fill="#888">© All rights reserved</text>
+
+  <!-- Title -->
+  <text x="480" y="34" text-anchor="middle" font-size="22" font-weight="600" fill="#1a1a1a">
+    <tspan font-style="italic">π</tspan><tspan font-size="14" dy="6">0.5</tspan><tspan dy="-6"> Model Inference Pipeline</tspan>
+  </text>
+  <text x="480" y="54" text-anchor="middle" font-size="11" fill="#c25" font-style="italic" font-weight="500">
+    Schematic only — block widths, gaps and step counts are illustrative, NOT to scale with real wall-clock timing
+  </text>
+
+  <!-- Iterative badge (top right) -->
+  <g transform="translate(840, 26)">
+    <rect x="0" y="0" width="100" height="40" rx="8" fill="#fff" stroke="#e0e0e0"/>
+    <text x="40" y="25" text-anchor="middle" font-size="11" fill="#666">Iterative</text>
+    <g transform="translate(78, 20)">
+      <path d="M -7 0 A 7 7 0 1 0 7 0 A 7 7 0 1 0 -7 0 M 7 -1 L 11 -1 L 9 -3"
+            fill="none" stroke="#666" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <animateTransform attributeName="transform" type="rotate"
+                          values="0 0 0; 360 0 0" dur="3s" repeatCount="indefinite"/>
+      </path>
+    </g>
+  </g>
+
+  <!-- ============ STAGE STATUS INDICATOR ============ -->
+  <g transform="translate(80, 84)">
+    <text x="0" y="-10" font-size="11" fill="#777" font-weight="500">Active Stage</text>
+
+    <!-- Stage 1: VLM -->
+    <g>
+      <rect x="0" y="0" width="240" height="50" rx="10" fill="#fff" stroke="#4A90D9" stroke-width="2.5"/>
+      <rect x="0" y="0" width="240" height="50" rx="10" fill="#4A90D9" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0; 0"
+                 keyTimes="0; 0.04; 0.05; 0.13; 0.14; 1"
+                 dur="12s" repeatCount="indefinite"/>
+      </rect>
+      <text x="120" y="31" text-anchor="middle" font-size="15" font-weight="700" fill="#4A90D9">
+        <animate attributeName="fill"
+                 values="#4A90D9; #4A90D9; #fff; #fff; #4A90D9; #4A90D9"
+                 keyTimes="0; 0.04; 0.05; 0.13; 0.14; 1"
+                 dur="12s" repeatCount="indefinite"/>
+        SigLIP
+      </text>
+    </g>
+
+    <!-- Arrow 1 -->
+    <g transform="translate(248, 25)">
+      <path d="M 0 0 L 18 0" stroke="#bbb" stroke-width="2" fill="none" stroke-linecap="round"/>
+      <path d="M 14 -4 L 18 0 L 14 4" stroke="#bbb" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+
+    <!-- Stage 2: LLM Backbone -->
+    <g transform="translate(272, 0)">
+      <rect x="0" y="0" width="240" height="50" rx="10" fill="#fff" stroke="#F5A65B" stroke-width="2.5"/>
+      <rect x="0" y="0" width="240" height="50" rx="10" fill="#F5A65B" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0; 0"
+                 keyTimes="0; 0.13; 0.14; 0.37; 0.38; 1"
+                 dur="12s" repeatCount="indefinite"/>
+      </rect>
+      <text x="120" y="31" text-anchor="middle" font-size="15" font-weight="700" fill="#F5A65B">
+        <animate attributeName="fill"
+                 values="#F5A65B; #F5A65B; #fff; #fff; #F5A65B; #F5A65B"
+                 keyTimes="0; 0.13; 0.14; 0.37; 0.38; 1"
+                 dur="12s" repeatCount="indefinite"/>
+        LLM Backbone
+      </text>
+    </g>
+
+    <!-- Arrow 2 -->
+    <g transform="translate(520, 25)">
+      <path d="M 0 0 L 18 0" stroke="#bbb" stroke-width="2" fill="none" stroke-linecap="round"/>
+      <path d="M 14 -4 L 18 0 L 14 4" stroke="#bbb" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+
+    <!-- Stage 3: 10x Expert Diffusion -->
+    <g transform="translate(544, 0)">
+      <rect x="0" y="0" width="240" height="50" rx="10" fill="#fff" stroke="#7CB342" stroke-width="2.5"/>
+      <rect x="0" y="0" width="240" height="50" rx="10" fill="#7CB342" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0; 0"
+                 keyTimes="0; 0.37; 0.38; 0.92; 0.93; 1"
+                 dur="12s" repeatCount="indefinite"/>
+      </rect>
+      <text x="120" y="31" text-anchor="middle" font-size="15" font-weight="700" fill="#7CB342">
+        <animate attributeName="fill"
+                 values="#7CB342; #7CB342; #fff; #fff; #7CB342; #7CB342"
+                 keyTimes="0; 0.37; 0.38; 0.92; 0.93; 1"
+                 dur="12s" repeatCount="indefinite"/>
+        10× Expert Diffusion
+      </text>
+    </g>
+  </g>
+
+  <!-- ============ TIMELINE ============ -->
+  <g transform="translate(170, 200)">
+    <!-- Lane labels -->
+    <text x="-12" y="44" text-anchor="end" font-size="13" font-weight="600" fill="#4A90D9">SigLIP</text>
+    <text x="-12" y="104" text-anchor="end" font-size="13" font-weight="600" fill="#F5A65B">LLM Backbone</text>
+    <text x="-12" y="164" text-anchor="end" font-size="13" font-weight="600" fill="#7CB342">Expert Diffusion</text>
+
+    <!-- Lane reference lines (dotted) -->
+    <line x1="0" y1="44" x2="700" y2="44" stroke="#e8e8e8" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="0" y1="104" x2="700" y2="104" stroke="#e8e8e8" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="0" y1="164" x2="700" y2="164" stroke="#e8e8e8" stroke-width="1" stroke-dasharray="3 4"/>
+
+    <!-- Time axis -->
+    <line x1="0" y1="200" x2="688" y2="200" stroke="#666" stroke-width="1.5"/>
+    <polygon points="700,200 686,195 686,205" fill="#666"/>
+    <text x="708" y="204" text-anchor="start" font-size="11" fill="#666" font-style="italic">t</text>
+
+    <!-- Time-cursor (subtle vertical guide) -->
+    <line x1="0" y1="22" x2="0" y2="200" stroke="#aaa" stroke-width="1" stroke-dasharray="2 4">
+      <animate attributeName="x1"
+               values="0; 0; 80; 280; 660; 660; 0; 0"
+               keyTimes="0; 0.04; 0.13; 0.37; 0.92; 0.95; 0.97; 1"
+               dur="12s" repeatCount="indefinite"/>
+      <animate attributeName="x2"
+               values="0; 0; 80; 280; 660; 660; 0; 0"
+               keyTimes="0; 0.04; 0.13; 0.37; 0.92; 0.95; 0.97; 1"
+               dur="12s" repeatCount="indefinite"/>
+      <animate attributeName="opacity"
+               values="0; 0.55; 0.55; 0.55; 0.55; 0.55; 0; 0"
+               keyTimes="0; 0.04; 0.13; 0.37; 0.92; 0.95; 0.96; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </line>
+
+    <!-- ===== Lane 1: VLM block ===== -->
+    <rect x="0" y="26" height="36" fill="#4A90D9" rx="4" filter="url(#soft-shadow)">
+      <animate attributeName="width"
+               values="0; 0; 80; 80; 80; 0"
+               keyTimes="0; 0.04; 0.13; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+      <animate attributeName="opacity"
+               values="0; 1; 1; 1; 0; 0"
+               keyTimes="0; 0.04; 0.13; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+
+    <!-- ===== Lane 2: LLM Backbone block ===== -->
+    <rect x="80" y="86" height="36" fill="#F5A65B" rx="4" filter="url(#soft-shadow)">
+      <animate attributeName="width"
+               values="0; 0; 0; 200; 200; 200; 0"
+               keyTimes="0; 0.13; 0.14; 0.37; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 1; 0; 0"
+               keyTimes="0; 0.13; 0.14; 0.37; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+
+    <!-- ===== Lane 3: 10x Expert Diffusion mini-blocks ===== -->
+    <!-- Block 0 -->
+    <rect x="280" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.375; 0.380; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 1 -->
+    <rect x="320" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.429; 0.434; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 2 -->
+    <rect x="360" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.483; 0.488; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 3 -->
+    <rect x="400" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.537; 0.542; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 4 -->
+    <rect x="440" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.591; 0.596; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 5 -->
+    <rect x="480" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.645; 0.650; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 6 -->
+    <rect x="520" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.699; 0.704; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 7 -->
+    <rect x="560" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.753; 0.758; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 8 -->
+    <rect x="600" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.807; 0.812; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Block 9 -->
+    <rect x="640" y="146" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.861; 0.866; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+    </rect>
+
+    <!-- ===== Annotations ===== -->
+    <!-- T_action × h span (under all blocks, only visible when full pipeline shown) -->
+    <g opacity="0">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.86; 0.88; 0.94; 0.95; 1"
+               dur="12s" repeatCount="indefinite"/>
+      <line x1="0" y1="190" x2="676" y2="190" stroke="#555" stroke-width="1"/>
+      <line x1="0" y1="186" x2="0" y2="194" stroke="#555" stroke-width="1"/>
+      <line x1="676" y1="186" x2="676" y2="194" stroke="#555" stroke-width="1"/>
+      <rect x="305" y="180" width="80" height="14" fill="#fafbfc"/>
+      <text x="345" y="192" text-anchor="middle" font-size="11" fill="#444" font-style="italic">
+        T<tspan baseline-shift="-30%" font-size="9">action</tspan> × h
+      </text>
+    </g>
+
+    <!-- Step counter for diffusion: one text per step, visible only when its block has appeared -->
+    <g font-size="11" font-weight="600" fill="#5b8a30">
+      <text x="298" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.375;0.380;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>1</text>
+      <text x="338" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.429;0.434;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>2</text>
+      <text x="378" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.483;0.488;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>3</text>
+      <text x="418" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.537;0.542;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>4</text>
+      <text x="458" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.591;0.596;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>5</text>
+      <text x="498" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.645;0.650;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>6</text>
+      <text x="538" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.699;0.704;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>7</text>
+      <text x="578" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.753;0.758;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>8</text>
+      <text x="618" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.807;0.812;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>9</text>
+      <text x="658" y="138" text-anchor="middle" opacity="0"><animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.861;0.866;0.94;0.95;1" dur="12s" repeatCount="indefinite"/>10</text>
+    </g>
+  </g>
+
+  <!-- Legend / Notes (bottom) -->
+  <g transform="translate(80, 432)">
+    <text x="0" y="0" font-size="11" fill="#c25" font-style="italic" font-weight="600">
+      Schematic only: this diagram visualises the order of stages, NOT their relative durations or compute cost.
+    </text>
+    <text x="0" y="18" font-size="10" fill="#888">
+      Status badge above lights up the active stage. Expert diffusion runs <tspan font-weight="600" fill="#7CB342">10 sequential denoising steps</tspan> — one mini-block per step.
+    </text>
+  </g>
+</svg>

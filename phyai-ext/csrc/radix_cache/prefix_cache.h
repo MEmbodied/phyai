@@ -96,7 +96,7 @@ class prefix_cache {
   };
   match_result match(atom_span query);
 
-  // Walk root → `end` and collect every unit id stored on this tier into
+  // Walk root -> `end` and collect every unit id stored on this tier into
   // `out` (caller-provided buffer). Returns the number of ids written; if
   // capacity is too small returns the required size without writing.
   std::size_t collect_units_into(tree_node* end, tier t, std::int32_t* out, std::size_t capacity) const;
@@ -187,7 +187,7 @@ class prefix_cache {
   void advance_step(std::uint64_t n) noexcept { current_step_ += n; }
   void touch_step(tree_node* node);
 
-  // Compute a 64-bit content hash for a node's full path (root → node).
+  // Compute a 64-bit content hash for a node's full path (root -> node).
   // Useful for cross-process keys (storage backend, remote KV store).
   std::uint64_t node_path_hash(const tree_node* node) const;
 

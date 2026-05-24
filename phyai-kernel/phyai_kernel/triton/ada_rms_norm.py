@@ -204,7 +204,7 @@ def _check_inputs(x: torch.Tensor, modulation: torch.Tensor) -> None:
 
 
 def _flatten(x: torch.Tensor, last_dim: int) -> torch.Tensor:
-    """Reshape ``(..., last_dim) → (-1, last_dim)`` and contiguousify if needed."""
+    """Reshape ``(..., last_dim) -> (-1, last_dim)`` and contiguousify if needed."""
     flat = x.reshape(-1, last_dim)
     if not flat.is_contiguous():
         flat = flat.contiguous()
@@ -266,8 +266,7 @@ def adarmsnorm(
     else:
         if out.shape != x.shape or out.dtype != x.dtype:
             raise RuntimeError(
-                "phyai_kernel.triton.adarmsnorm: `out` must match input "
-                "shape and dtype"
+                "phyai_kernel.triton.adarmsnorm: `out` must match input shape and dtype"
             )
         out_t = out
     out2d = out_t.reshape(-1, n_cols)

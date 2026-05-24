@@ -1,0 +1,29 @@
+---
+title: "Welcome to PhyAI"
+description: "Building AGI, Together."
+icon: 'star'
+mode: "wide"
+---
+
+import { SetupCard } from "/snippets/setup-card.jsx"
+
+# What is PhyAI
+
+**PhyAI** (**Phy**sical **AI** Inference Framework, pronounced “phi”) is a high-performance framework for running Physical AI models, including VLAs, WAMs, and beyond. It supports both cloud-based serving and on-device deployment.
+
+# Setup
+
+<SetupCard
+  rows={{
+    "OS": ["Ubuntu"],
+    "Package": [
+      ["Package", "not upload to pypi yet"],
+      ["Source", `git clone https://github.com/MEmbodied/phyai
+cd phyai
+uv sync`],
+      ["Docker", "not upload yet"]
+    ],
+    "Device": ["Cloud/Consumer"],
+    "Compute Platform": ["CUDA 13.0"],
+  }}
+/>

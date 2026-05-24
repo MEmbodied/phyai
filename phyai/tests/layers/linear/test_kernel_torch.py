@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from phyai.layers.linear.backend import Granularity, KernelProbe
-from phyai.layers.linear.backends._torch import TorchKernel, _expand_block_scale
+from phyai.layers.linear.backends.torch import TorchKernel, _expand_block_scale
 from phyai.layers.linear.spec import Bf16Spec, Fp8Spec
 from phyai.layers.quant import AllocationRequest
 from phyai.parallel.state import Mode
@@ -88,7 +88,7 @@ def test_torch_can_handle_fp8_needs_sm89():
 
 def test_torch_can_handle_fp8_rejects_unaligned_K():
     k = TorchKernel()
-    # K=15 not divisible by 16 → reject fp8
+    # K=15 not divisible by 16 -> reject fp8
     assert not k.can_handle(_probe("fp8_per_tensor", N=16, K=15, sm=90))
     assert k.can_handle(_probe("fp8_per_tensor", N=16, K=16, sm=90))
 

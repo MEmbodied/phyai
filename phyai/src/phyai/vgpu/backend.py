@@ -4,17 +4,17 @@ A "backend" wraps the SM partitioning capability of one driver-level
 implementation (flashinfer, torch). Backends are registered on import of
 :mod:`phyai.vgpu.backends`. ``resolve`` picks one according to the
 priority ``explicit > env (PHYAI_VGPU_BACKEND) > auto`` (auto order:
-flashinfer → torch with a fallback warning).
+flashinfer -> torch with a fallback warning).
 """
 
 from __future__ import annotations
 
-import os
 import warnings
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, TypeVar, runtime_checkable
 
 import torch
 
+from phyai.env import envs
 from phyai.vgpu._spec import ShardSpec
 from phyai.vgpu.exceptions import VGPUNotApplicableError
 
@@ -59,15 +59,36 @@ class GreenCtxBackend(Protocol):
 _BACKENDS: dict[str, type] = {}
 _CURRENT: GreenCtxBackend | None = None
 
+_BackendT = TypeVar("_BackendT", bound=type)
+
 
 def register(name: str, cls: type) -> None:
     """Register a backend class under ``name``.
 
-    Called at module import by each ``phyai.vgpu.backends._<impl>`` module.
-    Re-registration overwrites the previous mapping (intended for tests or
-    user customisation).
+    Re-registration overwrites the previous mapping (intended for tests
+    or user customisation). Built-in backends use the decorator form
+    :func:`register_vgpu_backend`; this functional shape stays for
+    callers who want explicit (name, class) pairs without binding to a
+    class definition.
     """
     _BACKENDS[name] = cls
+
+
+def register_vgpu_backend(name: str) -> Callable[[_BackendT], _BackendT]:
+    """Class decorator: register a :class:`GreenCtxBackend` under ``name``.
+
+    Equivalent to :func:`register` but applied at class-definition time:
+
+        @register_vgpu_backend("torch")
+        class TorchBackend:
+            ...
+    """
+
+    def deco(cls: _BackendT) -> _BackendT:
+        _BACKENDS[name] = cls
+        return cls
+
+    return deco
 
 
 def known_backends() -> list[str]:
@@ -133,14 +154,14 @@ def _ensure_builtins_loaded() -> None:
 def resolve(name: str | None) -> GreenCtxBackend:
     """Resolve a backend choice. Priority: explicit > env > auto.
 
-    Auto order: ``flashinfer → torch``. When auto falls through to torch
+    Auto order: ``flashinfer -> torch``. When auto falls through to torch
     because flashinfer is not importable a ``UserWarning`` is emitted —
     explicit ``backend='torch'`` does not warn.
     """
     _ensure_builtins_loaded()
     if name is not None:
         return set_backend(name)
-    env = os.environ.get("PHYAI_VGPU_BACKEND")
+    env = envs.PHYAI_VGPU_BACKEND.get()
     if env:
         return set_backend(env)
     if _flashinfer_available():

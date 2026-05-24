@@ -1,0 +1,90 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "PhyAI",
+  "colors": {
+    "primary": "#003399",
+    "light": "#60A5FA",
+    "dark": "#2563EB"
+  },
+  "favicon": "/favicon.png",
+  "navigation": {
+    "languages": [
+      {
+        "language": "en",
+        "default": true,
+        "groups": [
+          {
+            "group": "Getting started",
+            "pages": [
+              "index",
+              "quickstart/add-model"
+            ]
+          },
+          {
+            "group": "Models",
+            "pages": [
+              {
+                "group": "PI0.5",
+                "pages": [
+                  "models/pi05/ws1"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "zh",
+        "groups": [
+          {
+            "group": "快速开始",
+            "pages": [
+              "zh/index",
+              "zh/quickstart/add-model"
+            ]
+          },
+          {
+            "group": "模型",
+            "pages": [
+              {
+                "group": "PI0.5",
+                "pages": [
+                  "zh/models/pi05/ws1"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/logo/light.png",
+    "dark": "/logo/dark.png"
+  },
+  "navbar": {
+    "links": [],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/MEmbodied/phyai"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/MEmbodied/phyai"
+    }
+  }
+}

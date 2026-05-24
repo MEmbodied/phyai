@@ -22,7 +22,7 @@ namespace phyai_ext::radix_cache {
 // actual physical I/O. The returned op_handle is the same handle used by the
 // prefix_cache state machine: when the I/O completes the backend calls
 // `on_complete(handle, success)` (provided at registration) so the cache can
-// transition the resource Pending → Ready.
+// transition the resource Pending -> Ready.
 //
 // Implementations of this interface are NOT required to be thread-safe by
 // themselves; the prefix_cache serialises calls to the backend through its
@@ -55,7 +55,7 @@ class storage_backend {
 };
 
 // In-memory backend useful for tests and as a reference implementation. It
-// keeps a hash → bytes map and completes ops synchronously.
+// keeps a hash -> bytes map and completes ops synchronously.
 class in_memory_storage_backend final : public storage_backend {
  public:
   explicit in_memory_storage_backend(std::size_t unit_bytes) : unit_bytes_(unit_bytes) {}
@@ -103,7 +103,7 @@ class file_storage_backend final : public storage_backend {
   std::size_t unit_bytes_;
   int fd_ = -1;
   mutable std::mutex mtx_;
-  std::unordered_map<std::uint64_t, std::int64_t> offsets_;  // key → file offset
+  std::unordered_map<std::uint64_t, std::int64_t> offsets_;  // key -> file offset
   std::int64_t end_offset_ = 0;
 };
 

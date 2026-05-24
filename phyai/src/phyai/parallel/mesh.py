@@ -33,7 +33,7 @@ class Mesh:
 
     def axis_size(self, axis: str) -> int:
         # Torch 2.10's ``DeviceMesh.size(name)`` has a regression: the layout
-        # indexer rejects non-int keys, so we resolve the name → index
+        # indexer rejects non-int keys, so we resolve the name -> index
         # ourselves. ``axis_local_rank`` already uses the name path and works.
         names = self.torch_mesh.mesh_dim_names
         if names is None:

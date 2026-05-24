@@ -1,0 +1,817 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 760"
+     font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+  <defs>
+    <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="1.4"/>
+      <feOffset dx="0" dy="1"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.18"/></feComponentTransfer>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="arrow-grey" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 8 4 L 0 8 Z" fill="#888"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 8 4 L 0 8 Z" fill="#F5A65B"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 8 4 L 0 8 Z" fill="#7CB342"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 8 4 L 0 8 Z" fill="#4A90D9"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="760" fill="#fafbfc"/>
+
+  <!-- ============ HEADER ============ -->
+  <text x="24" y="32" font-size="12" font-weight="700" fill="#003399">PhyAI</text>
+  <text x="24" y="48" font-size="10" fill="#888">© All rights reserved</text>
+
+  <text x="480" y="34" text-anchor="middle" font-size="20" font-weight="600" fill="#1a1a1a">
+    Engine ↔ Scheduler ↔ 3 Runners — lifecycle
+  </text>
+  <text x="480" y="54" text-anchor="middle" font-size="11" fill="#c25" font-style="italic" font-weight="500">
+    Schematic only — durations are illustrative, NOT to scale with real wall-clock timing
+  </text>
+
+  <!-- Iterative badge -->
+  <g transform="translate(840, 26)">
+    <rect x="0" y="0" width="100" height="40" rx="8" fill="#fff" stroke="#e0e0e0"/>
+    <text x="40" y="25" text-anchor="middle" font-size="11" fill="#666">Iterative</text>
+    <g transform="translate(78, 20)">
+      <path d="M -7 0 A 7 7 0 1 0 7 0 A 7 7 0 1 0 -7 0 M 7 -1 L 11 -1 L 9 -3"
+            fill="none" stroke="#666" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <animateTransform attributeName="transform" type="rotate"
+                          values="0 0 0; 360 0 0" dur="3s" repeatCount="indefinite"/>
+      </path>
+    </g>
+  </g>
+
+  <!-- ============ PHASE INDICATOR ============ -->
+  <g transform="translate(60, 78)">
+    <text x="0" y="-2" font-size="10" font-weight="500" fill="#777">Active Phase</text>
+
+    <!-- Phase 1: Engine.__init__ -->
+    <g>
+      <rect x="0" y="6" width="264" height="28" rx="14" fill="#fff" stroke="#003399" stroke-width="1.5"/>
+      <rect x="0" y="6" width="264" height="28" rx="14" fill="#003399" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 1; 1; 0.08; 0.08"
+                 keyTimes="0; 0.01; 0.333; 0.345; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="132" y="24" text-anchor="middle" font-size="12" font-weight="600" fill="#003399">
+        <animate attributeName="fill"
+                 values="#003399; #fff; #fff; #003399; #003399"
+                 keyTimes="0; 0.01; 0.333; 0.345; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ① Engine.__init__
+      </text>
+    </g>
+
+    <!-- Phase 2: scheduler.setup() -->
+    <g transform="translate(288, 0)">
+      <rect x="0" y="6" width="264" height="28" rx="14" fill="#fff" stroke="#F5A65B" stroke-width="1.5"/>
+      <rect x="0" y="6" width="264" height="28" rx="14" fill="#F5A65B" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.08; 0.08"
+                 keyTimes="0; 0.333; 0.345; 0.5; 0.51; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="132" y="24" text-anchor="middle" font-size="12" font-weight="600" fill="#F5A65B">
+        <animate attributeName="fill"
+                 values="#F5A65B; #F5A65B; #fff; #fff; #F5A65B; #F5A65B"
+                 keyTimes="0; 0.333; 0.345; 0.5; 0.51; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ② scheduler.setup()
+      </text>
+    </g>
+
+    <!-- Phase 3: scheduler.step() -->
+    <g transform="translate(576, 0)">
+      <rect x="0" y="6" width="264" height="28" rx="14" fill="#fff" stroke="#7CB342" stroke-width="1.5"/>
+      <rect x="0" y="6" width="264" height="28" rx="14" fill="#7CB342" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.08; 0.08"
+                 keyTimes="0; 0.5; 0.51; 0.944; 0.95; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="132" y="24" text-anchor="middle" font-size="12" font-weight="600" fill="#7CB342">
+        <animate attributeName="fill"
+                 values="#7CB342; #7CB342; #fff; #fff; #7CB342; #7CB342"
+                 keyTimes="0; 0.5; 0.51; 0.944; 0.95; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ③ scheduler.step(request)
+      </text>
+    </g>
+  </g>
+
+  <!-- ============ ENGINE INIT PIPELINE ============ -->
+  <g transform="translate(39, 134)">
+    <text x="20" y="12" font-size="11" font-weight="600" fill="#003399">Engine.__init__ — fixed orchestrated bootstrap</text>
+
+    <!-- Common pill style: border #003399, fill via overlay opacity animation -->
+    <!-- 7 pills, each 110 wide, 36 tall, gap 12; total = 7*110 + 6*12 = 770 + 72 = 842 -->
+
+    <!-- Pill 1: EngineConfig -->
+    <g transform="translate(20, 24)">
+      <rect width="110" height="36" rx="8" fill="#fff" stroke="#003399" stroke-width="1.5"/>
+      <rect width="110" height="36" rx="8" fill="#003399" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.18; 0.18"
+                 keyTimes="0; 0.022; 0.039; 0.061; 0.072; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="55" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#003399">
+        <animate attributeName="fill"
+                 values="#003399; #003399; #fff; #fff; #003399; #003399"
+                 keyTimes="0; 0.022; 0.039; 0.061; 0.072; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ① EngineConfig
+      </text>
+      <text x="55" y="29" text-anchor="middle" font-size="8.5" fill="#888">
+        <animate attributeName="fill"
+                 values="#888; #888; #ffe; #ffe; #888; #888"
+                 keyTimes="0; 0.022; 0.039; 0.061; 0.072; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        init_engine_config
+      </text>
+    </g>
+
+    <!-- Pill 2: CUDA -->
+    <g transform="translate(142, 24)">
+      <rect width="110" height="36" rx="8" fill="#fff" stroke="#003399" stroke-width="1.5"/>
+      <rect width="110" height="36" rx="8" fill="#003399" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.18; 0.18"
+                 keyTimes="0; 0.061; 0.078; 0.1; 0.111; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="55" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#003399">
+        <animate attributeName="fill"
+                 values="#003399; #003399; #fff; #fff; #003399; #003399"
+                 keyTimes="0; 0.061; 0.078; 0.1; 0.111; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ② CUDA
+      </text>
+      <text x="55" y="29" text-anchor="middle" font-size="8.5" fill="#888">
+        <animate attributeName="fill"
+                 values="#888; #888; #ffe; #ffe; #888; #888"
+                 keyTimes="0; 0.061; 0.078; 0.1; 0.111; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        device + dtype
+      </text>
+    </g>
+
+    <!-- Pill 3: cuBLAS -->
+    <g transform="translate(264, 24)">
+      <rect width="110" height="36" rx="8" fill="#fff" stroke="#003399" stroke-width="1.5"/>
+      <rect width="110" height="36" rx="8" fill="#003399" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.18; 0.18"
+                 keyTimes="0; 0.1; 0.117; 0.139; 0.15; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="55" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#003399">
+        <animate attributeName="fill"
+                 values="#003399; #003399; #fff; #fff; #003399; #003399"
+                 keyTimes="0; 0.1; 0.117; 0.139; 0.15; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ③ cuBLAS
+      </text>
+      <text x="55" y="29" text-anchor="middle" font-size="8.5" fill="#888">
+        <animate attributeName="fill"
+                 values="#888; #888; #ffe; #ffe; #888; #888"
+                 keyTimes="0; 0.1; 0.117; 0.139; 0.15; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        init_cublas
+      </text>
+    </g>
+
+    <!-- Pill 4: dist -->
+    <g transform="translate(386, 24)">
+      <rect width="110" height="36" rx="8" fill="#fff" stroke="#003399" stroke-width="1.5"/>
+      <rect width="110" height="36" rx="8" fill="#003399" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.18; 0.18"
+                 keyTimes="0; 0.139; 0.156; 0.178; 0.189; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="55" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#003399">
+        <animate attributeName="fill"
+                 values="#003399; #003399; #fff; #fff; #003399; #003399"
+                 keyTimes="0; 0.139; 0.156; 0.178; 0.189; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ④ dist
+      </text>
+      <text x="55" y="29" text-anchor="middle" font-size="8.5" fill="#888">
+        <animate attributeName="fill"
+                 values="#888; #888; #ffe; #ffe; #888; #888"
+                 keyTimes="0; 0.139; 0.156; 0.178; 0.189; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        init_dist (ws=1: noop)
+      </text>
+    </g>
+
+    <!-- Pill 5: parallel -->
+    <g transform="translate(508, 24)">
+      <rect width="110" height="36" rx="8" fill="#fff" stroke="#003399" stroke-width="1.5"/>
+      <rect width="110" height="36" rx="8" fill="#003399" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.18; 0.18"
+                 keyTimes="0; 0.178; 0.194; 0.217; 0.228; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="55" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#003399">
+        <animate attributeName="fill"
+                 values="#003399; #003399; #fff; #fff; #003399; #003399"
+                 keyTimes="0; 0.178; 0.194; 0.217; 0.228; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ⑤ parallel
+      </text>
+      <text x="55" y="29" text-anchor="middle" font-size="8.5" fill="#888">
+        <animate attributeName="fill"
+                 values="#888; #888; #ffe; #ffe; #888; #888"
+                 keyTimes="0; 0.178; 0.194; 0.217; 0.228; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        Mesh(dp,ep,sp,cp,tp)
+      </text>
+    </g>
+
+    <!-- Pill 6: linear -->
+    <g transform="translate(630, 24)">
+      <rect width="110" height="36" rx="8" fill="#fff" stroke="#003399" stroke-width="1.5"/>
+      <rect width="110" height="36" rx="8" fill="#003399" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.18; 0.18"
+                 keyTimes="0; 0.217; 0.233; 0.256; 0.267; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="55" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#003399">
+        <animate attributeName="fill"
+                 values="#003399; #003399; #fff; #fff; #003399; #003399"
+                 keyTimes="0; 0.217; 0.233; 0.256; 0.267; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ⑥ linear
+      </text>
+      <text x="55" y="29" text-anchor="middle" font-size="8.5" fill="#888">
+        <animate attributeName="fill"
+                 values="#888; #888; #ffe; #ffe; #888; #888"
+                 keyTimes="0; 0.217; 0.233; 0.256; 0.267; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        KernelDispatcher
+      </text>
+    </g>
+
+    <!-- Pill 7: Entry.setup -->
+    <g transform="translate(752, 24)">
+      <rect width="110" height="36" rx="8" fill="#fff" stroke="#003399" stroke-width="1.5"/>
+      <rect width="110" height="36" rx="8" fill="#003399" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.18; 0.18"
+                 keyTimes="0; 0.256; 0.272; 0.306; 0.317; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="55" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#003399">
+        <animate attributeName="fill"
+                 values="#003399; #003399; #fff; #fff; #003399; #003399"
+                 keyTimes="0; 0.256; 0.272; 0.306; 0.317; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        ⑦ Entry.setup
+      </text>
+      <text x="55" y="29" text-anchor="middle" font-size="8.5" fill="#888">
+        <animate attributeName="fill"
+                 values="#888; #888; #ffe; #ffe; #888; #888"
+                 keyTimes="0; 0.256; 0.272; 0.306; 0.317; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        model + scheduler
+      </text>
+    </g>
+
+    <!-- Connector arrows between pills (always visible, low contrast) -->
+    <g stroke="#cfd3d8" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 132 42 L 140 42 M 138 39 L 142 42 L 138 45"/>
+      <path d="M 254 42 L 262 42 M 260 39 L 264 42 L 260 45"/>
+      <path d="M 376 42 L 384 42 M 382 39 L 386 42 L 382 45"/>
+      <path d="M 498 42 L 506 42 M 504 39 L 508 42 L 504 45"/>
+      <path d="M 620 42 L 628 42 M 626 39 L 630 42 L 626 45"/>
+      <path d="M 742 42 L 750 42 M 748 39 L 752 42 L 748 45"/>
+    </g>
+
+    <!-- Down-arrow handoff from pill 7 to architecture (animates on phase 2 entry) -->
+    <g opacity="0">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.317; 0.333; 0.95; 0.97; 1"
+               dur="18s" repeatCount="indefinite"/>
+      <path d="M 807 64 L 807 86 M 803 82 L 807 86 L 811 82"
+            stroke="#F5A65B" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="813" y="80" font-size="9" fill="#F5A65B" font-style="italic">scheduler.setup()</text>
+    </g>
+  </g>
+
+  <!-- ============ ARCHITECTURE: Scheduler + 3 Runners + KV Pool ============ -->
+  <g transform="translate(0, 220)">
+
+    <!-- Outer Scheduler frame -->
+    <g>
+      <rect x="60" y="0" width="840" height="240" rx="14"
+            fill="#ffffff" stroke="#cfd3d8" stroke-width="1.6"/>
+      <rect x="60" y="0" width="840" height="240" rx="14"
+            fill="none" stroke="#F5A65B" stroke-width="2.5" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 0.85; 0.5; 0.5; 0.25; 0.25"
+                 keyTimes="0; 0.272; 0.317; 0.5; 0.51; 0.95; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <rect x="78" y="-9" width="172" height="18" rx="4" fill="#fafbfc"/>
+      <text x="164" y="5" text-anchor="middle" font-size="12" font-weight="700" fill="#444">
+        PI05WS1Scheduler
+      </text>
+    </g>
+
+    <!-- ===== Vision Runner card ===== -->
+    <g transform="translate(82, 22)">
+      <rect width="248" height="116" rx="10" fill="#fff" stroke="#4A90D9" stroke-width="1.6"/>
+      <!-- "active" overlay during phase 2 setup, phase 3 vision step -->
+      <rect width="248" height="116" rx="10" fill="#4A90D9" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 0.10; 0.10; 0; 0; 0.18; 0.18; 0; 0"
+                 keyTimes="0; 0.333; 0.345; 0.39; 0.4; 0.5; 0.51; 0.589; 0.595; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="124" y="22" text-anchor="middle" font-size="13" font-weight="700" fill="#4A90D9">
+        PI05VisionRunner
+      </text>
+      <text x="124" y="38" text-anchor="middle" font-size="9.5" fill="#666">
+        SigLIP vision tower
+      </text>
+
+      <!-- Captured-shape line -->
+      <text x="124" y="58" text-anchor="middle" font-size="9" fill="#888" font-style="italic">
+        captured @ (3, 3, H, W)
+      </text>
+
+      <!-- "Graph: pending" → "Graph: ✓" badge (lights at t≈6.7s) -->
+      <g transform="translate(40, 75)">
+        <rect width="168" height="22" rx="6" fill="#f4f7fb" stroke="#cfd3d8" stroke-width="1"/>
+        <rect width="168" height="22" rx="6" fill="#4A90D9" opacity="0">
+          <animate attributeName="opacity"
+                   values="0; 0; 1; 1"
+                   keyTimes="0; 0.39; 0.4; 1"
+                   dur="18s" repeatCount="indefinite"/>
+        </rect>
+        <text x="84" y="15" text-anchor="middle" font-size="10" font-weight="600" fill="#888">
+          <animate attributeName="opacity"
+                   values="1; 1; 0; 0"
+                   keyTimes="0; 0.39; 0.4; 1"
+                   dur="18s" repeatCount="indefinite"/>
+          CUDA graph: pending
+        </text>
+        <text x="84" y="15" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+          <animate attributeName="opacity"
+                   values="0; 0; 1; 1"
+                   keyTimes="0; 0.39; 0.4; 1"
+                   dur="18s" repeatCount="indefinite"/>
+          CUDA graph: ✓ captured
+        </text>
+      </g>
+
+      <text x="124" y="108" text-anchor="middle" font-size="9" fill="#4A90D9">
+        forward: pixel_values → image_embs
+      </text>
+    </g>
+
+    <!-- ===== LLM Runner card ===== -->
+    <g transform="translate(354, 22)">
+      <rect width="248" height="116" rx="10" fill="#fff" stroke="#F5A65B" stroke-width="1.6"/>
+      <rect width="248" height="116" rx="10" fill="#F5A65B" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 0.10; 0.10; 0; 0; 0.18; 0.18; 0; 0"
+                 keyTimes="0; 0.383; 0.395; 0.428; 0.434; 0.594; 0.6; 0.644; 0.65; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="124" y="22" text-anchor="middle" font-size="13" font-weight="700" fill="#F5A65B">
+        PI05LLMRunner
+      </text>
+      <text x="124" y="38" text-anchor="middle" font-size="9.5" fill="#666">
+        PaliGemma 18 layers + paged K/V
+      </text>
+      <text x="124" y="58" text-anchor="middle" font-size="9" fill="#888" font-style="italic">
+        captured @ (B·n_per_sample, hidden)
+      </text>
+
+      <g transform="translate(40, 75)">
+        <rect width="168" height="22" rx="6" fill="#f4f7fb" stroke="#cfd3d8" stroke-width="1"/>
+        <rect width="168" height="22" rx="6" fill="#F5A65B" opacity="0">
+          <animate attributeName="opacity"
+                   values="0; 0; 1; 1"
+                   keyTimes="0; 0.428; 0.434; 1"
+                   dur="18s" repeatCount="indefinite"/>
+        </rect>
+        <text x="84" y="15" text-anchor="middle" font-size="10" font-weight="600" fill="#888">
+          <animate attributeName="opacity"
+                   values="1; 1; 0; 0"
+                   keyTimes="0; 0.428; 0.434; 1"
+                   dur="18s" repeatCount="indefinite"/>
+          CUDA graph: pending
+        </text>
+        <text x="84" y="15" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+          <animate attributeName="opacity"
+                   values="0; 0; 1; 1"
+                   keyTimes="0; 0.428; 0.434; 1"
+                   dur="18s" repeatCount="indefinite"/>
+          CUDA graph: ✓ captured
+        </text>
+      </g>
+
+      <text x="124" y="108" text-anchor="middle" font-size="9" fill="#F5A65B">
+        plan_inference + forward → writes prefix K/V
+      </text>
+    </g>
+
+    <!-- ===== Expert Runner card ===== -->
+    <g transform="translate(626, 22)">
+      <rect width="248" height="116" rx="10" fill="#fff" stroke="#7CB342" stroke-width="1.6"/>
+      <rect width="248" height="116" rx="10" fill="#7CB342" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 0.10; 0.10; 0; 0; 0.18; 0.18; 0; 0"
+                 keyTimes="0; 0.428; 0.434; 0.467; 0.473; 0.644; 0.65; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="124" y="22" text-anchor="middle" font-size="13" font-weight="700" fill="#7CB342">
+        PI05ExpertRunner
+      </text>
+      <text x="124" y="38" text-anchor="middle" font-size="9.5" fill="#666">
+        18 expert layers + AdaRMS + heads
+      </text>
+      <text x="124" y="58" text-anchor="middle" font-size="9" fill="#888" font-style="italic">
+        captured @ (B, chunk, action_dim)
+      </text>
+
+      <g transform="translate(40, 75)">
+        <rect width="168" height="22" rx="6" fill="#f4f7fb" stroke="#cfd3d8" stroke-width="1"/>
+        <rect width="168" height="22" rx="6" fill="#7CB342" opacity="0">
+          <animate attributeName="opacity"
+                   values="0; 0; 1; 1"
+                   keyTimes="0; 0.467; 0.473; 1"
+                   dur="18s" repeatCount="indefinite"/>
+        </rect>
+        <text x="84" y="15" text-anchor="middle" font-size="10" font-weight="600" fill="#888">
+          <animate attributeName="opacity"
+                   values="1; 1; 0; 0"
+                   keyTimes="0; 0.467; 0.473; 1"
+                   dur="18s" repeatCount="indefinite"/>
+          CUDA graph: pending
+        </text>
+        <text x="84" y="15" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+          <animate attributeName="opacity"
+                   values="0; 0; 1; 1"
+                   keyTimes="0; 0.467; 0.473; 1"
+                   dur="18s" repeatCount="indefinite"/>
+          CUDA graph: ✓ captured
+        </text>
+      </g>
+
+      <text x="124" y="108" text-anchor="middle" font-size="9" fill="#7CB342">
+        forward × 10 (Euler) → joint K/V
+      </text>
+    </g>
+
+    <!-- ===== KV Cache Pool (shared, full-width) ===== -->
+    <g transform="translate(82, 162)">
+      <rect width="792" height="62" rx="10" fill="#fff" stroke="#9C6ADE" stroke-width="1.6"/>
+      <text x="14" y="22" font-size="12" font-weight="700" fill="#9C6ADE">KVCachePool</text>
+      <text x="14" y="38" font-size="9" fill="#888" font-style="italic">shared paged K/V</text>
+
+      <!-- Slab segments -->
+      <g transform="translate(120, 14)">
+        <!-- sentinel slot -->
+        <rect x="0" y="14" width="40" height="32" rx="4" fill="#eee" stroke="#bbb" stroke-width="1"/>
+        <text x="20" y="34" text-anchor="middle" font-size="9" fill="#777">sentinel</text>
+
+        <!-- prefix slab -->
+        <rect x="48" y="14" width="280" height="32" rx="4" fill="#fff7ec" stroke="#F5A65B" stroke-width="1.4"/>
+        <rect x="48" y="14" width="280" height="32" rx="4" fill="#F5A65B" opacity="0">
+          <animate attributeName="opacity"
+                   values="0; 0; 0.55; 0.55; 0.18; 0.18"
+                   keyTimes="0; 0.594; 0.6; 0.644; 0.65; 1"
+                   dur="18s" repeatCount="indefinite"/>
+        </rect>
+        <text x="188" y="34" text-anchor="middle" font-size="10" font-weight="600" fill="#a86c2e">
+          <animate attributeName="fill"
+                   values="#a86c2e; #a86c2e; #fff; #fff; #a86c2e; #a86c2e"
+                   keyTimes="0; 0.594; 0.6; 0.644; 0.65; 1"
+                   dur="18s" repeatCount="indefinite"/>
+          prefix slab (max_B · n_per_sample)
+        </text>
+
+        <!-- suffix slab -->
+        <rect x="336" y="14" width="320" height="32" rx="4" fill="#f3f8eb" stroke="#7CB342" stroke-width="1.4"/>
+        <rect x="336" y="14" width="320" height="32" rx="4" fill="#7CB342" opacity="0">
+          <animate attributeName="opacity"
+                   values="0; 0; 0.55; 0.55; 0.18; 0.18"
+                   keyTimes="0; 0.644; 0.65; 0.928; 0.94; 1"
+                   dur="18s" repeatCount="indefinite"/>
+        </rect>
+        <text x="496" y="34" text-anchor="middle" font-size="10" font-weight="600" fill="#5b8a30">
+          <animate attributeName="fill"
+                   values="#5b8a30; #5b8a30; #fff; #fff; #5b8a30; #5b8a30"
+                   keyTimes="0; 0.644; 0.65; 0.928; 0.94; 1"
+                   dur="18s" repeatCount="indefinite"/>
+          suffix slab (max_B · chunk_size)
+        </text>
+      </g>
+    </g>
+
+    <!-- ===== Arrows during step() ===== -->
+
+    <!-- LLM → KV pool prefix slab (write) -->
+    <g opacity="0">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.594; 0.6; 0.644; 0.65; 1"
+               dur="18s" repeatCount="indefinite"/>
+      <path d="M 478 138 L 478 162" stroke="#F5A65B" stroke-width="1.8" fill="none"
+            stroke-linecap="round" marker-end="url(#arrow-orange)"/>
+      <text x="484" y="154" font-size="9" font-style="italic" fill="#F5A65B">write K/V</text>
+    </g>
+
+    <!-- Expert ↔ KV pool joint (read prefix + write suffix) -->
+    <g opacity="0">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.644; 0.65; 0.928; 0.94; 1"
+               dur="18s" repeatCount="indefinite"/>
+      <!-- Down arrow: expert writes suffix -->
+      <path d="M 740 138 L 740 162" stroke="#7CB342" stroke-width="1.8" fill="none"
+            stroke-linecap="round" marker-end="url(#arrow-green)"/>
+      <!-- Up arrow: expert reads prefix+suffix -->
+      <path d="M 770 162 L 770 138" stroke="#7CB342" stroke-width="1.8" fill="none"
+            stroke-linecap="round" stroke-dasharray="3 3" marker-end="url(#arrow-green)"/>
+      <text x="755" y="154" text-anchor="middle" font-size="9" font-style="italic" fill="#5b8a30">R / W</text>
+    </g>
+  </g>
+
+  <!-- Handoff arrow from architecture to step timeline -->
+  <g transform="translate(0, 466)" opacity="0">
+    <animate attributeName="opacity"
+             values="0; 0; 1; 1; 0; 0"
+             keyTimes="0; 0.473; 0.5; 0.95; 0.97; 1"
+             dur="18s" repeatCount="indefinite"/>
+    <path d="M 480 0 L 480 16 M 476 12 L 480 16 L 484 12"
+          stroke="#7CB342" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="492" y="12" font-size="10" fill="#7CB342" font-style="italic">step(request) — runtime cooperation</text>
+  </g>
+
+  <!-- ============ STEP TIMELINE ============ -->
+  <g transform="translate(122, 510)">
+
+    <!-- Lane labels -->
+    <text x="-12" y="40" text-anchor="end" font-size="11" font-weight="600" fill="#4A90D9">Vision</text>
+    <text x="-12" y="80" text-anchor="end" font-size="11" font-weight="600" fill="#F5A65B">LLM</text>
+    <text x="-12" y="120" text-anchor="end" font-size="11" font-weight="600" fill="#7CB342">Expert</text>
+
+    <!-- Lane reference lines -->
+    <line x1="0" y1="40" x2="760" y2="40" stroke="#e8e8e8" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="0" y1="80" x2="760" y2="80" stroke="#e8e8e8" stroke-width="1" stroke-dasharray="3 4"/>
+    <line x1="0" y1="120" x2="760" y2="120" stroke="#e8e8e8" stroke-width="1" stroke-dasharray="3 4"/>
+
+    <!-- Time axis -->
+    <line x1="0" y1="160" x2="752" y2="160" stroke="#666" stroke-width="1.5"/>
+    <polygon points="760,160 746,155 746,165" fill="#666"/>
+    <text x="765" y="164" font-size="11" fill="#666" font-style="italic">t</text>
+
+    <!-- Time-cursor -->
+    <line x1="0" y1="22" x2="0" y2="160" stroke="#aaa" stroke-width="1" stroke-dasharray="2 4" opacity="0">
+      <animate attributeName="x1"
+               values="0; 0; 0; 160; 175; 250; 260; 720; 720"
+               keyTimes="0; 0.5; 0.5; 0.589; 0.6; 0.644; 0.65; 0.928; 1"
+               dur="18s" repeatCount="indefinite"/>
+      <animate attributeName="x2"
+               values="0; 0; 0; 160; 175; 250; 260; 720; 720"
+               keyTimes="0; 0.5; 0.5; 0.589; 0.6; 0.644; 0.65; 0.928; 1"
+               dur="18s" repeatCount="indefinite"/>
+      <animate attributeName="opacity"
+               values="0; 0; 0.6; 0.6; 0.6; 0.6; 0.6; 0.6; 0"
+               keyTimes="0; 0.499; 0.5; 0.589; 0.6; 0.644; 0.65; 0.928; 0.94"
+               dur="18s" repeatCount="indefinite"/>
+    </line>
+
+    <!-- ===== Lane 1 (Vision): single forward call with 3 cameras batched ===== -->
+    <rect x="0" y="22" width="0" height="36" fill="#4A90D9" rx="4" filter="url(#soft-shadow)">
+      <animate attributeName="width"
+               values="0; 0; 156; 156; 156; 156"
+               keyTimes="0; 0.5; 0.589; 0.928; 0.94; 1"
+               dur="18s" repeatCount="indefinite"/>
+      <animate attributeName="opacity"
+               values="1; 1; 1; 1; 0.4; 0.4"
+               keyTimes="0; 0.5; 0.589; 0.928; 0.94; 1"
+               dur="18s" repeatCount="indefinite"/>
+    </rect>
+    <text x="78" y="46" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0.6; 0.6"
+               keyTimes="0; 0.55; 0.589; 0.928; 0.94; 1"
+               dur="18s" repeatCount="indefinite"/>
+      3 cams batched in 1 forward
+    </text>
+    <text x="78" y="14" text-anchor="middle" font-size="9" fill="#888" font-style="italic">
+      replay × 1 — pixel_values shape (3, 3, H, W)
+    </text>
+
+    <!-- ===== Lane 2 (LLM): one big block, growing ===== -->
+    <rect x="175" y="62" width="0" height="36" fill="#F5A65B" rx="4" filter="url(#soft-shadow)">
+      <animate attributeName="width"
+               values="0; 0; 75; 75; 75; 75"
+               keyTimes="0; 0.6; 0.644; 0.928; 0.94; 1"
+               dur="18s" repeatCount="indefinite"/>
+      <animate attributeName="opacity"
+               values="1; 1; 1; 1; 0.4; 0.4"
+               keyTimes="0; 0.6; 0.644; 0.928; 0.94; 1"
+               dur="18s" repeatCount="indefinite"/>
+    </rect>
+    <text x="212" y="86" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0.6; 0.6"
+               keyTimes="0; 0.62; 0.644; 0.928; 0.94; 1"
+               dur="18s" repeatCount="indefinite"/>
+      prefix prefill
+    </text>
+    <text x="212" y="54" text-anchor="middle" font-size="9" fill="#888" font-style="italic">
+      plan_inference + replay
+    </text>
+
+    <!-- ===== Lane 3 (Expert): 10 mini-blocks ===== -->
+    <text x="490" y="94" text-anchor="middle" font-size="9" fill="#888" font-style="italic">
+      replay × 10 (Euler steps), reads prefix + writes suffix
+    </text>
+
+    <!-- Step 1 at x=270, stride 46 -->
+    <g font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif">
+      <rect x="270" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.65; 0.679; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="288" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.65; 0.679; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        1
+      </text>
+
+      <rect x="316" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.679; 0.706; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="334" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.679; 0.706; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        2
+      </text>
+
+      <rect x="362" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.706; 0.734; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="380" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.706; 0.734; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        3
+      </text>
+
+      <rect x="408" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.734; 0.762; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="426" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.734; 0.762; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        4
+      </text>
+
+      <rect x="454" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.762; 0.790; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="472" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.762; 0.790; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        5
+      </text>
+
+      <rect x="500" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.790; 0.818; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="518" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.790; 0.818; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        6
+      </text>
+
+      <rect x="546" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.818; 0.845; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="564" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.818; 0.845; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        7
+      </text>
+
+      <rect x="592" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.845; 0.873; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="610" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.845; 0.873; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        8
+      </text>
+
+      <rect x="638" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.873; 0.901; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="656" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.873; 0.901; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        9
+      </text>
+
+      <rect x="684" y="102" width="36" height="36" fill="#7CB342" rx="3" filter="url(#soft-shadow)" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.45; 0.45"
+                 keyTimes="0; 0.901; 0.928; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+      </rect>
+      <text x="702" y="126" text-anchor="middle" font-size="10" font-weight="600" fill="#fff" opacity="0">
+        <animate attributeName="opacity"
+                 values="0; 0; 1; 1; 0.6; 0.6"
+                 keyTimes="0; 0.901; 0.928; 0.928; 0.94; 1"
+                 dur="18s" repeatCount="indefinite"/>
+        10
+      </text>
+    </g>
+
+    <!-- "actions returned" annotation, appears at end of step -->
+    <g opacity="0">
+      <animate attributeName="opacity"
+               values="0; 0; 1; 1; 0; 0"
+               keyTimes="0; 0.928; 0.935; 0.95; 0.96; 1"
+               dur="18s" repeatCount="indefinite"/>
+      <path d="M 720 120 L 752 120" stroke="#7CB342" stroke-width="1.6" fill="none" marker-end="url(#arrow-green)"/>
+      <text x="752" y="112" text-anchor="end" font-size="10" font-style="italic" fill="#5b8a30">return actions[:actual_B]</text>
+    </g>
+  </g>
+
+  <!-- ============ FOOTER ============ -->
+  <g transform="translate(80, 720)">
+    <text x="0" y="0" font-size="11" fill="#c25" font-style="italic" font-weight="600">
+      Schematic only: this diagram visualises the order of phases, NOT their relative durations or compute cost.
+    </text>
+    <text x="0" y="16" font-size="10" fill="#888">
+      Engine.__init__ runs once (fixed bootstrap order); scheduler.setup() captures one CUDA graph per runner; scheduler.step() then replays them in a fixed dance — vision per robot, LLM once, expert × N denoise steps.
+    </text>
+  </g>
+</svg>

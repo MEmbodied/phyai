@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 import torch
-import torch.distributed as dist
+import torch.distributed as torch_dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from phyai.parallel.backend import Backend, Op, Topology
@@ -66,13 +66,41 @@ def _resolve_backend(backend: str | None) -> str:
     """Resolve a ``backend`` choice ('auto' / None / explicit) into a
     concrete name by inspecting the world process group."""
     if backend in (None, "auto"):
-        wb = dist.get_backend()
+        wb = torch_dist.get_backend()
         if wb in ("nccl", "gloo"):
             return wb
         # Unknown / non-standard backend (e.g. mpi, custom) — return as-is;
         # the caller should explicitly opt in if they want phyai support.
         return wb
     return backend
+
+
+class _DegenerateTorchMesh:
+    """Stand-in for ``torch.distributed.DeviceMesh`` at world_size=1.
+
+    ``init_device_mesh`` requires a live process group, but at ws=1 the
+    process group is never read — every collective in ``phyai.parallel.ops``
+    short-circuits when ``axis_size <= 1`` and ``Mesh.axis_group`` is only
+    consulted on the >1 path. So we expose just the surface that
+    ``phyai.parallel.mesh.Mesh`` actually queries (``mesh_dim_names``,
+    ``size``, ``get_local_rank``); ``get_group`` raises so a regression
+    that tries to call collectives at ws=1 is caught loudly.
+    """
+
+    def __init__(self, mesh_dim_names: tuple[str, ...]) -> None:
+        self.mesh_dim_names = tuple(mesh_dim_names)
+
+    def size(self, dim: int | None = None) -> int:
+        return 1
+
+    def get_local_rank(self, axis: str) -> int:
+        return 0
+
+    def get_group(self, axis: str):
+        raise RuntimeError(
+            "phyai.parallel: ws=1 mesh has no ProcessGroup; collectives "
+            "should have short-circuited before reaching axis_group()."
+        )
 
 
 def init(
@@ -109,18 +137,34 @@ def init(
     Returns:
         The default :class:`Mesh`.
     """
-    if not dist.is_initialized():
+    expected = 1
+    for s in layout:
+        expected *= s
+
+    if not torch_dist.is_initialized():
+        # Single-rank short-circuit: at ws=1, every collective in
+        # `phyai.parallel.ops` returns a clone before consulting the
+        # mesh's process group, so we don't need ``init_process_group``
+        # at all. Build a degenerate ``DeviceMesh`` stand-in and an
+        # empty dispatcher — neither is ever invoked, but downstream
+        # code can still call ``resolve_mesh("model")`` /
+        # ``mesh.axis_size("tp")`` and get sensible answers.
+        if expected == 1:
+            mesh = Mesh(
+                _DegenerateTorchMesh(mesh_dim_names),
+                name="model",
+            )
+            register_mesh(mesh)
+            set_dispatcher(Dispatcher(registry=Registry()))
+            return mesh
         raise RuntimeError(
             "phyai.parallel.init: torch.distributed must be initialised first "
             "(call torch.distributed.init_process_group(...))"
         )
 
-    expected = 1
-    for s in layout:
-        expected *= s
-    if expected != dist.get_world_size():
+    if expected != torch_dist.get_world_size():
         raise ValueError(
-            f"layout product ({expected}) != world_size ({dist.get_world_size()})"
+            f"layout product ({expected}) != world_size ({torch_dist.get_world_size()})"
         )
 
     resolved_backend = _resolve_backend(backend)
@@ -146,7 +190,7 @@ def init(
             axes = (
                 list(pynccl_axes) if pynccl_axes is not None else list(mesh_dim_names)
             )
-            local_rank = dist.get_rank() % max(torch.cuda.device_count(), 1)
+            local_rank = torch_dist.get_rank() % max(torch.cuda.device_count(), 1)
             dev = torch.device(f"cuda:{local_rank}")
             pynccl.attach(mesh, axes, device=dev)
             registry.register(

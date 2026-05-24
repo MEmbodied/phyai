@@ -20,7 +20,7 @@ example):
   ViT-style. SiLU is rejected here because no real model uses
   non-gated SiLU.
 
-Activation × gated matrix:
+Activation x gated matrix:
 
 ==========  ==============  ==========================  ===================================
 ``gated``   ``activation``  use case                    kernel
@@ -36,12 +36,12 @@ Activation × gated matrix:
 Aliases ``gelu_pytorch_tanh`` and ``gelu_new`` both normalise to
 ``gelu_tanh``; underscore vs hyphen is also normalised.
 
-Weight loading goes through the standard placement protocol: each child
-linear knows how to declare its own placements, and DenseMLP returns
-the concatenation. HF naming for the gated path defaults to
-``gate_proj`` / ``up_proj`` / ``down_proj``; non-gated defaults to
-``fc1`` / ``fc2``. Both are overridable from
-:meth:`DenseMLP.placements` for models that use non-standard names.
+Weight loading: each child linear attaches its own ``hf_keys`` and
+``weight_loader`` at construction (see :mod:`phyai.weights`). HF naming
+for the gated path defaults to ``gate_proj`` / ``up_proj`` /
+``down_proj``; non-gated defaults to ``fc1`` / ``fc2``. The gated leg
+names are overridable via the ``gated_hf_legs=`` constructor kwarg for
+models that use non-standard names.
 
 Limitations
 -----------
@@ -69,7 +69,6 @@ from phyai.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from phyai.layers.placement import Placement
 
 
 _GATED_ACTS = ("silu", "gelu", "gelu_tanh")
@@ -141,7 +140,7 @@ class DenseMLP(nn.Module):
         ``gelu_pytorch_tanh`` / ``gelu_new`` map to ``gelu_tanh``.
     gated:
         If ``True`` (default), build the gated SwiGLU/GeGLU path. If
-        ``False``, build the plain ``fc1→act→fc2`` path. Cannot combine
+        ``False``, build the plain ``fc1->act->fc2`` path. Cannot combine
         with ``activation="silu"``.
     bias:
         Bias on every internal linear. Llama / Gemma FFNs use
@@ -163,8 +162,8 @@ class DenseMLP(nn.Module):
     prefix:
         Dotted state-dict prefix for THIS module (not its parent).
         Children are constructed with ``prefix=f"{prefix}.gate_up_proj"``
-        etc. Empty prefix is allowed at construction; placements()
-        will reject it later.
+        etc. Empty prefix means children skip ``hf_keys`` attachment;
+        such an MLP can still run forward but will not load weights.
     """
 
     def __init__(
@@ -180,6 +179,7 @@ class DenseMLP(nn.Module):
         params_dtype: torch.dtype | None = None,
         spec_in: object | None = None,
         spec_out: object | None = None,
+        gated_hf_legs: tuple[str, str] = ("gate_proj", "up_proj"),
         mesh: str = "model",
         prefix: str = "",
     ) -> None:
@@ -201,6 +201,7 @@ class DenseMLP(nn.Module):
                 bias=bias,
                 params_dtype=params_dtype,
                 spec=spec_in,
+                hf_legs=gated_hf_legs,
                 mesh=mesh,
                 prefix=f"{prefix}.gate_up_proj" if prefix else "gate_up_proj",
             )
@@ -261,30 +262,6 @@ class DenseMLP(nn.Module):
         h, _ = self.fc1(x)
         h = self._act_fn(h)
         out, _ = self.fc2(h)
-        return out
-
-    def placements(
-        self,
-        *,
-        gated_in_names: tuple[str, str] = ("gate_proj", "up_proj"),
-    ) -> list[Placement]:
-        """Return the placements for every parameter in this MLP.
-
-        For the gated path, ``gated_in_names`` overrides the HF names for
-        the gate / up projections (default: ``("gate_proj", "up_proj")``).
-        The down projection and the non-gated fc1 / fc2 use whatever HF
-        name matches the layer's own ``prefix`` last component — to use a
-        non-default name (e.g. T5's ``wo``), construct DenseMLP with the
-        corresponding ``prefix`` for that child rather than overriding
-        here.
-        """
-        out: list[Placement] = []
-        if self.gated:
-            out += self.gate_up_proj.placements(hf_names=gated_in_names)
-            out += self.down_proj.placements()
-        else:
-            out += self.fc1.placements()
-            out += self.fc2.placements()
         return out
 
     def extra_repr(self) -> str:

@@ -8,7 +8,7 @@
 
 namespace phyai_ext::radix_cache {
 
-// RAII pin against eviction. On construction, walks node→root and locks the
+// RAII pin against eviction. On construction, walks node->root and locks the
 // node_resource of `t` on every ancestor that has one. On destruction,
 // reverse-walks unlocking. Cost is O(depth) per construction/destruction.
 class node_ref {

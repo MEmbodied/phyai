@@ -27,6 +27,7 @@ from phyai.vgpu.backend import (
     get_backend,
     known_backends,
     register,
+    register_vgpu_backend,
     set_backend,
 )
 from phyai.vgpu.exceptions import (
@@ -47,6 +48,7 @@ __all__ = [
     "get_backend",
     "known_backends",
     "register",
+    "register_vgpu_backend",
     # split / shard
     "split_device",
     "split_device_by_sm_count",

@@ -10,11 +10,11 @@ registered only when the ``flashinfer`` package can be imported.
 from __future__ import annotations
 
 # Side-effect import: registers TorchBackend.
-from phyai.vgpu.backends import _torch  # noqa: F401
+from phyai.vgpu.backends import torch  # noqa: F401
 
 try:
     # Side-effect import: registers FlashInferBackend.
-    from phyai.vgpu.backends import _flashinfer  # noqa: F401
+    from phyai.vgpu.backends import flashinfer  # noqa: F401
 except ImportError:
     pass
 

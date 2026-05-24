@@ -43,15 +43,10 @@ from phyai.layers.linear.registry import (
     ForcedPolicy,
     LinearKernelRegistry,
     Policy,
+    list_registered_linear_kernels,
+    register_linear_kernel,
 )
 from phyai.layers.linear.spec import ActivationView, Bf16Spec, Fp8Spec
-from phyai.layers.placement import (
-    CopyPlacement,
-    Placement,
-    Slice1D,
-    ZeroPlacement,
-    apply_placements,
-)
 from phyai.layers.quant import AllocationRequest, WeightSpec
 from phyai.utils.cuda import sm_arch
 
@@ -62,32 +57,25 @@ def init(
     validate: bool = True,
     sample_specs: list[str] | None = None,
 ) -> KernelDispatcher:
-    """Build the process-level :class:`KernelDispatcher` and register defaults.
+    """Build the process-level :class:`KernelDispatcher` from the kernel
+    declarations gathered by :func:`register_linear_kernel`.
 
     Call once after :func:`phyai.parallel.init`. Subsequent calls replace
-    the dispatcher — useful in tests, harmless otherwise.
+    the dispatcher — useful in tests, harmless otherwise. Pass
+    ``register_flashinfer=False`` to skip the flashinfer kernel (handy on
+    CPU-only / flashinfer-unavailable hosts that still want validate to
+    pass on torch alone).
     """
     reg = LinearKernelRegistry()
 
-    if register_flashinfer:
-        # FlashInfer is preferred for bf16 (cuBLASLt/cuDNN autopick) and
-        # for block-FP8 prefill/decode on Blackwell. The point of
-        # ``prefer_for`` is that the per-regime winner can be re-tuned in
-        # one place without touching kernel code.
-        reg.register(
-            FlashInferKernel(),
-            prefer_for={
-                ("bf16", "prefill"),
-                ("fp8_block_128_128", "prefill"),
-                ("fp8_block_128_128", "decode"),
-            },
-        )
-
-    reg.register(TorchKernel())  # always last, always a fallback
+    for cls, prefer_for in list_registered_linear_kernels():
+        if not register_flashinfer and cls.name == "flashinfer":
+            continue
+        reg.register(cls(), prefer_for=set(prefer_for) if prefer_for else None)
 
     if validate:
         default_specs = ["bf16", "fp8_per_tensor", "fp8_per_channel"]
-        # Block-FP8 only validates on Blackwell; skip on older hardware so
+        # Block-FP8 only validates on sm_100+; skip on older hardware so
         # developer laptops don't fail init.
         sm = sm_arch()
         if sm >= 100:
@@ -123,12 +111,6 @@ __all__ = [
     "AllocationRequest",
     "WeightSpec",
     "Granularity",
-    # placement
-    "Placement",
-    "CopyPlacement",
-    "ZeroPlacement",
-    "Slice1D",
-    "apply_placements",
     # dispatcher / registry
     "KernelDispatcher",
     "get_linear_dispatcher",
@@ -138,6 +120,8 @@ __all__ = [
     "Policy",
     "LinearKernel",
     "KernelProbe",
+    "register_linear_kernel",
+    "list_registered_linear_kernels",
     # backends
     "TorchKernel",
     "FlashInferKernel",

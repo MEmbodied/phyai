@@ -9,13 +9,13 @@ from phyai.layers.rotary_embedding import (
     apply_rotary_pos_emb,
     rotate_half,
 )
-from phyai.layers.transformer_block import NoStateTransformerBlock
+from phyai.layers.transformer_block import TransformerBlock
 
 __all__ = [
     "AdaRMSNorm",
     "GemmaRMSNorm",
     "LayerNorm",
-    "NoStateTransformerBlock",
+    "TransformerBlock",
     "RMSNorm",
     "ROPE_INV_FREQ_FNS",
     "RotaryEmbedding",

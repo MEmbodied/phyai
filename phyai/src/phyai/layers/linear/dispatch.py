@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from phyai.engine_config import get_engine_config
 from phyai.layers.linear.backend import KernelProbe, LinearKernel
 from phyai.layers.linear.registry import (
     DefaultPolicy,
@@ -38,7 +39,16 @@ class KernelDispatcher:
         policy: Policy | None = None,
     ) -> None:
         self.registry = registry
-        forced = os.environ.get("PHYAI_FORCE_LINEAR_KERNEL")
+        # Env override takes precedence over the engine-config singleton —
+        # the singleton is populated once at first read and otherwise
+        # ignores subsequent ``PHYAI_FORCE_LINEAR_KERNEL`` changes
+        # (e.g. mid-test ``monkeypatch.setenv``). Falling back to the
+        # engine config preserves the centralised-config intent for
+        # callers that set ``force_linear_kernel`` programmatically.
+        forced = (
+            os.environ.get("PHYAI_FORCE_LINEAR_KERNEL")
+            or get_engine_config().runtime.force_linear_kernel
+        )
         if policy is not None:
             self.policy = policy
         elif forced:

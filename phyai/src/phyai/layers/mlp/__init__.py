@@ -2,7 +2,7 @@
 
 So far this exposes :class:`DenseMLP`, a generic 2-layer FFN with
 optional gating that covers SwiGLU/GeGLU (Llama, Gemma, Qwen) on the
-gated path and plain ``fc1→act→fc2`` (BERT, SigLIP, ViT) on the
+gated path and plain ``fc1->act->fc2`` (BERT, SigLIP, ViT) on the
 non-gated path.
 """
 

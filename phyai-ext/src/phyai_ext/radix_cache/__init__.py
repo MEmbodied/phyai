@@ -391,7 +391,7 @@ class PrefixCache:
 
     def collect_units(self, last_node: int, tier: Tier) -> Any:
         """Return a zero-copy CPU int32 ``tvm_ffi.Tensor`` of every unit id
-        on the path root → ``last_node`` for the given tier.
+        on the path root -> ``last_node`` for the given tier.
 
         The returned object supports the ``__dlpack__`` protocol; consume it
         via ``torch.from_dlpack(...)`` / ``numpy.from_dlpack(...)``. The
@@ -545,7 +545,7 @@ class PrefixCache:
         _F["prefix_cache.touch_step"](self._impl, int(node_handle))
 
     def node_path_hash(self, node_handle: int) -> int:
-        """Return the 64-bit content hash of the path root → node_handle.
+        """Return the 64-bit content hash of the path root -> node_handle.
 
         Useful as a content-addressed key for storage backends.
         """

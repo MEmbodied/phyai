@@ -1,7 +1,7 @@
 """Numerical-equivalence tests for the Triton LayerNorm kernel.
 
 Validates :func:`phyai_kernel.triton.layernorm` against
-:func:`torch.nn.functional.layer_norm` across the dtype × hidden_size
+:func:`torch.nn.functional.layer_norm` across the dtype x hidden_size
 matrix relevant to SigLIP / BERT / ViT.
 """
 
@@ -46,7 +46,7 @@ def test_module_exposes_layernorm():
 
 
 # --------------------------------------------------------------------------- #
-# Shape × dtype × bias matrix                                                  #
+# Shape x dtype x bias matrix                                                  #
 # --------------------------------------------------------------------------- #
 
 

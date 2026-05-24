@@ -1,4 +1,4 @@
-"""LayerNorm — backend parity, F.layer_norm reference, placement loading."""
+"""LayerNorm — backend parity, F.layer_norm reference, weight-load attach."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 
 from phyai.layers.layer_norm import LayerNorm
-from phyai.layers.placement import CopyPlacement, apply_placements
 
 
 cuda_only = pytest.mark.skipif(
@@ -48,44 +47,32 @@ def test_no_bias_does_not_register_parameter():
 
 
 # --------------------------------------------------------------------------- #
-# Placements                                                                  #
+# Weight-load attach                                                          #
 # --------------------------------------------------------------------------- #
 
 
-def test_placements_with_bias():
+def test_attach_with_bias():
     m = LayerNorm(64, backend="phyai-kernel", prefix="vision.encoder.layer_norm1")
-    pls = m.placements()
-    assert len(pls) == 2
-    assert all(isinstance(p, CopyPlacement) for p in pls)
-    keys = {(p.hf_key, p.phyai_key) for p in pls}
-    assert (
-        "vision.encoder.layer_norm1.weight",
-        "vision.encoder.layer_norm1.weight",
-    ) in keys
-    assert (
-        "vision.encoder.layer_norm1.bias",
-        "vision.encoder.layer_norm1.bias",
-    ) in keys
+    assert m.weight.hf_keys == [("vision.encoder.layer_norm1.weight", None)]
+    assert m.bias.hf_keys == [("vision.encoder.layer_norm1.bias", None)]
+    assert callable(m.weight.weight_loader)
+    assert callable(m.bias.weight_loader)
 
 
-def test_placements_without_bias():
+def test_attach_without_bias():
     m = LayerNorm(64, backend="phyai-kernel", bias=False, prefix="text.norm")
-    pls = m.placements()
-    assert len(pls) == 1
-    assert pls[0].hf_key == "text.norm.weight"
+    assert m.weight.hf_keys == [("text.norm.weight", None)]
+    assert m.bias is None
 
 
-def test_placements_load_weight_and_bias():
-    """End-to-end: load HF tensors via the placement protocol."""
+def test_attach_load_weight_and_bias():
+    """End-to-end: invoke the param-attached weight_loader."""
     D = 32
     m = LayerNorm(D, backend="phyai-kernel", prefix="ln")
     src_w = torch.randn(D)
     src_b = torch.randn(D)
-    apply_placements(
-        m.placements(),
-        {"ln.weight": src_w, "ln.bias": src_b}.__getitem__,
-        {"ln.weight": m.weight.data, "ln.bias": m.bias.data},
-    )
+    m.weight.weight_loader(m.weight, src_w, None)
+    m.bias.weight_loader(m.bias, src_b, None)
     torch.testing.assert_close(m.weight.data, src_w)
     torch.testing.assert_close(m.bias.data, src_b)
 

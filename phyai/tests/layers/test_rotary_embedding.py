@@ -31,7 +31,7 @@ cuda_only = pytest.mark.skipif(
 def _ref_cos_sin(
     pos_ids: torch.Tensor, rotary_dim: int, theta: float, *, double: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Same recipe as transformers' GemmaRotaryEmbedding (rotate_half)."""
+    """Reference cos/sin for rotate-half RoPE."""
     inv_freq = 1.0 / (
         theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
     )
@@ -184,7 +184,7 @@ def test_eager_matches_manual_4d():
     m = RotaryEmbedding(
         D, max_position_embeddings=64, rope_theta=theta, backend="eager"
     )
-    q_out, k_out = m(q, k, pos)
+    q_out, k_out = m(pos, q, k)
     q_ref, k_ref = _ref_rotate_half_apply(q, k, pos, theta=theta)
     torch.testing.assert_close(q_out, q_ref, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(k_out, k_ref, atol=1e-5, rtol=1e-5)
@@ -201,7 +201,7 @@ def test_eager_matches_manual_3d_ragged():
     m = RotaryEmbedding(
         D, max_position_embeddings=64, rope_theta=theta, backend="eager"
     )
-    q_out, k_out = m(q, k, pos)
+    q_out, k_out = m(pos, q, k)
     q_ref, k_ref = _ref_rotate_half_apply(q, k, pos, theta=theta)
     torch.testing.assert_close(q_out, q_ref, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(k_out, k_ref, atol=1e-5, rtol=1e-5)
@@ -215,7 +215,7 @@ def test_eager_gqa_q_k_diff_heads():
     pos = torch.arange(S)
 
     m = RotaryEmbedding(D, max_position_embeddings=32, backend="eager")
-    q_out, k_out = m(q, k, pos)
+    q_out, k_out = m(pos, q, k)
     q_ref, k_ref = _ref_rotate_half_apply(q, k, pos, theta=10000.0)
     torch.testing.assert_close(q_out, q_ref, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(k_out, k_ref, atol=1e-5, rtol=1e-5)
@@ -233,7 +233,7 @@ def test_eager_partial_rotary_factor_passthrough():
     m = RotaryEmbedding(
         D, max_position_embeddings=16, partial_rotary_factor=partial, backend="eager"
     )
-    q_out, k_out = m(q, k, pos)
+    q_out, k_out = m(pos, q, k)
 
     # Trailing channels untouched.
     torch.testing.assert_close(q_out[..., rotary_dim:], q[..., rotary_dim:])
@@ -260,8 +260,8 @@ def test_eager_position_ids_1d_broadcasts_over_batch():
     pos_2d = pos_1d.unsqueeze(0).expand(B, S)
 
     m = RotaryEmbedding(D, max_position_embeddings=16, backend="eager")
-    q_a, k_a = m(q, k, pos_1d)
-    q_b, k_b = m(q, k, pos_2d)
+    q_a, k_a = m(pos_1d, q, k)
+    q_b, k_b = m(pos_2d, q, k)
     torch.testing.assert_close(q_a, q_b)
     torch.testing.assert_close(k_a, k_b)
 
@@ -279,7 +279,7 @@ def test_eager_interleave_matches_manual():
     pos = torch.arange(nnz)
 
     m = RotaryEmbedding(D, max_position_embeddings=16, interleave=True, backend="eager")
-    q_out, k_out = m(q, k, pos)
+    q_out, k_out = m(pos, q, k)
 
     # Manual reference: standard interleaved RoPE rotation by hand.
     cos_h, sin_h = _ref_cos_sin(pos, D, 10000.0, double=False)
@@ -311,7 +311,7 @@ def test_mismatched_nnz_raises_3d():
     k = torch.randn(5, 2, 64)
     pos = torch.arange(6)
     with pytest.raises(ValueError, match="ragged token counts differ"):
-        m(q, k, pos)
+        m(pos, q, k)
 
 
 def test_mismatched_seqlen_raises_4d():
@@ -320,7 +320,7 @@ def test_mismatched_seqlen_raises_4d():
     k = torch.randn(2, 5, 4, 64)
     pos = torch.arange(6).unsqueeze(0).expand(2, 6)
     with pytest.raises(ValueError, match="leading.*B, S"):
-        m(q, k, pos)
+        m(pos, q, k)
 
 
 def test_wrong_head_dim_raises():
@@ -329,7 +329,7 @@ def test_wrong_head_dim_raises():
     k = torch.randn(2, 4, 4, 32)
     pos = torch.arange(4)
     with pytest.raises(ValueError, match="last dim must equal head_dim"):
-        m(q, k, pos)
+        m(pos, q, k)
 
 
 def test_2d_q_raises():
@@ -338,7 +338,7 @@ def test_2d_q_raises():
     k = torch.randn(8, 64)
     pos = torch.arange(8)
     with pytest.raises(ValueError, match="3-D .* or 4-D"):
-        m(q, k, pos)
+        m(pos, q, k)
 
 
 # ---------------------------------------------------------------------------
@@ -361,9 +361,9 @@ def test_module_linear_scaling_changes_output():
         rope_scaling={"factor": 2.0},
         backend="eager",
     )
-    q_def, _ = m_def(q, k, pos)
-    q_lin, _ = m_lin(q, k, pos)
-    # Different inv_freq → different rotated output.
+    q_def, _ = m_def(pos, q, k)
+    q_lin, _ = m_lin(pos, q, k)
+    # Different inv_freq -> different rotated output.
     assert not torch.allclose(q_def, q_lin, atol=1e-3)
 
 
@@ -386,8 +386,8 @@ def test_flashinfer_matches_eager_4d_bf16():
     m_fi = RotaryEmbedding(
         D, max_position_embeddings=64, backend="flashinfer", device="cuda"
     )
-    q_e, k_e = m_eager(q, k, pos)
-    q_f, k_f = m_fi(q, k, pos)
+    q_e, k_e = m_eager(pos, q, k)
+    q_f, k_f = m_fi(pos, q, k)
     torch.testing.assert_close(q_f, q_e, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_f, k_e, atol=2e-2, rtol=2e-2)
 
@@ -407,8 +407,8 @@ def test_flashinfer_matches_eager_3d_ragged_bf16():
     m_fi = RotaryEmbedding(
         D, max_position_embeddings=64, backend="flashinfer", device="cuda"
     )
-    q_e, k_e = m_eager(q, k, pos)
-    q_f, k_f = m_fi(q, k, pos)
+    q_e, k_e = m_eager(pos, q, k)
+    q_f, k_f = m_fi(pos, q, k)
     torch.testing.assert_close(q_f, q_e, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_f, k_e, atol=2e-2, rtol=2e-2)
 
@@ -435,8 +435,8 @@ def test_flashinfer_partial_rotary_matches_eager_bf16():
         backend="flashinfer",
         device="cuda",
     )
-    q_e, k_e = m_eager(q, k, pos)
-    q_f, k_f = m_fi(q, k, pos)
+    q_e, k_e = m_eager(pos, q, k)
+    q_f, k_f = m_fi(pos, q, k)
     torch.testing.assert_close(q_f, q_e, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_f, k_e, atol=2e-2, rtol=2e-2)
 
@@ -450,4 +450,4 @@ def test_flashinfer_rejects_cpu_input():
     k = torch.randn(2, 4, 4, 64)
     pos = torch.arange(4)
     with pytest.raises(RuntimeError, match="rotary_emb.to"):
-        m(q, k, pos)
+        m(pos, q, k)

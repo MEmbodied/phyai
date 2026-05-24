@@ -6,12 +6,16 @@ requires-python = ">=3.12"
 dependencies = [
     "phyai-kernel",
     "numpy",
-    "torch",
-    "flashinfer-python",
+    "torch==2.11",
+    "safetensors",
+    "torchvision",
+    "flashinfer-python==v0.6.11.post3",
+    "transformers==5.8.1",
 ]
 
 [project.optional-dependencies]
 ext = ["phyai-ext"]
+fastokenizer = ["fastokens>=0.2.0"]
 
 [build-system]
 requires = ["hatchling"]

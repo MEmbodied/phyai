@@ -1,10 +1,10 @@
 """Conv{1,2,3}d wrappers tagged for the phyai loader system.
 
-Plain ``torch.nn.Conv{1,2,3}d`` would suffice for compute, but the rest of
-phyai expects every parameter-bearing layer to expose a ``placements()``
-method so checkpoint loading can dispatch generically. These classes are
-nothing more than ``F.conv{1,2,3}d`` with a replicated
-:class:`~phyai.layers.placement.CopyPlacement` per parameter — no
+Plain ``torch.nn.Conv{1,2,3}d`` would suffice for compute, but the rest
+of phyai expects every parameter-bearing layer to attach load metadata
+to its parameters so the top-level loader can dispatch generically.
+These classes are nothing more than ``F.conv{1,2,3}d`` with replicated
+:func:`phyai.weights.shards.replicated` loaders on each parameter — no
 tensor-parallel sharding, no kernel dispatch.
 
 Constructor signatures mirror ``torch.nn.Conv{1,2,3}d`` so existing
@@ -22,11 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.layers.placement import (
-    CopyPlacement,
-    Placement,
-    split_prefix,
-)
+from phyai.engine_config import get_engine_config
+from phyai.weights.shards import replicated
 
 _size_1_t = Union[int, Tuple[int]]
 _size_2_t = Union[int, Tuple[int, int]]
@@ -54,7 +51,7 @@ class _ConvNd(nn.Module):
     canonical PyTorch layout
     ``(out_channels, in_channels // groups, *kernel_size)``, so HuggingFace
     / ``nn.Conv*`` checkpoints copy in straight through a replicated
-    :class:`~phyai.layers.placement.CopyPlacement`.
+    :func:`phyai.weights.shards.replicated` loader.
     """
 
     _ndim: int
@@ -71,6 +68,7 @@ class _ConvNd(nn.Module):
         bias: bool,
         padding_mode: str,
         dtype: torch.dtype | None,
+        device: torch.device | str | None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -97,6 +95,8 @@ class _ConvNd(nn.Module):
                 raise ValueError(
                     "padding='same' is incompatible with strided convolutions"
                 )
+        if device is None:
+            device = get_engine_config().device.target
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -118,34 +118,23 @@ class _ConvNd(nn.Module):
 
         weight_shape = (out_channels, in_channels // groups) + tuple(kernel_size)
         self.weight = nn.Parameter(
-            torch.empty(weight_shape, dtype=dtype),
+            torch.empty(weight_shape, dtype=dtype, device=device),
             requires_grad=False,
         )
         if bias:
             self.bias = nn.Parameter(
-                torch.zeros(out_channels, dtype=dtype),
+                torch.zeros(out_channels, dtype=dtype, device=device),
                 requires_grad=False,
             )
         else:
             self.register_parameter("bias", None)
 
-    def placements(self) -> list[Placement]:
-        parent, own = split_prefix(self.prefix)
-        hf_base = f"{parent}.{own}" if parent else own
-        out: list[Placement] = [
-            CopyPlacement(
-                hf_key=f"{hf_base}.weight",
-                phyai_key=f"{self.prefix}.weight",
-            )
-        ]
-        if self.bias is not None:
-            out.append(
-                CopyPlacement(
-                    hf_key=f"{hf_base}.bias",
-                    phyai_key=f"{self.prefix}.bias",
-                )
-            )
-        return out
+        if prefix:
+            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.weight_loader = replicated()
+            if self.bias is not None:
+                self.bias.hf_keys = [(f"{prefix}.bias", None)]
+                self.bias.weight_loader = replicated()
 
     @staticmethod
     def _build_reversed_pad(
@@ -226,6 +215,7 @@ class Conv1d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -239,6 +229,7 @@ class Conv1d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            device,
             prefix=prefix,
         )
 
@@ -264,6 +255,7 @@ class Conv2d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -277,6 +269,7 @@ class Conv2d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            device,
             prefix=prefix,
         )
 
@@ -302,6 +295,7 @@ class Conv3d(_ConvNd):
         padding_mode: str = "zeros",
         *,
         dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__(
@@ -315,6 +309,7 @@ class Conv3d(_ConvNd):
             bias,
             padding_mode,
             dtype,
+            device,
             prefix=prefix,
         )
 

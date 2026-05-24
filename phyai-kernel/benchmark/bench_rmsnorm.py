@@ -57,7 +57,7 @@ class HFRMSNorm(torch.nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Closures for each provider × variant.                                       #
+# Closures for each provider x variant.                                       #
 # --------------------------------------------------------------------------- #
 
 

@@ -1,7 +1,7 @@
 """RoPE with a selectable kernel backend.
 
-Llama / Qwen / Gemma / PaliGemma all rotate Q and K with the rotate-half
-(NeoX-style) variant of RoPE; :class:`NoStateAttention` is by design a
+Most modern transformer decoders rotate Q and K with the rotate-half
+(NeoX-style) variant of RoPE; :class:`Attention` is by design a
 pure attention op and expects rotation to happen before it. This module
 fills that gap.
 
@@ -23,23 +23,45 @@ Supported rope_types
 ``"dynamic"``, ``"longrope"`` are reserved and raise ``NotImplementedError``
 to keep the dispatch table closed.
 
-Forward shape contract
-----------------------
+Two usage shapes
+----------------
+The default call does the position → cos/sin lookup and the rotation
+in one fused launch per layer; signature passes
+(``positions`` first, then ``q`` and ``k``):
+
+    q, k = rope(positions, q, k)           # one fused kernel per layer
+
+Alternatively the cos/sin gather can be hoisted out of the layer loop
+and the rotation applied per layer with the cached tensors:
+
+    cos, sin = rope.compute_cos_sin(positions)   # once at top of stack
+    for layer in layers:
+        q, k = rope.apply_with_cos_sin(q, k, cos, sin)   # rotation only
+
+Trades one extra method on the rope object for amortising the cache
+gather across N layers. Mostly useful when the same ``positions`` apply
+to every layer in the stack and you care about kernel-launch count
+(cuda-graph capture, deep stacks).
+
+Shape contract
+--------------
 Both Q and K must have the same number of tokens (``S`` for padded,
 ``nnz`` for ragged) — append-prefill (Q shorter than K) is the caller's
 responsibility, who can call this layer twice with different
-``position_ids``.
+``positions``.
 
 * 4-D padded: ``q (B, S, H_q, D)``, ``k (B, S, H_k, D)``,
-  ``position_ids (B, S)`` or ``(S,)``.
+  ``positions (B, S)`` or ``(S,)``.
 * 3-D ragged: ``q (nnz, H_q, D)``, ``k (nnz, H_k, D)``,
-  ``position_ids (nnz,)``.
+  ``positions (nnz,)``.
 
 Limitations
 -----------
 * No fused FP8 RoPE (flashinfer's ``rope_quantize_fp8``); not needed for
   prefill-only VLA today.
 * No in-place variant — output buffers are always freshly allocated.
+* The precomputed-cos/sin path uses the eager apply; flashinfer has no
+  kernel that takes pre-gathered cos/sin tensors today.
 """
 
 from __future__ import annotations
@@ -49,6 +71,8 @@ from typing import Callable, Tuple
 
 import torch
 import torch.nn as nn
+
+from phyai.engine_config import get_engine_config
 
 
 _VALID_BACKENDS: tuple[str, ...] = ("flashinfer", "eager")
@@ -113,7 +137,8 @@ def _llama3_inv_freq(
 ) -> tuple[torch.Tensor, float]:
     """Llama 3.1 piecewise-smooth scaling.
 
-    Mirrors :func:`transformers.modeling_rope_utils._compute_llama3_parameters`.
+    Implements the piecewise-smooth long-context scaling described in the
+    Llama 3 technical report.
     """
     inv_freq, _ = _default_inv_freq(rotary_dim, theta, device=device)
     low_freq_wavelen = original_max_position_embeddings / low_freq_factor
@@ -157,7 +182,7 @@ ROPE_INV_FREQ_FNS: dict[str, Callable[..., tuple[torch.Tensor, float]]] = {
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """``[a, b] -> [-b, a]`` along the last dim — the NeoX/Llama RoPE rotation."""
+    """``[a, b] -> [-b, a]`` along the last dim — the NeoX-style RoPE rotation."""
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((-x2, x1), dim=-1)
@@ -172,12 +197,12 @@ def apply_rotary_pos_emb(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply rotate-half RoPE with caller-supplied ``cos`` / ``sin``.
 
-    Mirrors transformers' :func:`apply_rotary_pos_emb`. ``cos`` and ``sin``
-    must already be sized to the full ``head_dim`` (i.e. each half
-    duplicated). ``unsqueeze_dim`` controls which axis becomes the head
-    axis after broadcasting:
+    NeoX-style rotate-half convention. ``cos`` and ``sin`` must already be
+    sized to the full ``head_dim`` (i.e. each half duplicated).
+    ``unsqueeze_dim`` controls which axis becomes the head axis after
+    broadcasting:
 
-    * ``unsqueeze_dim=1`` for ``q (B, H, S, D)`` (transformers default),
+    * ``unsqueeze_dim=1`` for ``q (B, H, S, D)`` (HF default),
     * ``unsqueeze_dim=2`` for ``q (B, S, H, D)``,
     * ``unsqueeze_dim=-2`` for ragged ``q (nnz, H, D)`` or any "head is
       second-to-last" layout.
@@ -236,11 +261,11 @@ class RotaryEmbedding(nn.Module):
         and the trailing ``head_dim - rotary_dim`` are passed through
         unchanged.
     max_position_embeddings:
-        Cache size along the sequence axis. ``position_ids`` must be
+        Cache size along the sequence axis. ``positions`` must be
         ``< max_position_embeddings``.
     rope_theta:
-        RoPE base wavelength. Llama / Qwen ``1e4``, Llama 3.1 ``5e5``,
-        Gemma ``1e4``, etc.
+        RoPE base wavelength. Common values: ``1e4`` for short-context
+        configs, ``5e5`` (or larger) for long-context configs.
     rope_type:
         ``"default"``, ``"linear"``, or ``"llama3"``. ``"yarn"``,
         ``"dynamic"``, ``"longrope"`` raise NotImplementedError.
@@ -252,14 +277,17 @@ class RotaryEmbedding(nn.Module):
     partial_rotary_factor:
         Fraction of ``head_dim`` that gets rotated. Default ``1.0``.
     interleave:
-        ``False`` (default): NeoX / rotate-half geometry — used by Llama,
-        Qwen, Gemma, PaliGemma. ``True``: GPT-J / NeoX-old even/odd
-        geometry. flashinfer maps ``is_neox = not interleave``.
+        ``False`` (default): NeoX-style rotate-half geometry (the
+        common case for modern transformer decoders). ``True``:
+        GPT-J / NeoX-old even/odd geometry. flashinfer maps
+        ``is_neox = not interleave``.
     backend:
         ``"flashinfer"`` (default) or ``"eager"``.
     device:
-        Where to allocate the cache. Module is otherwise CPU-pinned at
-        construction; ``.to(device)`` moves the buffer.
+        Where to allocate the cache. Defaults to
+        :attr:`phyai.engine_config.EngineConfig.device` (typically
+        ``"cuda"``); pass an explicit ``"cpu"`` / ``"cuda:N"`` to
+        override. ``.to(device)`` later still works.
     """
 
     def __init__(
@@ -309,6 +337,8 @@ class RotaryEmbedding(nn.Module):
         self.partial_rotary_factor = partial_rotary_factor
         self.interleave = interleave
         self.backend = _resolve_backend(backend)
+        if device is None:
+            device = get_engine_config().device.target
 
         if self.backend == "flashinfer":
             # Fail fast at construction rather than at first forward.
@@ -338,27 +368,32 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_sin_cache", cos_sin_cache, persistent=False)
 
     # ------------------------------------------------------------------ #
-    # Forward                                                            #
+    # Forward — positions first, then q, k                                #
     # ------------------------------------------------------------------ #
 
     def forward(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
-        position_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self._check_shapes(q, k, position_ids)
+        """Per-layer fused gather-and-rotate.
+
+        Argument order is ``(positions, query, key)`` so the kernel
+        sees the position lookup before the Q/K rotation in one fused
+        call.
+        """
+        self._check_shapes(positions, q, k)
         if self.backend == "flashinfer":
-            return self._forward_flashinfer(q, k, position_ids)
-        return self._forward_eager(q, k, position_ids)
+            return self._forward_flashinfer(positions, q, k)
+        return self._forward_eager(positions, q, k)
 
     def _check_shapes(
-        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> None:
         if q.dim() not in (3, 4):
             raise ValueError(
-                f"q must be 3-D (ragged) or 4-D (padded), got shape "
-                f"{tuple(q.shape)}."
+                f"q must be 3-D (ragged) or 4-D (padded), got shape {tuple(q.shape)}."
             )
         if q.dim() != k.dim():
             raise ValueError(
@@ -378,7 +413,7 @@ class RotaryEmbedding(nn.Module):
                     f"q/k must share leading (B, S); got q={tuple(q.shape)}, "
                     f"k={tuple(k.shape)}. Append-prefill (Q shorter than K) "
                     f"is not supported here — call RotaryEmbedding twice "
-                    f"with different position_ids."
+                    f"with different positions."
                 )
         else:  # 3-D
             if q.shape[0] != k.shape[0]:
@@ -390,7 +425,7 @@ class RotaryEmbedding(nn.Module):
     # ---------------------------- flashinfer ---------------------------- #
 
     def _forward_flashinfer(
-        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.rope import apply_rope_with_cos_sin_cache
 
@@ -410,17 +445,17 @@ class RotaryEmbedding(nn.Module):
             nnz = B * S
             flat_q = q.reshape(nnz, H_q * self.head_dim)
             flat_k = k.reshape(nnz, H_k * self.head_dim)
-            pos = position_ids
+            pos = positions
             if pos.dim() == 1:
                 if pos.shape[0] != S:
                     raise ValueError(
-                        f"1-D position_ids length {pos.shape[0]} does not "
+                        f"1-D positions length {pos.shape[0]} does not "
                         f"match S={S} for 4-D q."
                     )
                 pos = pos.unsqueeze(0).expand(B, S)
             elif pos.shape != (B, S):
                 raise ValueError(
-                    f"position_ids shape {tuple(pos.shape)} != (B, S)=({B}, {S})."
+                    f"positions shape {tuple(pos.shape)} != (B, S)=({B}, {S})."
                 )
             flat_pos = pos.reshape(nnz)
         else:  # 3-D
@@ -429,12 +464,12 @@ class RotaryEmbedding(nn.Module):
             H_k = k.shape[1]
             flat_q = q.reshape(nnz, H_q * self.head_dim)
             flat_k = k.reshape(nnz, H_k * self.head_dim)
-            if position_ids.dim() != 1 or position_ids.shape[0] != nnz:
+            if positions.dim() != 1 or positions.shape[0] != nnz:
                 raise ValueError(
-                    f"position_ids shape {tuple(position_ids.shape)} does not "
+                    f"positions shape {tuple(positions.shape)} does not "
                     f"match (nnz,)=({nnz},) for 3-D q."
                 )
-            flat_pos = position_ids
+            flat_pos = positions
         flat_pos = flat_pos.contiguous().to(torch.int32)
 
         q_out, k_out = apply_rope_with_cos_sin_cache(
@@ -450,32 +485,76 @@ class RotaryEmbedding(nn.Module):
     # ------------------------------ eager ------------------------------ #
 
     def _forward_eager(
-        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Look up cos/sin per token. Cache stays fp32; cast back to q.dtype
-        # when we multiply.
-        pos = position_ids.to(self.cos_sin_cache.device).long()
-        cs = self.cos_sin_cache[pos]  # (..., rotary_dim)
-        cos_h, sin_h = cs.chunk(2, dim=-1)  # each (..., rotary_dim/2)
+        # Eager path: gather cos/sin from the cache and apply via
+        # :meth:`apply_with_cos_sin`. Sharing the apply path with the
+        # precomputed-cos/sin route keeps the two numerically identical.
+        cos, sin = self.compute_cos_sin(positions)
+        return self.apply_with_cos_sin(q, k, cos, sin)
 
+    # ------------------------------------------------------------------ #
+    # Precomputed cos/sin                                                #
+    # ------------------------------------------------------------------ #
+
+    def compute_cos_sin(
+        self, positions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather cos/sin from the cache for the given positions.
+
+        Hoist this call to the top of the layer loop when the same
+        ``positions`` apply to every layer, then thread the resulting
+        ``(cos, sin)`` through every layer's
+        :meth:`apply_with_cos_sin` (or the equivalent
+        ``rope_cos`` / ``rope_sin`` forward kwargs on
+        :class:`~phyai.layers.transformer_block.TransformerBlock`).
+
+        Returns
+        -------
+        cos, sin : torch.Tensor
+            Shape ``(*positions.shape, rotary_dim)``, fp32 (cache dtype),
+            laid out for ``self.interleave``:
+
+            * ``interleave=False`` (rotate-half / NeoX): each cos/sin
+              half is duplicated along the last dim
+              (``[c0, c1, ..., c0, c1, ...]``).
+            * ``interleave=True`` (GPT-J / NeoX-old): each entry is
+              repeated twice in place (``[c0, c0, c1, c1, ...]``).
+
+            The caller broadcasts to the head axis by passing through
+            :meth:`apply_with_cos_sin` (which uses ``unsqueeze_dim=-2``)
+            or with their own unsqueeze.
+        """
+        pos = positions.to(self.cos_sin_cache.device).long()
+        cs = self.cos_sin_cache[pos]  # (*pos.shape, rotary_dim)
+        cos_h, sin_h = cs.chunk(2, dim=-1)  # each (*pos.shape, rotary_dim/2)
         if self.interleave:
-            # cos / sin doubled by repeat-interleave: [c0, c0, c1, c1, ...].
             cos = cos_h.repeat_interleave(2, dim=-1)
             sin = sin_h.repeat_interleave(2, dim=-1)
-            apply_fn = _apply_interleaved
         else:
             cos = torch.cat([cos_h, cos_h], dim=-1)
             sin = torch.cat([sin_h, sin_h], dim=-1)
-            apply_fn = apply_rotary_pos_emb
+        return cos, sin
 
-        # Broadcast position-axis cos/sin to the q/k shape.
-        # 4-D q: (B, S, H, D); cos here is (B, S, rd) when pos is (B, S),
-        # or (S, rd) when pos is (S,) — the latter broadcasts along B.
-        # 3-D q: (nnz, H, D); cos is (nnz, rd).
-        # In both cases head axis is -2, so unsqueeze_dim=-2.
+    def apply_with_cos_sin(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply RoPE rotation with caller-supplied cos/sin.
+
+        Picks rotate-half vs interleaved based on ``self.interleave`` and
+        respects ``self.partial_rotary_factor`` (only the leading
+        ``rotary_dim`` channels are rotated; the trailing channels pass
+        through). The head axis is auto-broadcast via ``unsqueeze_dim=-2``,
+        matching phyai's ``(..., H, D)`` layout for both padded and
+        ragged inputs.
+        """
+        apply_fn = _apply_interleaved if self.interleave else apply_rotary_pos_emb
         cos = cos.to(dtype=q.dtype, device=q.device)
         sin = sin.to(dtype=q.dtype, device=q.device)
-
         if self.rotary_dim < self.head_dim:
             q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
             k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
