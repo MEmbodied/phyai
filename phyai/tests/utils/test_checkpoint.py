@@ -13,7 +13,6 @@ import torch
 from phyai.models.configuration import PretrainedConfig
 from phyai.utils.checkpoint import (
     find_safetensors,
-    load_checkpoint,
     load_config,
 )
 
@@ -180,39 +179,3 @@ def test_load_config_custom_filename(tmp_path: Path):
 def test_load_config_dir_validation(tmp_path: Path):
     with pytest.raises(FileNotFoundError, match="does not exist"):
         load_config(tmp_path / "ghost", _TinyConfig)
-
-
-# --------------------------------------------------------------------------- #
-# load_checkpoint                                                             #
-# --------------------------------------------------------------------------- #
-
-
-def test_load_checkpoint_returns_pair(tmp_path: Path):
-    (tmp_path / "config.json").write_text(json.dumps({"hidden_size": 64}))
-    (tmp_path / "model.safetensors").write_bytes(b"")
-    cfg, shards = load_checkpoint(tmp_path, _TinyConfig)
-    assert cfg.hidden_size == 64
-    assert len(shards) == 1
-    assert shards[0].name == "model.safetensors"
-
-
-def test_load_checkpoint_with_index_shards(tmp_path: Path):
-    save_file({"a": torch.zeros(2)}, str(tmp_path / "shard-00001.safetensors"))
-    save_file({"b": torch.zeros(2)}, str(tmp_path / "shard-00002.safetensors"))
-    (tmp_path / "config.json").write_text(json.dumps({"hidden_size": 4}))
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    "a": "shard-00001.safetensors",
-                    "b": "shard-00002.safetensors",
-                }
-            }
-        )
-    )
-    cfg, shards = load_checkpoint(tmp_path, _TinyConfig)
-    assert cfg.hidden_size == 4
-    assert [p.name for p in shards] == [
-        "shard-00001.safetensors",
-        "shard-00002.safetensors",
-    ]

@@ -7,17 +7,17 @@ A "checkpoint" in phyai follows the same on-disk layout as a
 * one or more ``*.safetensors`` shards, optionally indexed by
   ``model.safetensors.index.json``.
 
-These helpers resolve a folder into the (config object, shard paths)
-pair every plugin needs:
+This module covers the filesystem side of that layout:
 
 * :func:`find_safetensors` — list the safetensors shards in a folder,
   honouring ``model.safetensors.index.json`` when present.
 * :func:`load_config` — parse ``config.json`` into a
   :class:`~phyai.models.configuration.PretrainedConfig` subclass.
-* :func:`load_checkpoint` — convenience: do both in one call.
 
-Plugins (:class:`phyai.engine.Entry`) and ``examples/`` consume these
-instead of hand-rolling per-model directory parsing.
+Actually loading tensors into an :class:`nn.Module` is the job of
+:func:`phyai.weights.load_pretrained`, which accepts a checkpoint folder
+directly and reuses :func:`find_safetensors` internally — call sites do
+not need to expand the folder themselves.
 """
 
 from __future__ import annotations
@@ -123,22 +123,4 @@ def load_config(
     return config_cls.from_json(config_path)
 
 
-def load_checkpoint(
-    folder: str | Path,
-    config_cls: type[T],
-    *,
-    config_filename: str = _DEFAULT_CONFIG_FILENAME,
-) -> tuple[T, list[Path]]:
-    """One-shot folder resolver: ``(config, [shard_paths])``.
-
-    Equivalent to calling :func:`load_config` and :func:`find_safetensors`
-    on the same folder; provided for the common case where both pieces
-    are needed at the same call site.
-    """
-    folder = _ensure_dir(folder)
-    config = load_config(folder, config_cls, filename=config_filename)
-    shards = find_safetensors(folder)
-    return config, shards
-
-
-__all__ = ["find_safetensors", "load_checkpoint", "load_config"]
+__all__ = ["find_safetensors", "load_config"]

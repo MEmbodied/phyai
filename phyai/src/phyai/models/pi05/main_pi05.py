@@ -8,8 +8,8 @@ Two pieces, both consumed by :class:`~phyai.engine.Engine`:
   optional :class:`PI05Config` override, and the model-specific
   scheduler knob ``max_batch_size``.
 * :class:`PI05Entry` — :class:`~phyai.engine.Entry` subclass that
-  resolves the checkpoint folder via
-  :func:`phyai.utils.load_checkpoint`, builds a :class:`PI05Model`,
+  parses the checkpoint folder's ``config.json`` via
+  :func:`phyai.utils.load_config`, builds a :class:`PI05Model`,
   runs :func:`load_pretrained`, constructs and warms a
   :class:`PI05WS1Scheduler`, then forwards :meth:`step` to it.
 
