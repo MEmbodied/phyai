@@ -51,6 +51,32 @@ from phyai.layers.quant import AllocationRequest, WeightSpec
 from phyai.utils.cuda import sm_arch
 
 
+def supported_specs_for_sm(sm: int) -> list[str]:
+    """Specs ``validate()`` should *require* a kernel for on this hardware.
+
+    ``validate()`` is a startup sanity check, not a feature gate: it should
+    only assert coverage for specs the current GPU can actually run. fp8 has
+    no backend below sm_89 (``torch._scaled_mm`` needs sm89+; flashinfer's
+    block-fp8 GEMM is sm100+), so demanding fp8 coverage on Ampere (sm_86)
+    or CPU (sm_arch → 0) would kill engine init for a pure-bf16 model that
+    never touches fp8. bf16 is universal (it also covers the CPU fallback).
+
+    A model that *does* request an fp8 spec on unsupported hardware still
+    gets a clear, lazily-raised
+    :class:`~phyai.parallel.exceptions.NoBackendError` at dispatch time
+    (see :meth:`KernelDispatcher.select`) — the failure surfaces at the
+    offending matmul, not at startup for everyone.
+    """
+    specs = ["bf16"]
+    if sm >= 89:
+        # torch._scaled_mm per-tensor / per-channel fp8.
+        specs += ["fp8_per_tensor", "fp8_per_channel"]
+    if sm >= 100:
+        # flashinfer gemm_fp8_nt_groupwise (DeepSeek-V3 block-fp8).
+        specs.append("fp8_block_128_128")
+    return specs
+
+
 def init(
     *,
     register_flashinfer: bool = True,
@@ -65,6 +91,11 @@ def init(
     ``register_flashinfer=False`` to skip the flashinfer kernel (handy on
     CPU-only / flashinfer-unavailable hosts that still want validate to
     pass on torch alone).
+
+    When ``sample_specs`` is left unset, the specs ``validate()`` requires
+    are chosen by hardware capability via :func:`supported_specs_for_sm`
+    so that pure-bf16 deployments on fp8-incapable GPUs (e.g. sm_86) start
+    cleanly; unsupported specs only error if a layer actually requests one.
     """
     reg = LinearKernelRegistry()
 
@@ -74,14 +105,11 @@ def init(
         reg.register(cls(), prefer_for=set(prefer_for) if prefer_for else None)
 
     if validate:
-        default_specs = ["bf16", "fp8_per_tensor", "fp8_per_channel"]
-        # Block-FP8 only validates on sm_100+; skip on older hardware so
-        # developer laptops don't fail init.
         sm = sm_arch()
-        if sm >= 100:
-            default_specs.append("fp8_block_128_128")
         reg.validate(
-            sample_specs=sample_specs if sample_specs is not None else default_specs,
+            sample_specs=(
+                sample_specs if sample_specs is not None else supported_specs_for_sm(sm)
+            ),
             sm=sm,
         )
 
@@ -97,6 +125,7 @@ def _reset_for_test() -> None:
 
 __all__ = [
     "init",
+    "supported_specs_for_sm",
     # layers
     "LinearBase",
     "ReplicatedLinear",

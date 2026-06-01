@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import phyai.layers.linear as L
+from phyai.parallel.exceptions import NoBackendError
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +485,72 @@ def test_init_force_env_overrides(fake_mesh, monkeypatch):
         out_dtype=torch.bfloat16,
     )
     assert k.name == "torch"
+
+
+# ---------------------------------------------------------------------------
+# Hardware-gated validate(): fp8 has no kernel below sm_89, so a pure-bf16
+# deployment on Ampere (sm_86) / CPU (sm_arch -> 0) must still init cleanly.
+# Unsupported specs error lazily at the matmul, never at startup.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sm, expected",
+    [
+        (0, ["bf16"]),  # CPU
+        (80, ["bf16"]),  # Ampere A100 — no fp8
+        (86, ["bf16"]),  # Ampere A10/A40 — the reported failure
+        (89, ["bf16", "fp8_per_tensor", "fp8_per_channel"]),  # Ada
+        (90, ["bf16", "fp8_per_tensor", "fp8_per_channel"]),  # Hopper
+        (100, ["bf16", "fp8_per_tensor", "fp8_per_channel", "fp8_block_128_128"]),
+    ],
+)
+def test_supported_specs_for_sm(sm, expected):
+    assert L.supported_specs_for_sm(sm) == expected
+
+
+def test_init_validate_succeeds_on_sm86_bf16_only(fake_mesh, monkeypatch):
+    """Regression: a bf16-only model on sm_86 used to die in validate()
+    demanding an fp8 kernel that no backend provides below sm_89."""
+    fake_mesh()
+    # init() reads the package-level sm_arch binding to choose which specs
+    # validate() must cover; the dispatcher reads its own binding for _sm.
+    monkeypatch.setattr("phyai.layers.linear.sm_arch", lambda *a, **k: 86)
+    monkeypatch.setattr("phyai.layers.linear.dispatch.sm_arch", lambda *a, **k: 86)
+
+    # No exception: validate only requires the specs sm_86 can actually run.
+    d = L.init(register_flashinfer=False, validate=True)
+
+    # bf16 still resolves to the torch fallback.
+    k = d.select(
+        spec_id="bf16",
+        M=8,
+        N=64,
+        K=64,
+        in_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+    )
+    assert k.name == "torch"
+
+
+def test_fp8_on_sm86_errors_lazily_at_dispatch_not_init(fake_mesh, monkeypatch):
+    """The user's design intent: unsupported -> don't register, raise at the
+    call site. init() succeeds; the fp8 request is what fails, and clearly."""
+    fake_mesh()
+    monkeypatch.setattr("phyai.layers.linear.sm_arch", lambda *a, **k: 86)
+    monkeypatch.setattr("phyai.layers.linear.dispatch.sm_arch", lambda *a, **k: 86)
+
+    d = L.init(register_flashinfer=False, validate=True)  # does NOT raise
+
+    with pytest.raises(NoBackendError):
+        d.select(
+            spec_id="fp8_per_tensor",
+            M=8,
+            N=64,
+            K=64,
+            in_dtype=torch.float8_e4m3fn,
+            out_dtype=torch.bfloat16,
+        )
 
 
 # ---------------------------------------------------------------------------

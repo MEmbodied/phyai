@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1
+#
+# phyai dev/runtime image — torch 2.11 + CUDA 13.
+#
+# The NGC PyTorch base supplies the CUDA 13 toolkit (nvcc) that phyai-kernel's
+# runtime JIT needs, plus the C++ toolchain phyai-ext's scikit-build-core CMake
+# build uses. `scripts/setup_dev_env.sh` then runs `uv sync`, which builds an
+# isolated .venv with its OWN pinned torch==2.11 (cu13 wheels). So the base
+# image's Python/PyTorch stack is not what runs — the base is here for the CUDA
+# userspace + system libraries; uv owns the Python environment.
+FROM nvcr.io/nvidia/pytorch:25.12-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# git → clone (+ submodules); build-essential + cmake → phyai-ext CMake build.
+# NGC images usually ship these already; pin them so the build doesn't depend on
+# whatever the base happens to include.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        build-essential \
+        cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv drives the whole workspace (uv sync / uv tool install inside the bootstrap
+# script) and ships preinstalled in the NGC base image — no COPY/pip needed.
+# If you retarget this Dockerfile at a base without uv, install it with e.g.
+#   COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Let uv manage a 3.12 interpreter regardless of the base image's system Python,
+# keep the project .venv at a stable path, and copy (don't hardlink) from the
+# cache so it works across the build's filesystem layers.
+ENV UV_PYTHON=3.12 \
+    UV_PROJECT_ENVIRONMENT=/opt/phyai/.venv \
+    UV_LINK_MODE=copy
+
+WORKDIR /opt/phyai
+
+# Clone the source with submodules, then prepare the env via the repo's own
+# bootstrap script. Pin a commit/branch/tag with --build-arg PHYAI_REF=<ref>.
+# The ADD of the GitHub commit ref busts the clone layer's cache whenever the
+# requested ref's HEAD moves, so rebuilds pick up new commits on a branch.
+ARG PHYAI_REF=main
+ADD "https://api.github.com/repos/MEmbodied/phyai/commits/${PHYAI_REF}" /tmp/phyai-ref.json
+RUN git clone --recursive https://github.com/MEmbodied/phyai . \
+    && git checkout "${PHYAI_REF}" \
+    && git submodule update --init --recursive
+
+# setup_dev_env.sh: uv sync (.venv + editable workspace, compiles phyai-ext),
+# pre-commit hooks, and — only if npm exists in the image — the Mintlify CLI.
+# The script degrades gracefully when npm is absent (NGC has no Node), so the
+# docs tooling is simply skipped here.
+RUN bash scripts/setup_dev_env.sh
+
+# Make the workspace venv the default interpreter for `docker run`.
+ENV PATH="/opt/phyai/.venv/bin:${PATH}"
+
+# Sanity check the toolchain at build time (no GPU needed — JIT happens lazily
+# at runtime; this just confirms nvcc + the venv torch are wired up).
+RUN nvcc --version \
+    && python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+CMD ["bash"]
