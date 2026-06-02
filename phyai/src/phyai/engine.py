@@ -387,3 +387,4 @@ __all__ = [
 # ---------------------------------------------------------------------- #
 
 from phyai.models.pi05 import main_pi05 as _main_pi05  # noqa: E402, F401
+from phyai.models.walloss import main_walloss as _main_walloss  # noqa: E402, F401
