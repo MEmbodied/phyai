@@ -11,6 +11,8 @@ dependencies = [
     "torchvision",
     "flashinfer-python==v0.6.11.post3",
     "transformers==5.8.1",
+    "msgpack>=1.0.0",
+    "websockets>=12.0",
 ]
 
 [project.optional-dependencies]

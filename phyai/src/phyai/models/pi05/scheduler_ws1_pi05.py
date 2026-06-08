@@ -68,12 +68,13 @@ def pack_prefix_per_sample_padded(
     lang_lens: torch.Tensor,
     *,
     n_per_sample: int,
+    image_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Assemble per-sample-padded ``(B * n_per_sample, D)`` prefix buffer.
 
     Per sample ``b`` the layout is
-    ``[image_b (N_img), lang_b[:lang_lens[b]] (real_lang_b), padding (rest)]``
-    where ``N_img + tokenizer_max_length == n_per_sample`` and the
+    ``[image_b[:image_lens[b]], lang_b[:lang_lens[b]], padding (rest)]``
+    where ``max_N_img + tokenizer_max_length == n_per_sample`` and the
     padding region holds zeros. The LLM runner is captured at fixed
     shape, so padding rows are required even though they will write K/V
     to the sentinel slot.
@@ -91,12 +92,15 @@ def pack_prefix_per_sample_padded(
 
     packed = torch.zeros(B * n_per_sample, D, dtype=dtype, device=device)
     lang_lens_list = lang_lens.tolist()
+    image_lens_list = [n_img] * B if image_lens is None else image_lens.tolist()
     for b in range(B):
+        L_img = int(image_lens_list[b])
         L_lang = int(lang_lens_list[b])
         base = b * n_per_sample
-        packed[base : base + n_img] = image_embs[b]
+        if L_img > 0:
+            packed[base : base + L_img] = image_embs[b, :L_img]
         if L_lang > 0:
-            packed[base + n_img : base + n_img + L_lang] = lang_embs[b, :L_lang]
+            packed[base + L_img : base + L_img + L_lang] = lang_embs[b, :L_lang]
     return packed
 
 
@@ -196,14 +200,18 @@ def build_joint_paged_kv_indices(
 class PI05Request:
     """One pi0.5 inference request.
 
-    ``pixel_values`` carries every robot's three cameras stacked along
-    the camera axis: shape ``(B, 3, 3, H, W)`` — ``B`` robots x 3 cameras
-    x 3 channels x ``image_size``x``image_size``. ``B`` may be any value
-    in ``[1, max_batch_size]`` (the scheduler pads up internally).
+    ``pixel_values`` carries every robot's camera images stacked along
+    the camera axis: shape ``(B, Cams, 3, H, W)`` — ``B`` robots x camera
+    count x 3 channels x ``image_size``x``image_size``. ``B`` may be any
+    value in ``[1, max_batch_size]`` (the scheduler pads up internally).
 
     ``input_ids`` is the padded language-token tensor (``(B,
     tokenizer_max_length)`` int64); ``lang_lens`` carries the
     un-padded real lengths.
+
+    ``image_masks`` is optional; when present it has shape ``(B, Cams)`` and
+    marks which camera streams are real. If omitted, every supplied camera is
+    treated as valid.
 
     ``noise`` is optional; if ``None`` the scheduler samples a fresh
     Gaussian (over the *real* batch only — the padded tail uses zeros
@@ -213,6 +221,7 @@ class PI05Request:
     pixel_values: torch.Tensor
     input_ids: torch.Tensor
     lang_lens: torch.Tensor
+    image_masks: torch.Tensor | None = None
     noise: torch.Tensor | None = None
 
 
@@ -238,8 +247,10 @@ class PI05WS1Scheduler(Scheduler):
             raise ValueError(f"max_batch_size must be positive, got {max_batch_size}.")
         self.model = model
 
-        # Layout knobs.
-        self.image_token_count = cfg.vision.num_patches * 3  # 3 cameras per robot
+        # Layout knobs. Allocate prefix capacity for up to three cameras; each
+        # request may provide two or three camera streams.
+        self.max_cameras = 3
+        self.image_token_count = cfg.vision.num_patches * self.max_cameras
         self.n_per_sample = self.image_token_count + cfg.tokenizer_max_length
 
         # KVCachePool: sentinel slot 0 + prefix slab + suffix slab.
@@ -388,11 +399,20 @@ class PI05WS1Scheduler(Scheduler):
         # padded q-rows then produce zeros (or NaNs that we discard).
         # No K/V written to slot 0 is ever read by attention.
         lang_lens_actual = request.lang_lens.to(device=device, dtype=torch.int32)
+        num_cameras = int(request.pixel_values.shape[1])
+        tokens_per_camera = cfg.vision.num_patches
+        if request.image_masks is None:
+            image_masks_actual = torch.ones(actual_B, num_cameras, dtype=torch.bool, device=device)
+        else:
+            image_masks_actual = request.image_masks.to(device=device, dtype=torch.bool)
+        image_lens_actual = image_masks_actual.to(torch.int32).sum(dim=1) * tokens_per_camera
         real_lens = torch.zeros(max_B, dtype=torch.int32, device=device)
-        real_lens[:actual_B] = lang_lens_actual + self.image_token_count
+        image_lens = torch.zeros(max_B, dtype=torch.int32, device=device)
+        image_lens[:actual_B] = image_lens_actual
+        real_lens[:actual_B] = lang_lens_actual + image_lens_actual
         n_real_total = int(real_lens.sum())
 
-        # 1. Vision pass — replay the captured (3, 3, H, W) graph once
+        # 1. Vision pass — run the supplied camera stack once
         # per real robot. The runner's output aliases its static buffer,
         # so we eagerly copy each replay into a pre-allocated
         # ``(max_B, image_token_count, D)`` slot before the next replay
@@ -411,7 +431,10 @@ class PI05WS1Scheduler(Scheduler):
                     image_embs = torch.zeros(
                         max_B, *flat.shape, dtype=flat.dtype, device=flat.device
                     )
-                image_embs[b] = flat
+                camera_tokens = flat.view(num_cameras, tokens_per_camera, flat.shape[-1])
+                valid_tokens = camera_tokens[image_masks_actual[b]].reshape(-1, flat.shape[-1])
+                if valid_tokens.numel() > 0:
+                    image_embs[b, : valid_tokens.shape[0]] = valid_tokens
             assert image_embs is not None  # actual_B >= 1 enforced by _validate
 
         # 2. Lang embed (eager) + per-sample padded packing. input_ids
@@ -442,6 +465,7 @@ class PI05WS1Scheduler(Scheduler):
                 lang_embs,
                 lang_lens_padded,
                 n_per_sample=self.n_per_sample,
+                image_lens=image_lens,
             )
 
         # 3. Reset caches and plan the prefix layout.
@@ -615,9 +639,10 @@ class PI05WS1Scheduler(Scheduler):
                 f"pixel_values batch dim {actual_B} not in "
                 f"[1, max_batch_size={self.max_batch_size}]."
             )
-        if req.pixel_values.shape[1] != 3:
+        num_cameras = int(req.pixel_values.shape[1])
+        if num_cameras not in {2, 3}:
             raise ValueError(
-                f"pixel_values must have 3 cameras, got {req.pixel_values.shape[1]}."
+                f"pixel_values must have 2 or 3 cameras, got {num_cameras}."
             )
         if req.pixel_values.shape[-1] != cfg.vision.image_size:
             raise ValueError(
@@ -633,6 +658,11 @@ class PI05WS1Scheduler(Scheduler):
         if req.lang_lens.shape != (actual_B,):
             raise ValueError(
                 f"lang_lens shape {tuple(req.lang_lens.shape)} != (B,)=({actual_B},)."
+            )
+        if req.image_masks is not None and req.image_masks.shape != (actual_B, num_cameras):
+            raise ValueError(
+                f"image_masks shape {tuple(req.image_masks.shape)} != "
+                f"(B, num_cameras)=({actual_B}, {num_cameras})."
             )
         if req.noise is not None and req.noise.shape != (
             actual_B,

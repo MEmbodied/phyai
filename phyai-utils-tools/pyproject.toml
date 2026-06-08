@@ -3,7 +3,12 @@ name = "phyai-utils-tools"
 version = "0.1.0"
 description = "phyai — Shared utilities and tools."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy",
+    "safetensors",
+    "torch==2.11",
+    "transformers==5.8.1",
+]
 
 [build-system]
 requires = ["hatchling"]

@@ -58,6 +58,7 @@ Limitations
 from __future__ import annotations
 
 import functools
+import os
 from typing import Callable, Literal
 
 import torch
@@ -84,13 +85,29 @@ def _canonicalise_activation(name: str) -> str:
     return canon
 
 
-def _resolve_gated_act(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Lazy-import flashinfer's fused ``act_and_mul`` for ``name``.
-
-    The lazy import mirrors :class:`phyai.layers.layer_norm.RMSNorm` —
-    picking one branch shouldn't drag in flashinfer's other modules.
-    """
+def _torch_gated_act(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
     canon = _canonicalise_activation(name)
+
+    def _apply(x: torch.Tensor) -> torch.Tensor:
+        gate, up = x.chunk(2, dim=-1)
+        if canon == "silu":
+            return F.silu(gate) * up
+        if canon == "gelu":
+            return F.gelu(gate) * up
+        if canon == "gelu_tanh":
+            return F.gelu(gate, approximate="tanh") * up
+        raise ValueError(
+            f"Unsupported gated activation {name!r}; expected one of {_GATED_ACTS!r}."
+        )
+
+    return _apply
+
+
+def _resolve_gated_act(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Lazy-import flashinfer fused act-and-mul, with a torch fallback for smoke tests."""
+    canon = _canonicalise_activation(name)
+    if os.environ.get("PHYAI_FORCE_TORCH_GATED_ACT") == "1":
+        return _torch_gated_act(canon)
     if canon == "silu":
         from flashinfer.activation import silu_and_mul
 

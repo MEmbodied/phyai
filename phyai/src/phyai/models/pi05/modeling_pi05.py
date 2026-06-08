@@ -271,9 +271,22 @@ class SiglipVisionEmbeddings(nn.Module):
                 f"config: expected (B, {self.config.num_channels}, "
                 f"{self.config.image_size}, {self.config.image_size})."
             )
-        h_patch = self.patch_embedding(pixel_values)  # (B, hidden, H/p, W/p)
+        # OpenPI/SigLIP keeps patch extraction and positional embedding in fp32,
+        # then casts back to the model dtype before the encoder.  Gripper output
+        # is sensitive to this small prefix difference on LIBERO.
+        weight = self.patch_embedding.weight.float()
+        bias = None if self.patch_embedding.bias is None else self.patch_embedding.bias.float()
+        h_patch = F.conv2d(
+            pixel_values.float(),
+            weight,
+            bias,
+            self.patch_embedding.stride,
+            self.patch_embedding.padding,
+            self.patch_embedding.dilation,
+            self.patch_embedding.groups,
+        )
         embeds = h_patch.flatten(2).transpose(1, 2)  # (B, num_patches, hidden)
-        embeds = embeds + self.position_embedding()  # broadcast (N, D) over batch
+        embeds = embeds + self.position_embedding().float()
         return embeds
 
 
@@ -390,6 +403,7 @@ class SiglipVisionModel(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         h = self.embeddings(pixel_values)
+        h = h.to(self.post_layernorm.weight.dtype)
         h = self.encoder(h)
         h = self.post_layernorm(h)
         return h
@@ -468,9 +482,9 @@ class PI05VisionTower(nn.Module):
     :func:`phyai.weights.load_pretrained` matches keys directly without
     a ``remap=`` argument. ``forward`` returns the
     ``(B, num_patches, projection_dim)`` token bank that pi0.5's
-    ``embed_image`` step consumes — including the
-    ``* sqrt(projection_dim)`` post-projection scale so callers can drop
-    the result straight into the language model's embedding space.
+    ``embed_image`` step consumes. LeRobot/PaliGemma already returns the
+    projector output in the expected scale, so no extra sqrt(dim) scaling
+    is applied here.
     """
 
     DEFAULT_PREFIX: str = "paligemma_with_expert.paligemma.model"
@@ -504,12 +518,11 @@ class PI05VisionTower(nn.Module):
             if prefix
             else "multi_modal_projector",
         )
-        self.projection_scale = float(config.projection_dim) ** 0.5
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         h = self.vision_tower(pixel_values)  # (B, N, hidden)
         h = self.multi_modal_projector(h)  # (B, N, projection_dim)
-        return h * self.projection_scale
+        return h
 
 
 # ============================================================================ #
@@ -529,17 +542,9 @@ class PaliGemmaEmbedTokens(nn.Module):
     :func:`~phyai.weights.load_pretrained` matches the right tensor
     without needing a ``remap=`` argument.
 
-    Scale convention: pi0.5 lang tokens are scaled by ``hidden_size`` —
-    *not* the textbook ``sqrt(hidden_size)``. lerobot's port hits this
-    scale by composition: HF's ``GemmaTextScaledWordEmbedding`` applies
-    ``x sqrt(hidden_size)`` inside its forward, and pi0.5's
-    ``embed_prefix`` then multiplies by ``sqrt(hidden_size)`` again
-    (``lang_emb * math.sqrt(lang_emb_dim)``), total ``x hidden_size``.
-    The matching openpi reference does the same. Vision tokens, in
-    contrast, only get a single ``x sqrt(hidden_size)`` scale (applied
-    by :class:`PI05VisionTower.projection_scale`); lang and image
-    streams therefore live at *different* magnitudes by design — the
-    model was trained with that asymmetry.
+    Scale convention: LeRobot's PaliGemma language embedding applies
+    Gemma's standard ``sqrt(hidden_size)`` scale. No additional pi0.5
+    prefix-side scaling is applied in the current LeRobot reference.
 
     Forward signature: ``forward(input_ids: (B, S) int) -> (B, S, hidden_size)``.
     """
@@ -560,7 +565,7 @@ class PaliGemmaEmbedTokens(nn.Module):
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             params_dtype=params_dtype,
-            embed_scale=float(config.hidden_size),
+            embed_scale=float(config.hidden_size) ** 0.5,
             prefix=prefix,
         )
 

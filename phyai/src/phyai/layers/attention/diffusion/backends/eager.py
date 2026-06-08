@@ -1,9 +1,4 @@
-"""Pure-PyTorch reference paged-KV attention for the diffusion / action-expert stack.
-
-Structurally identical to
-:class:`phyai.layers.attention.ar.backends.eager.EagerARBackend`. Bug
-fixes here MUST be mirrored to that file.
-"""
+"""Pure-PyTorch reference paged-KV attention for the diffusion / action-expert stack."""
 
 from __future__ import annotations
 
@@ -32,8 +27,8 @@ class EagerDiffusionPlan(DiffusionAttnPlanHandle):
     """Per-step ragged plumbing for :class:`EagerDiffusionBackend`."""
 
     cu_seqlens_q: torch.Tensor  # (B+1,) int64
-    kv_starts: torch.Tensor  # (B,) int64
-    kv_lens: torch.Tensor  # (B,) int64
+    paged_kv_indptr: torch.Tensor  # (B+1,) int64
+    paged_kv_indices: torch.Tensor  # (N,) int64
 
 
 @register_backend("eager")
@@ -60,32 +55,12 @@ class EagerDiffusionBackend(DiffusionAttentionBackend):
                 "DiffusionAttnMetadata."
             )
         cu_q = meta.cu_seqlens_q.to(torch.int64)
-        indptr = meta.paged_kv_indptr.to(torch.int64).tolist()
+        indptr = meta.paged_kv_indptr.to(torch.int64)
         indices = meta.paged_kv_indices.to(torch.int64)
-        B = len(indptr) - 1
-        kv_starts = torch.zeros(B, dtype=torch.int64, device=indices.device)
-        kv_lens = torch.zeros(B, dtype=torch.int64, device=indices.device)
-        for b in range(B):
-            s, e = indptr[b], indptr[b + 1]
-            seg = indices[s:e]
-            n = seg.numel()
-            if n == 0:
-                continue
-            start = int(seg[0].item())
-            expected = torch.arange(
-                start, start + n, dtype=seg.dtype, device=seg.device
-            )
-            if not torch.equal(seg, expected):
-                raise ValueError(
-                    f"EagerDiffusionBackend requires contiguous KV slots per "
-                    f"sample; sample {b} has non-contiguous "
-                    f"paged_kv_indices={seg.tolist()}. Use 'flashinfer' "
-                    f"for non-contiguous (radix / eviction) cache layouts."
-                )
-            kv_starts[b] = start
-            kv_lens[b] = n
         return EagerDiffusionPlan(
-            cu_seqlens_q=cu_q, kv_starts=kv_starts, kv_lens=kv_lens
+            cu_seqlens_q=cu_q,
+            paged_kv_indptr=indptr,
+            paged_kv_indices=indices,
         )
 
     def forward(
@@ -107,19 +82,19 @@ class EagerDiffusionBackend(DiffusionAttentionBackend):
         plan = ctx.plan
         K_pool, V_pool = ctx.kv_pool.kv_buffer(layer.layer_id)
         cu_q = plan.cu_seqlens_q.tolist()
-        kv_starts = plan.kv_starts.tolist()
-        kv_lens = plan.kv_lens.tolist()
+        kv_indptr = plan.paged_kv_indptr.tolist()
         out = torch.empty_like(q)
         for b in range(len(cu_q) - 1):
             q_start, q_end = cu_q[b], cu_q[b + 1]
-            kv_start, kv_len = kv_starts[b], kv_lens[b]
+            kv_start, kv_end = kv_indptr[b], kv_indptr[b + 1]
             if q_end == q_start:
                 continue
-            if kv_len == 0:
+            if kv_end == kv_start:
                 out[q_start:q_end] = 0
                 continue
-            k_seg = K_pool[kv_start : kv_start + kv_len].squeeze(1)
-            v_seg = V_pool[kv_start : kv_start + kv_len].squeeze(1)
+            kv_indices = plan.paged_kv_indices[kv_start:kv_end]
+            k_seg = K_pool.index_select(0, kv_indices).squeeze(1)
+            v_seg = V_pool.index_select(0, kv_indices).squeeze(1)
             qi = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
             ki = repeat_kv(
                 k_seg.transpose(0, 1).unsqueeze(0),

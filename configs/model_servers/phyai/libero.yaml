@@ -1,0 +1,19 @@
+# PhyAI pi0.5 model server — LIBERO smoke/integration config.
+# 运行时建议从 /mnt/data0/qyy/phyai 执行，并设置：
+# PYTHONPATH=/home/qyy/vla-evaluation-harness/src
+# PHYAI_FORCE_TORCH_GATED_ACT=1
+
+script: "/mnt/data0/qyy/phyai/phyai/src/phyai/servers/vla_eval_server.py"
+args:
+  checkpoint_path: "/mnt/data2/shared_models/pi05_libero_phyai_converted"
+  device: "cuda"
+  params_dtype: "bfloat16"
+  use_cuda_graph: false
+  attn_backend: "eager"
+  norm_backend: "phyai-kernel"
+  linear_backend: "torch"
+  chunk_size: 50
+  max_batch_size: 1
+  max_wait_time: 0.01
+  host: "0.0.0.0"
+  port: 8000
