@@ -181,3 +181,24 @@ def test_bridge_reexported_from_ar_package():
 
     assert ar.RadixAttentionPlanner is RadixAttentionPlanner
     assert ar.RadixSequence is RadixSequence
+
+
+def test_ar_import_does_not_pull_radix_extension():
+    """phyai-ext is an optional extra; importing the base AR package must not
+    import phyai_ext, so non-[ext] installs can still use the attention
+    layers/backends. The radix bridge is re-exported lazily."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "import phyai.layers.attention.ar\n"
+        "assert 'phyai_ext' not in sys.modules, 'phyai_ext imported eagerly'\n"
+        "assert 'phyai.layers.attention.ar.radix' not in sys.modules, 'radix eager'\n"
+        "from phyai.layers.attention.ar import RadixAttentionPlanner\n"
+        "assert 'phyai_ext' in sys.modules, 'lazy access should load phyai_ext'\n"
+        "print('LAZY_OK')\n"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert "LAZY_OK" in res.stdout

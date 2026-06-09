@@ -35,10 +35,6 @@ from phyai.layers.attention.ar.registry import (
     list_backends,
     register_backend,
 )
-from phyai.layers.attention.ar.radix import (
-    RadixAttentionPlanner,
-    RadixSequence,
-)
 
 
 __all__ = [
@@ -59,3 +55,17 @@ __all__ = [
     "list_backends",
     "register_backend",
 ]
+
+
+def __getattr__(name: str):
+    # Lazy re-export: the radix bridge pulls in the optional ``phyai-ext``
+    # extra, so importing the base AR package (layers/backends) must not import
+    # it eagerly. Resolved on first attribute access.
+    # See tests/.../test_radix_planner.py::test_ar_import_does_not_pull_radix_extension.
+    if name in ("RadixAttentionPlanner", "RadixSequence"):
+        from phyai.layers.attention.ar import radix
+
+        value = getattr(radix, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
