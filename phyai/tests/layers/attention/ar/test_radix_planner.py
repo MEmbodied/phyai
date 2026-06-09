@@ -178,6 +178,21 @@ def test_commit_skips_reused_sequence_no_growth_no_alloc():
     assert c.suffix_units is None
 
 
+def test_commit_seeds_fresh_overlapping_sequence_regardless_of_order():
+    """Two fresh sequences where one is a prefix of the other: committing the
+    shorter first must NOT cause the longer (planned fresh) one to be skipped.
+    The seed decision uses plan-time prefix_len, not a commit-time re-match."""
+    cache, pool, planner = _build()
+    ab = RadixSequence(_atoms([1, 2]))
+    abc = RadixSequence(_atoms([1, 2, 3]))
+    planner.plan([ab, abc])  # cache empty at plan -> both prefix_len == 0
+    assert ab.prefix_len == 0 and abc.prefix_len == 0
+    planner.commit([ab, abc])  # commit ab first, then abc
+    assert ab.committed and abc.committed
+    assert int(cache.match(_atoms([1, 2, 3])).matched_atoms[int(Tier.DEVICE)]) == 3
+    planner.release([ab, abc])
+
+
 def test_release_frees_lock_and_uncommitted_units():
     cache, pool, planner = _build()
     a = RadixSequence(_atoms([10, 11, 12]))

@@ -188,9 +188,11 @@ class RadixAttentionPlanner:
         """Seed fully-new sequences into the radix tree for future reuse.
 
         Call after the forward has scattered the suffix K/V into the pool. Only
-        sequences with **no cached prefix** (``overlap == 0``) are inserted: the
-        whole sequence is new, so the suffix units ``plan`` allocated are exactly
-        the units the C++ ``insert`` needs.
+        sequences that were **fresh at plan time** (``prefix_len == 0``) are
+        inserted: the whole sequence is new, so the suffix units ``plan``
+        allocated are exactly the units the C++ ``insert`` needs. The decision
+        uses the plan-time ``prefix_len`` (not a commit-time re-match) so a batch
+        of fresh overlapping sequences seeds the same way regardless of order.
 
         A sequence that **reused** a cached prefix is left uncommitted (a no-op).
         Growing an existing prefix would mean handing ``insert`` a full-length
@@ -204,14 +206,11 @@ class RadixAttentionPlanner:
         for seq in sequences:
             if seq.committed or seq.suffix_units is None:
                 continue
-            num_units = self._num_units(seq.atoms)
-            overlap = min(
-                int(self.cache.match(seq.atoms).matched_atoms[self._tier_i])
-                // self.atoms_per_unit,
-                num_units,
-            )
-            if overlap > 0:
-                continue  # reused/already-cached prefix — see docstring
+            if seq.prefix_len > 0:
+                continue  # reused a cached prefix at plan time — read-only
+            # Fresh at plan time: its suffix units cover the whole sequence.
+            # insert frees any prefix overlap a sibling seeded earlier in this
+            # same batch and attaches the rest, so the decision is order-free.
             self.cache.insert(self.tier, seq.atoms, seq.suffix_units)
             seq.suffix_units = None
             seq.committed = True
