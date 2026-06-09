@@ -188,6 +188,24 @@ def test_plan_raises_capacity_error_when_locked_and_full():
         planner.plan([c])
 
 
+def test_plan_rolls_back_locks_and_units_on_failure():
+    """A mid-batch plan() failure must release every lock and free every unit
+    acquired so far, leaving touched sequences re-plannable (atomic plan)."""
+    cache, pool, planner = _build(num_slots=8, total_units=6)  # ids 1..5 usable
+    a = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([a])
+    planner.commit([a])  # seed [1,2,3], avail 2
+    avail0 = cache.available(Tier.DEVICE)
+    seq_c = RadixSequence(_atoms([10, 11, 12, 77]))  # reuse: locks [1,2,3], allocs 1
+    seq_d = RadixSequence(_atoms([20, 21, 22, 23]))  # fresh: needs 4 > free -> fails
+    with pytest.raises(CacheCapacityError):
+        planner.plan([seq_c, seq_d])
+    assert seq_c.node_ref is None  # lock rolled back
+    assert seq_c.suffix_units is None  # units freed
+    assert not seq_c.released  # still re-plannable
+    assert cache.available(Tier.DEVICE) == avail0  # capacity restored
+
+
 def test_bridge_reexported_from_ar_package():
     import phyai.layers.attention.ar as ar
 

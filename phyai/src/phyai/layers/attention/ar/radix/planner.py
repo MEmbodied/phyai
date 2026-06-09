@@ -88,11 +88,27 @@ class RadixAttentionPlanner:
 
         Mutates each :class:`RadixSequence` with its prefix/suffix slot
         split and the radix handles (lock + suffix units) that ``commit`` /
-        ``release`` consume. Query rows are the per-sequence suffixes.
+        ``release`` consume. Query rows are the per-sequence suffixes. Atomic:
+        if any sequence fails (capacity, validation, …), every lock and
+        allocation acquired so far in this call is rolled back before the
+        exception propagates, leaving the sequences re-plannable.
         """
         if not sequences:
             raise ValueError("plan() requires at least one RadixSequence.")
+        touched: list[RadixSequence] = []
+        try:
+            return self._plan(sequences, mode, touched)
+        except BaseException:
+            for seq in touched:
+                self._rollback(seq)
+            raise
 
+    def _plan(
+        self,
+        sequences: list[RadixSequence],
+        mode: AttnMode,
+        touched: list[RadixSequence],
+    ) -> ARAttnMetadata:
         suffix_lens: list[int] = []
         total_lens: list[int] = []
         indices_parts: list[torch.Tensor] = []
@@ -102,20 +118,22 @@ class RadixAttentionPlanner:
         for seq in sequences:
             if seq.released:
                 raise ValueError("cannot plan a released RadixSequence.")
+            touched.append(seq)
             num_units = self._num_units(seq.atoms)
-            prefix_units, prefix_slots, node_ref = self._match_prefix(
-                seq.atoms, num_units
-            )
-            seq.node_ref = node_ref
+            prefix_units, prefix_slots = self._match_prefix(seq, num_units)
 
             suffix_units = num_units - prefix_units
             if suffix_units > 0:
                 self.cache.ensure_capacity(self.tier, suffix_units)
-                owned = self.cache.allocate(self.tier, suffix_units)
+                # Assign straight onto the sequence — keeping the OwnedUnits in a
+                # local would let an exception traceback pin it and defeat
+                # rollback's RAII free.
+                seq.suffix_units = self.cache.allocate(self.tier, suffix_units)
                 suffix_slots = torch.as_tensor(
-                    list(owned.ids()), dtype=torch.int64, device=self.device
+                    list(seq.suffix_units.ids()),
+                    dtype=torch.int64,
+                    device=self.device,
                 )
-                seq.suffix_units = owned
             else:
                 suffix_slots = torch.empty(0, dtype=torch.int64, device=self.device)
                 seq.suffix_units = None
@@ -204,6 +222,17 @@ class RadixAttentionPlanner:
                 seq.suffix_units = None  # RAII free
             seq.released = True
 
+    def _rollback(self, seq: RadixSequence) -> None:
+        """Undo a failed plan()'s acquisitions for one sequence — drop the lock
+        and free any allocated suffix units — leaving it re-plannable (not
+        marked released)."""
+        seq.node_ref = None  # RAII unlock
+        seq.suffix_units = None  # RAII free
+        seq.prefix_len = 0
+        seq.prefix_slots = None
+        seq.suffix_slots = None
+        seq.committed = False
+
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
@@ -217,17 +246,21 @@ class RadixAttentionPlanner:
             )
         return n // self.page_bytes
 
-    def _match_prefix(self, atoms: bytes, num_units: int):
+    def _match_prefix(self, seq: RadixSequence, num_units: int):
+        """Match seq's cached prefix; lock it onto ``seq.node_ref`` (no local,
+        so rollback can free it). Returns ``(prefix_units, prefix_slots)``."""
         empty = torch.empty(0, dtype=torch.int64, device=self.device)
+        seq.node_ref = None
         if num_units == 0:
-            return 0, empty, None
-        mr = self.cache.match(atoms)
-        prefix_units = int(mr.matched_atoms[self._tier_i]) // self.atoms_per_unit
-        prefix_units = min(prefix_units, num_units)
+            return 0, empty
+        mr = self.cache.match(seq.atoms)
+        prefix_units = min(
+            int(mr.matched_atoms[self._tier_i]) // self.atoms_per_unit, num_units
+        )
         if prefix_units == 0:
-            return 0, empty, None
+            return 0, empty
         node = int(mr.last_node[self._tier_i])
-        node_ref = self.cache.lock(self.tier, node)
+        seq.node_ref = self.cache.lock(self.tier, node)
         slots = torch.from_dlpack(self.cache.collect_units(node, self.tier)).to(
             device=self.device, dtype=torch.int64
         )
@@ -236,7 +269,7 @@ class RadixAttentionPlanner:
                 f"collect_units returned {int(slots.numel())} slots but match "
                 f"reported {prefix_units} prefix units."
             )
-        return prefix_units, slots, node_ref
+        return prefix_units, slots
 
     def _assemble(
         self, B, suffix_lens, total_lens, indices_parts, write_parts, pos_parts, mode
