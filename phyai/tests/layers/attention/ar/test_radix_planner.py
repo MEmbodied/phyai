@@ -193,6 +193,23 @@ def test_commit_seeds_fresh_overlapping_sequence_regardless_of_order():
     planner.release([ab, abc])
 
 
+def test_commit_does_not_pin_seeded_node():
+    """commit() must NOT pin the seeded node — pinning leaks units when a later
+    shorter-prefix match splits it. A committed sequence is an evictable cache
+    entry: a competing request under capacity pressure reuses its slots."""
+    cache, pool, planner = _build(num_slots=8, total_units=4)  # ids 1..3 usable
+    a = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([a])
+    planner.commit([a])
+    assert a.committed and a.node_ref is None  # not pinned
+    # Cache is full (3/3) but a is unpinned -> a competitor evicts it and fits.
+    b = RadixSequence(_atoms([20, 21, 22]))
+    meta_b = planner.plan([b])
+    assert meta_b.write_indices.numel() == 3
+    planner.release([a])
+    planner.release([b])
+
+
 def test_release_frees_lock_and_uncommitted_units():
     cache, pool, planner = _build()
     a = RadixSequence(_atoms([10, 11, 12]))
@@ -264,3 +281,31 @@ def test_ar_import_does_not_pull_radix_extension():
     res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
     assert "LAZY_OK" in res.stdout
+
+
+def test_no_leak_when_batch_reuses_nested_prefixes():
+    """A batch reusing a committed prefix to different depths must not leak
+    units. Locking a node that a sibling's shorter match later splits would
+    orphan the split-off child's duplicated ref_count; plan() pre-splits the
+    tree before taking any lock to avoid that."""
+    cache, pool, planner = _build(num_slots=16, total_units=16)
+    avail_empty = cache.available(Tier.DEVICE)
+    seed = RadixSequence(_atoms([1, 2, 3, 4, 5]))
+    planner.plan([seed])
+    planner.commit([seed])
+    planner.release([seed])
+    # Batch: x reuses the full [1..5]; y reuses only [1,2,3] (a shorter prefix).
+    x = RadixSequence(_atoms([1, 2, 3, 4, 5, 6]))
+    y = RadixSequence(_atoms([1, 2, 3, 9]))
+    planner.plan([x, y])
+    assert x.prefix_len == 5 and y.prefix_len == 3
+    planner.release([x, y])
+    # Drain fully: a true leak (ref_count > 0) can never be reclaimed.
+    prev = -1
+    while cache.available(Tier.DEVICE) != prev:
+        prev = cache.available(Tier.DEVICE)
+        try:
+            cache.ensure_capacity(Tier.DEVICE, cache.total(Tier.DEVICE))
+        except CacheCapacityError:
+            break
+    assert cache.available(Tier.DEVICE) == avail_empty

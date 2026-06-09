@@ -115,6 +115,16 @@ class RadixAttentionPlanner:
         mode: AttnMode,
         touched: list[RadixSequence],
     ) -> ARAttnMetadata:
+        # Pre-pass: perform every match up front so the radix tree is fully split
+        # at all needed prefix boundaries BEFORE we take any NodeRef. A later
+        # match that split an already-locked node would orphan the duplicated
+        # ref_count the C++ split copies onto the split-off suffix child
+        # (node_ref only unlocks the node->root path) and leak its units.
+        for seq in sequences:
+            n = len(seq.atoms)
+            if n and not seq.released and n % self.page_bytes == 0:
+                self.cache.match(seq.atoms)
+
         suffix_lens: list[int] = []
         total_lens: list[int] = []
         indices_parts: list[torch.Tensor] = []
@@ -193,6 +203,15 @@ class RadixAttentionPlanner:
         allocated are exactly the units the C++ ``insert`` needs. The decision
         uses the plan-time ``prefix_len`` (not a commit-time re-match) so a batch
         of fresh overlapping sequences seeds the same way regardless of order.
+
+        commit does **not** pin the seeded node. Pinning leaks units: a later
+        shorter-prefix match splits the pinned node, and ``node_ref`` only
+        unlocks the node→root path, orphaning the duplicated ref-count the C++
+        split copies onto the split-off suffix child. A committed sequence is an
+        ordinary evictable cache entry; a request's own slots are protected
+        during its active life by the prefix-reuse lock plus its held suffix
+        ``OwnedUnits``, both dropped at ``release`` (do not keep a request active
+        across other ``plan`` calls after commit).
 
         A sequence that **reused** a cached prefix is left uncommitted (a no-op).
         Growing an existing prefix would mean handing ``insert`` a full-length
