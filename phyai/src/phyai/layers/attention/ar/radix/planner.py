@@ -50,6 +50,13 @@ class RadixAttentionPlanner:
         *,
         tier: Tier = Tier.DEVICE,
     ) -> None:
+        if tier != Tier.DEVICE:
+            raise ValueError(
+                f"RadixAttentionPlanner is device-slot-only; tier must be "
+                f"Tier.DEVICE, got {tier!r}. Its unit ids are used directly as "
+                f"KVCachePool slot indices, so a non-device tier would index "
+                f"the device pool with foreign ids."
+            )
         if cache.atoms_per_unit != kv_pool.page_size:
             raise ValueError(
                 f"cache.atoms_per_unit ({cache.atoms_per_unit}) must equal "

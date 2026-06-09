@@ -52,9 +52,21 @@ def test_construction_rejects_unit_size_mismatch():
         RadixAttentionPlanner(cache, pool)
 
 
-def test_construction_rejects_disabled_tier():
-    cache, pool, _ = _build()
-    with pytest.raises(ValueError, match="not enabled"):
+def test_construction_rejects_non_device_tier():
+    # Even with the host tier enabled, the device-slot-only planner must reject
+    # it: host unit ids are not device-pool slots.
+    cache = PrefixCache(
+        atom_bytes=4, atoms_per_unit=1, device_total_units=64, host_total_units=64
+    )
+    pool = KVCachePool(
+        num_layers=1,
+        num_slots=64,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="Tier.DEVICE"):
         RadixAttentionPlanner(cache, pool, tier=Tier.HOST)
 
 
