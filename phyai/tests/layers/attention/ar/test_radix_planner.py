@@ -162,3 +162,10 @@ def test_plan_raises_capacity_error_when_locked_and_full():
     c = RadixSequence(_atoms([10, 11, 12, 20]))  # reuse + 1 new, but no free slot
     with pytest.raises(CacheCapacityError):
         planner.plan([c])
+
+
+def test_bridge_reexported_from_ar_package():
+    import phyai.layers.attention.ar as ar
+
+    assert ar.RadixAttentionPlanner is RadixAttentionPlanner
+    assert ar.RadixSequence is RadixSequence

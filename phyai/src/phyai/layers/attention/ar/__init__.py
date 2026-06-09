@@ -35,6 +35,10 @@ from phyai.layers.attention.ar.registry import (
     list_backends,
     register_backend,
 )
+from phyai.layers.attention.ar.radix import (
+    RadixAttentionPlanner,
+    RadixSequence,
+)
 
 
 __all__ = [
@@ -49,6 +53,8 @@ __all__ = [
     "EagerARPlan",
     "FlashInferARBackend",
     "FlashInferARPlan",
+    "RadixAttentionPlanner",
+    "RadixSequence",
     "get_backend_factory",
     "list_backends",
     "register_backend",
