@@ -150,6 +150,63 @@ class RadixAttentionPlanner:
         )
 
     # ------------------------------------------------------------------ #
+    # Commit / release                                                   #
+    # ------------------------------------------------------------------ #
+
+    def commit(self, sequences: list[RadixSequence]) -> None:
+        """Insert each sequence's freshly written suffix into the radix tree.
+
+        Call after the forward has scattered the suffix K/V into the pool.
+        ``insert`` requires full-length units, so a reuse (prefix>0) commit
+        allocates ``overlap`` transient dummy units, appends the written
+        suffix units, and inserts; ``insert`` frees the dummy overlap and
+        attaches the written suffix slots. The suffix ``OwnedUnits`` is
+        consumed.
+        """
+        for seq in sequences:
+            if seq.committed or seq.suffix_units is None:
+                continue
+            num_units = self._num_units(seq.atoms)
+            mr = self.cache.match(seq.atoms)
+            overlap = int(mr.matched_atoms[self._tier_i]) // self.atoms_per_unit
+            overlap = min(overlap, num_units)
+            if overlap >= num_units:
+                # Fully cached already (e.g. a duplicate committed earlier in
+                # the batch). Drop our written suffix units back.
+                seq.suffix_units = None
+                seq.committed = True
+                continue
+            have = len(seq.suffix_units)
+            need = num_units - overlap
+            if have != need:
+                raise ValueError(
+                    f"commit: sequence has {have} suffix units but the tree now "
+                    f"needs {need}; committing sequences that share an "
+                    f"uncommitted suffix in one batch is unsupported."
+                )
+            if overlap > 0:
+                self.cache.ensure_capacity(self.tier, overlap)
+                units = self.cache.allocate(self.tier, overlap)
+                units.append(seq.suffix_units)
+            else:
+                units = seq.suffix_units
+            self.cache.insert(self.tier, seq.atoms, units)
+            seq.suffix_units = None
+            seq.committed = True
+
+    def release(self, sequences: list[RadixSequence]) -> None:
+        """Drop prefix locks and free any uncommitted suffix units.
+
+        Idempotent. After release the matched prefix becomes evictable and
+        any planned-but-uncommitted suffix returns to the allocator.
+        """
+        for seq in sequences:
+            seq.node_ref = None  # RAII unlock
+            if not seq.committed:
+                seq.suffix_units = None  # RAII free
+            seq.released = True
+
+    # ------------------------------------------------------------------ #
     # Helpers                                                            #
     # ------------------------------------------------------------------ #
 

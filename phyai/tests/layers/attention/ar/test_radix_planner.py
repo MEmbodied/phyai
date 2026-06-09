@@ -117,3 +117,48 @@ def test_plan_fully_cached_sequence_has_no_query_rows():
     assert meta.cu_seqlens_q.tolist() == [0, 0]
     assert meta.paged_kv_indices.tolist() == [1, 2, 3]
     assert meta.write_indices.numel() == 0
+
+
+def test_commit_reuse_grows_tree_at_written_slots():
+    cache, pool, planner = _build()
+    a = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([a])
+    planner.commit([a])
+    c = RadixSequence(_atoms([10, 11, 12, 77, 88]))
+    planner.plan([c])  # prefix [1,2,3], suffix [4,5]
+    planner.commit([c])  # dummy-append insert
+    assert c.committed and c.suffix_units is None
+    # full sequence now cached; suffix slots are the ones we wrote
+    mr = cache.match(_atoms([10, 11, 12, 77, 88]))
+    assert int(mr.matched_atoms[int(Tier.DEVICE)]) == 5
+    full = torch.from_dlpack(
+        cache.collect_units(int(mr.last_node[int(Tier.DEVICE)]), Tier.DEVICE)
+    ).tolist()
+    assert full == [1, 2, 3, 4, 5]
+
+
+def test_release_frees_lock_and_uncommitted_units():
+    cache, pool, planner = _build()
+    a = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([a])
+    planner.commit([a])
+    avail_before = cache.available(Tier.DEVICE)
+    c = RadixSequence(_atoms([10, 11, 12, 77, 88]))
+    planner.plan([c])  # locks prefix, allocates 2 suffix
+    assert c.node_ref is not None
+    assert cache.available(Tier.DEVICE) == avail_before - 2
+    planner.release([c])  # not committed -> free suffix + drop lock
+    assert c.node_ref is None
+    assert c.suffix_units is None
+    assert c.released
+    assert cache.available(Tier.DEVICE) == avail_before
+
+
+def test_plan_raises_capacity_error_when_locked_and_full():
+    cache, pool, planner = _build(num_slots=8, total_units=4)  # ids 1..3 usable
+    a = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([a])
+    planner.commit([a])  # avail 0, tree=[10,11,12]->[1,2,3]
+    c = RadixSequence(_atoms([10, 11, 12, 20]))  # reuse + 1 new, but no free slot
+    with pytest.raises(CacheCapacityError):
+        planner.plan([c])
