@@ -23,11 +23,14 @@ from phyai.layers.attention.common import eager_attn, repeat_kv
 
 
 def _has_flashinfer() -> bool:
+    # flashinfer initialises CUDA eagerly on import; on a broken / misconfigured
+    # CUDA setup that raises a RuntimeError (not just ImportError). Treat ANY
+    # failure as "unavailable" so this test skips instead of crashing collection.
     try:
         import flashinfer.prefill  # noqa: F401
 
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
