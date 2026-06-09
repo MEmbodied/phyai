@@ -161,43 +161,34 @@ class RadixAttentionPlanner:
     # ------------------------------------------------------------------ #
 
     def commit(self, sequences: list[RadixSequence]) -> None:
-        """Insert each sequence's freshly written suffix into the radix tree.
+        """Seed fully-new sequences into the radix tree for future reuse.
 
-        Call after the forward has scattered the suffix K/V into the pool.
-        ``insert`` requires full-length units, so a reuse (prefix>0) commit
-        allocates ``overlap`` transient dummy units, appends the written
-        suffix units, and inserts; ``insert`` frees the dummy overlap and
-        attaches the written suffix slots. The suffix ``OwnedUnits`` is
-        consumed.
+        Call after the forward has scattered the suffix K/V into the pool. Only
+        sequences with **no cached prefix** (``overlap == 0``) are inserted: the
+        whole sequence is new, so the suffix units ``plan`` allocated are exactly
+        the units the C++ ``insert`` needs.
+
+        A sequence that **reused** a cached prefix is left uncommitted (a no-op).
+        Growing an existing prefix would mean handing ``insert`` a full-length
+        unit list (it frees the matched overlap), i.e. transiently reserving
+        ``overlap`` extra slots while the prefix is still locked — which can
+        evict useful entries or fail under capacity pressure for no net gain. The
+        reuse already delivered the compute savings; ``release`` frees the
+        uncommitted suffix. Extending a cached prefix awaits a C++
+        ``insert_suffix_from_node``.
         """
         for seq in sequences:
             if seq.committed or seq.suffix_units is None:
                 continue
             num_units = self._num_units(seq.atoms)
-            mr = self.cache.match(seq.atoms)
-            overlap = int(mr.matched_atoms[self._tier_i]) // self.atoms_per_unit
-            overlap = min(overlap, num_units)
-            if overlap >= num_units:
-                # Fully cached already (e.g. a duplicate committed earlier in
-                # the batch). Drop our written suffix units back.
-                seq.suffix_units = None
-                seq.committed = True
-                continue
-            have = len(seq.suffix_units)
-            need = num_units - overlap
-            if have != need:
-                raise ValueError(
-                    f"commit: sequence has {have} suffix units but the tree now "
-                    f"needs {need}; committing sequences that share an "
-                    f"uncommitted suffix in one batch is unsupported."
-                )
+            overlap = min(
+                int(self.cache.match(seq.atoms).matched_atoms[self._tier_i])
+                // self.atoms_per_unit,
+                num_units,
+            )
             if overlap > 0:
-                self.cache.ensure_capacity(self.tier, overlap)
-                units = self.cache.allocate(self.tier, overlap)
-                units.append(seq.suffix_units)
-            else:
-                units = seq.suffix_units
-            self.cache.insert(self.tier, seq.atoms, units)
+                continue  # reused/already-cached prefix — see docstring
+            self.cache.insert(self.tier, seq.atoms, seq.suffix_units)
             seq.suffix_units = None
             seq.committed = True
 

@@ -131,22 +131,34 @@ def test_plan_fully_cached_sequence_has_no_query_rows():
     assert meta.write_indices.numel() == 0
 
 
-def test_commit_reuse_grows_tree_at_written_slots():
+def test_commit_seeds_fresh_sequence():
+    cache, pool, planner = _build()
+    a = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([a])
+    planner.commit([a])
+    assert a.committed and a.suffix_units is None
+    mr = cache.match(_atoms([10, 11, 12]))
+    assert int(mr.matched_atoms[int(Tier.DEVICE)]) == 3
+
+
+def test_commit_skips_reused_sequence_no_growth_no_alloc():
+    """commit() seeds only fully-new sequences. A reused (prefix>0) sequence is
+    a no-op — no transient overlap allocation (which could evict/fail) and no
+    tree growth; release() frees its written suffix."""
     cache, pool, planner = _build()
     a = RadixSequence(_atoms([10, 11, 12]))
     planner.plan([a])
     planner.commit([a])
     c = RadixSequence(_atoms([10, 11, 12, 77, 88]))
     planner.plan([c])  # prefix [1,2,3], suffix [4,5]
-    planner.commit([c])  # dummy-append insert
-    assert c.committed and c.suffix_units is None
-    # full sequence now cached; suffix slots are the ones we wrote
+    avail_after_plan = cache.available(Tier.DEVICE)
+    planner.commit([c])  # reuse -> no-op
+    assert not c.committed
+    assert cache.available(Tier.DEVICE) == avail_after_plan  # no transient alloc
     mr = cache.match(_atoms([10, 11, 12, 77, 88]))
-    assert int(mr.matched_atoms[int(Tier.DEVICE)]) == 5
-    full = torch.from_dlpack(
-        cache.collect_units(int(mr.last_node[int(Tier.DEVICE)]), Tier.DEVICE)
-    ).tolist()
-    assert full == [1, 2, 3, 4, 5]
+    assert int(mr.matched_atoms[int(Tier.DEVICE)]) == 3  # tree not grown
+    planner.release([c])
+    assert c.suffix_units is None
 
 
 def test_release_frees_lock_and_uncommitted_units():
