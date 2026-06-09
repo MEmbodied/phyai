@@ -56,3 +56,64 @@ def test_construction_rejects_disabled_tier():
     cache, pool, _ = _build()
     with pytest.raises(ValueError, match="not enabled"):
         RadixAttentionPlanner(cache, pool, tier=Tier.HOST)
+
+
+def test_plan_fresh_sequence_allocates_full_suffix():
+    cache, pool, planner = _build()
+    seq = RadixSequence(_atoms([10, 11, 12]))
+    meta = planner.plan([seq])
+    assert seq.prefix_len == 0
+    assert seq.suffix_slots.tolist() == [1, 2, 3]
+    assert seq.node_ref is None
+    assert meta.batch_size == 1
+    assert meta.num_query_tokens == 3
+    assert meta.cu_seqlens_q.tolist() == [0, 3]
+    assert meta.paged_kv_indptr.tolist() == [0, 3]
+    assert meta.paged_kv_indices.tolist() == [1, 2, 3]
+    assert meta.paged_kv_indices.dtype == torch.int32
+    assert meta.write_indices.tolist() == [1, 2, 3]
+    assert meta.write_indices.dtype == torch.int64
+    assert meta.paged_kv_last_page_len.tolist() == [1]
+    assert meta.position_ids.tolist() == [0, 1, 2]
+
+
+def test_plan_rejects_unaligned_atoms():
+    cache, pool, planner = _build()
+    with pytest.raises(ValueError, match="page_bytes"):
+        planner.plan([RadixSequence(b"abcde")])  # 5 bytes, page_bytes=4
+
+
+def test_plan_reuse_shares_prefix_slots_non_contiguous():
+    cache, pool, planner = _build()
+    a = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([a])
+    planner.commit([a])  # tree: [10,11,12] -> [1,2,3]
+    d = RadixSequence(_atoms([55, 66]))  # decoy consumes [4,5]
+    planner.plan([d])
+    planner.commit([d])
+    c = RadixSequence(_atoms([10, 11, 12, 77, 88]))
+    meta = planner.plan([c])
+    assert c.prefix_len == 3
+    assert c.prefix_slots.tolist() == [1, 2, 3]
+    assert c.suffix_slots.tolist() == [6, 7]
+    assert meta.paged_kv_indices.tolist() == [1, 2, 3, 6, 7]  # gap 3->6
+    assert meta.cu_seqlens_q.tolist() == [0, 2]
+    assert meta.paged_kv_indptr.tolist() == [0, 5]
+    assert meta.write_indices.tolist() == [6, 7]
+    assert meta.position_ids.tolist() == [3, 4]
+    assert c.node_ref is not None
+
+
+def test_plan_fully_cached_sequence_has_no_query_rows():
+    cache, pool, planner = _build()
+    a = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([a])
+    planner.commit([a])
+    b = RadixSequence(_atoms([10, 11, 12]))  # identical -> fully cached
+    meta = planner.plan([b])
+    assert b.prefix_len == 3
+    assert b.suffix_len == 0
+    assert meta.num_query_tokens == 0
+    assert meta.cu_seqlens_q.tolist() == [0, 0]
+    assert meta.paged_kv_indices.tolist() == [1, 2, 3]
+    assert meta.write_indices.numel() == 0
