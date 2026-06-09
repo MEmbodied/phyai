@@ -70,6 +70,23 @@ def test_construction_rejects_non_device_tier():
         RadixAttentionPlanner(cache, pool, tier=Tier.HOST)
 
 
+def test_construction_rejects_multi_token_page():
+    # Multi-token pages aren't supported end-to-end (write_kv / flashinfer are
+    # page_size=1 only; the metadata counts radix units).
+    cache = PrefixCache(atom_bytes=4, atoms_per_unit=2, device_total_units=64)
+    pool = KVCachePool(
+        num_layers=1,
+        num_slots=64,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        page_size=2,
+    )
+    with pytest.raises(ValueError, match="page_size == 1"):
+        RadixAttentionPlanner(cache, pool)
+
+
 def test_plan_fresh_sequence_allocates_full_suffix():
     cache, pool, planner = _build()
     seq = RadixSequence(_atoms([10, 11, 12]))

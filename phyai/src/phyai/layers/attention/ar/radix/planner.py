@@ -63,6 +63,12 @@ class RadixAttentionPlanner:
                 f"kv_pool.page_size ({kv_pool.page_size}) so one radix unit "
                 f"maps to one KV pool slot."
             )
+        if kv_pool.page_size != 1:
+            raise ValueError(
+                f"RadixAttentionPlanner currently supports page_size == 1 only "
+                f"(one token per slot); got kv_pool.page_size={kv_pool.page_size}. "
+                f"Multi-token pages are not wired through write_kv / flashinfer yet."
+            )
         if not cache.tier_enabled(tier):
             raise ValueError(f"cache tier {tier!r} is not enabled.")
         self.cache = cache
