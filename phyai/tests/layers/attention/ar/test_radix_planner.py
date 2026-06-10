@@ -87,6 +87,22 @@ def test_construction_rejects_multi_token_page():
         RadixAttentionPlanner(cache, pool)
 
 
+def test_construction_rejects_cache_larger_than_pool():
+    # A cache whose device tier can hand out more unit ids than the pool has
+    # slots would produce out-of-bounds prefix/suffix slot indices.
+    cache = PrefixCache(atom_bytes=4, atoms_per_unit=1, device_total_units=128)
+    pool = KVCachePool(
+        num_layers=1,
+        num_slots=64,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="num_slots"):
+        RadixAttentionPlanner(cache, pool)
+
+
 def test_plan_fresh_sequence_allocates_full_suffix():
     cache, pool, planner = _build()
     seq = RadixSequence(_atoms([10, 11, 12]))

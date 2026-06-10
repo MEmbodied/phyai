@@ -71,6 +71,12 @@ class RadixAttentionPlanner:
             )
         if not cache.tier_enabled(tier):
             raise ValueError(f"cache tier {tier!r} is not enabled.")
+        if cache.total(tier) > kv_pool.num_slots:
+            raise ValueError(
+                f"cache device tier ({cache.total(tier)} units) exceeds "
+                f"kv_pool.num_slots ({kv_pool.num_slots}); cached unit ids could "
+                f"index past the pool. Size the tier <= kv_pool.num_slots."
+            )
         self.cache = cache
         self.kv_pool = kv_pool
         self.tier = tier
