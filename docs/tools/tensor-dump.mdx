@@ -1,0 +1,192 @@
+---
+title: "Tensor Dump"
+description: "Capture every operator's activations during inference for debugging and numerical comparison"
+icon: "bug"
+---
+
+# Overview
+
+Tensor dump records the **output activation** of every leaf operator your
+model runs during inference, writing one file per `Engine.step()`. It is the
+tool to reach for when you need to answer "what does layer *X* actually
+produce at runtime?" — debugging a numerical regression, comparing two
+backends (e.g. flashinfer vs eager, or bf16 vs an FP8 build), or checking a
+new model port against a reference implementation.
+
+It is built on PyTorch forward hooks: every selected `nn.Module` with no
+children gets a hook that captures its return value, moves it to CPU, and
+accumulates it under the module's dotted name
+(`model.expert_stack.layers.0.o_proj`). Weights are **not** dumped — those are
+static and already live in your checkpoint; what you capture here are the
+intermediate tensors that change with the input.
+
+<Warning>
+**Tensor dump runs eager-only.** A captured CUDA graph replays its kernels
+without re-entering Python, so forward hooks never fire during graph replay.
+When you set a dump directory, the engine **forces `use_cuda_graph=False`**
+(with a warning) so the hooks actually run. Expect eager-mode speed while
+dumping — this is a debugging path, not a production one.
+</Warning>
+
+# Enabling
+
+Tensor dump is off by default. Turn it on through the runtime config, or
+purely through environment variables — whichever fits your workflow.
+
+<Tabs>
+  <Tab title="Environment variables">
+    The lightest way to switch dumping on for a single run without touching
+    the caller. `PHYAI_*` vars overlay on top of whatever config the program
+    passes, so this works even for a script that builds its own
+    `EngineConfig`:
+
+    ```bash
+    PHYAI_DEBUG_TENSOR_DUMP_DIR=/tmp/dump \
+        uv run python examples/run_pi05.py --checkpoint /path/to/pi05_base --raw
+    ```
+
+    Restrict what is captured with a JSON array of regexes (matched against
+    each operator's full dotted name):
+
+    ```bash
+    PHYAI_DEBUG_TENSOR_DUMP_DIR=/tmp/dump \
+    PHYAI_DEBUG_TENSOR_DUMP_FILTER='["expert_stack\\.layers\\.0\\.", "\\.heads\\."]' \
+        uv run python examples/run_pi05.py --checkpoint /path/to/pi05_base --raw
+    ```
+
+    | Variable | Meaning |
+    | --- | --- |
+    | `PHYAI_DEBUG_TENSOR_DUMP_DIR` | Output directory. Setting it enables dumping. |
+    | `PHYAI_DEBUG_TENSOR_DUMP_FILTER` | JSON array of regexes (or a single bare pattern). Records an operator if **any** pattern matches. |
+    | `PHYAI_DEBUG_TENSOR_DUMP_FILTER_FN` | `"pkg.module:func"` or `"/path/file.py:func"` predicate. Mutually exclusive with `_FILTER`. |
+  </Tab>
+  <Tab title="EngineConfig">
+    Set the same knobs directly on `RuntimeConfig` when you construct the
+    engine in code:
+
+    ```python
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import EngineConfig, DeviceConfig, RuntimeConfig
+    from phyai.models.pi05.main_pi05 import PI05Args
+
+    engine = Engine(
+        EngineArgs(
+            plugin="pi05",
+            plugin_args=PI05Args(checkpoint_dir="/path/to/pi05_base"),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda"),
+                runtime=RuntimeConfig(
+                    # use_cuda_graph is forced off automatically when a dump
+                    # dir is set; you do not need to flip it yourself.
+                    debug_tensor_dump_dir="/tmp/dump",
+                    debug_tensor_dump_filter=(r"expert_stack\.layers\.0\.",),
+                ),
+            ),
+        )
+    )
+    ```
+
+    <Note>
+    An environment variable always overlays on top of an explicit `config`.
+    If `PHYAI_DEBUG_TENSOR_DUMP_DIR` is set in the environment, it overrides
+    the field above — handy for toggling dump on a program that otherwise
+    hard-codes its config.
+    </Note>
+  </Tab>
+</Tabs>
+
+# Selecting what to dump
+
+VLA models are not a single homogeneous decoder stack — pi0.5 alone has three
+`layers.<int>` stacks (vision encoder, PaliGemma language model, action
+expert) plus components with no layer index at all (`heads`, `rope`,
+embeddings, projectors). The `filter` selects operators by their **full
+dotted name**, which lets you target any of them precisely.
+
+`filter` accepts three forms:
+
+<AccordionGroup>
+  <Accordion title="None — record everything (default)">
+    Every leaf operator is captured. For pi0.5 this is ~1500 tensors per
+    step, so prefer a narrower filter once you know what you are after.
+  </Accordion>
+  <Accordion title="A list of regexes — record if any matches">
+    Patterns are `re.search`-matched against the operator name and OR-ed
+    together. Examples:
+
+    | Goal | Regex |
+    | --- | --- |
+    | One stack's first layer | `r"expert_stack\.layers\.0\."` |
+    | First layer of two stacks | `r"expert_stack\.layers\.0\."`, `r"paligemma_lm\.layers\.0\."` |
+    | Every output projection | `r"o_proj$"` |
+    | The action/time heads (no layer index) | `r"\.heads\."` |
+    | The whole vision tower | `r"\.vision\."` |
+  </Accordion>
+  <Accordion title="A callable — record if it returns True">
+    For logic a regex cannot express, pass a
+    `(name: str, module: nn.Module) -> bool` predicate. It receives the
+    module too, so you can dispatch on type:
+
+    ```python
+    from torch import nn
+
+    def keep(name, module):
+        # Every output projection except the vision tower's.
+        return name.endswith("o_proj") and ".vision." not in name
+    ```
+
+    Point the config or env var at it as `"my_pkg.filters:keep"` (import path)
+    or `"/tmp/myfilter.py:keep"` (file path — convenient for ad-hoc debugging
+    without installing anything).
+  </Accordion>
+</AccordionGroup>
+
+# Output layout
+
+Each rank writes to its own subdirectory so concurrent processes never
+collide; each `Engine.step()` produces one numbered pass file:
+
+<Tree>
+  <Tree.Folder name="/tmp/dump" defaultOpen>
+    <Tree.Folder name="rank0_pid3069569" defaultOpen>
+      <Tree.File name="pass00000.pt" />
+      <Tree.File name="pass00001.pt" />
+      <Tree.File name="pass00002.pt" />
+    </Tree.Folder>
+  </Tree.Folder>
+</Tree>
+
+Each `.pt` file is a dict of `{operator_name: cpu_tensor}`. When one operator
+fires multiple times in a single step — the vision tower runs once per
+camera, the action expert runs once per Euler denoise step — every
+invocation is preserved: the first is keyed by the bare name, later ones get
+a `::callN` suffix.
+
+```
+model.paligemma_lm.layers.0.o_proj
+model.expert_stack.layers.0.attn          # Euler step 0
+model.expert_stack.layers.0.attn::call1   # Euler step 1
+model.expert_stack.layers.0.attn::call2   # Euler step 2
+...
+```
+
+# Loading a dump
+
+Use `load_pass` to read one pass file back:
+
+```python
+from phyai.runtime.tensor_dump import load_pass
+
+tensors = load_pass("/tmp/dump/rank0_pid3069569/pass00000.pt")
+
+# Keys are operator names; values are CPU tensors.
+print(tensors["model.expert_stack.layers.0.o_proj"].shape)
+
+# Compare two runs (e.g. two backends) operator-by-operator.
+a = load_pass("/tmp/dump_a/rank0_pid111/pass00000.pt")
+b = load_pass("/tmp/dump_b/rank0_pid222/pass00000.pt")
+for name in a.keys() & b.keys():
+    diff = (a[name].float() - b[name].float()).abs().max().item()
+    if diff > 1e-3:
+        print(f"{name}: max_abs_diff={diff:.6f}")
+```

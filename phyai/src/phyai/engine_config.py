@@ -45,6 +45,7 @@ pattern is to install the config first and then build models.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from threading import Lock
 
@@ -325,12 +326,39 @@ class RuntimeConfig:
         under that name regardless of (spec, regime). Useful for A/B
         comparisons; ``None`` lets the registry's ``prefer_for``
         ordering decide.
+    debug_tensor_dump_dir:
+        Base directory for forward-hook activation dumps. ``None`` (the
+        default) disables dumping. When set, the engine records every
+        selected leaf operator's output to
+        ``<dir>/rank{R}_pid{P}/pass{N}.pt`` — one file per
+        :meth:`~phyai.engine.Engine.step`. Because a captured CUDA graph
+        replays without re-entering Python (so forward hooks never fire),
+        the engine **forces ``use_cuda_graph`` off** whenever this is set;
+        expect eager-mode speed while dumping. See
+        :mod:`phyai.runtime.tensor_dump`.
+    debug_tensor_dump_filter:
+        Optional tuple of regex strings selecting which operators to dump,
+        matched against each operator's full dotted name
+        (``model.expert_stack.layers.0.o_proj``). A leaf is recorded if
+        **any** pattern ``re.search``-matches (a union). ``None`` records
+        every operator. Mutually exclusive with
+        ``debug_tensor_dump_filter_fn``. No effect unless
+        ``debug_tensor_dump_dir`` is also set.
+    debug_tensor_dump_filter_fn:
+        Optional ``"pkg.module:func"`` / ``"/path/to/file.py:func"`` path
+        to a ``(name, module) -> bool`` predicate, for selection logic a
+        regex can't express. Mutually exclusive with
+        ``debug_tensor_dump_filter``. No effect unless
+        ``debug_tensor_dump_dir`` is also set.
     """
 
     use_cuda_graph: bool = True
     flashinfer_workspace_bytes: int = 128 * 1024 * 1024
     flashinfer_prefill_backend: str | None = None
     force_linear_kernel: str | None = None
+    debug_tensor_dump_dir: str | None = None
+    debug_tensor_dump_filter: tuple[str, ...] | None = None
+    debug_tensor_dump_filter_fn: str | None = None
 
     def __post_init__(self) -> None:
         v = self.flashinfer_workspace_bytes
@@ -346,6 +374,30 @@ class RuntimeConfig:
                 f"None or one of {sorted(_VALID_FLASHINFER_PREFILL_BACKENDS)} "
                 f"(the names BatchPrefillWithPagedKVCacheWrapper accepts; "
                 f"'cute-dsl' is paged-incompatible)."
+            )
+        flt = self.debug_tensor_dump_filter
+        if flt is not None:
+            if not isinstance(flt, tuple) or not all(isinstance(x, str) for x in flt):
+                raise ValueError(
+                    f"RuntimeConfig.debug_tensor_dump_filter must be None or a "
+                    f"tuple of regex strings, got {flt!r}."
+                )
+            for pat in flt:
+                try:
+                    re.compile(pat)
+                except re.error as e:
+                    raise ValueError(
+                        f"RuntimeConfig.debug_tensor_dump_filter has an invalid "
+                        f"regex {pat!r}: {e}"
+                    ) from e
+        if (
+            self.debug_tensor_dump_filter is not None
+            and self.debug_tensor_dump_filter_fn is not None
+        ):
+            raise ValueError(
+                "RuntimeConfig.debug_tensor_dump_filter and "
+                "debug_tensor_dump_filter_fn are mutually exclusive; set at "
+                "most one."
             )
         # ``force_linear_kernel`` is *not* validated against the global
         # linear-kernel registry: a kernel registered into a
@@ -449,6 +501,12 @@ class EngineConfig:
             runtime_kw["flashinfer_prefill_backend"] = v
         if (v := envs.PHYAI_FORCE_LINEAR_KERNEL.get()) is not None:
             runtime_kw["force_linear_kernel"] = v
+        if (v := envs.PHYAI_DEBUG_TENSOR_DUMP_DIR.get()) is not None:
+            runtime_kw["debug_tensor_dump_dir"] = v
+        if (v := envs.PHYAI_DEBUG_TENSOR_DUMP_FILTER.get()) is not None:
+            runtime_kw["debug_tensor_dump_filter"] = v
+        if (v := envs.PHYAI_DEBUG_TENSOR_DUMP_FILTER_FN.get()) is not None:
+            runtime_kw["debug_tensor_dump_filter_fn"] = v
 
         return cls(
             backends=replace(base.backends, **backends_kw)

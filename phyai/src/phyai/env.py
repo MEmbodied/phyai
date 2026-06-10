@@ -106,6 +106,34 @@ def _parse_dtype(s: str):
     return table[key]
 
 
+def _parse_regex_list(s: str) -> tuple[str, ...]:
+    """Parse a JSON array of regex strings, e.g. ``'["o_proj$", "\\\\.heads\\\\."]'``.
+
+    JSON (not a comma-split) because regex patterns routinely contain
+    ``,`` / ``|`` / ``.`` that a naive split would mangle. A single bare
+    string (not valid JSON, or JSON that isn't a list) is treated as a
+    one-element list so ``PHYAI_DEBUG_TENSOR_DUMP_FILTER='o_proj$'`` also
+    works for the common single-pattern case. An empty / whitespace string
+    yields the empty tuple. Used for the tensor-dump operator filter.
+    """
+    import json
+
+    raw = s.strip()
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return (raw,)
+    if isinstance(parsed, str):
+        return (parsed,)
+    if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+        return tuple(parsed)
+    raise ValueError(
+        f"expected a JSON array of regex strings (or a single pattern), got {s!r}"
+    )
+
+
 class envs:
     """Process-level typed env-var registry.
 
@@ -143,6 +171,20 @@ class envs:
         "PHYAI_FLASHINFER_PREFILL_BACKEND", None, str
     )
     PHYAI_FORCE_LINEAR_KERNEL = EnvField("PHYAI_FORCE_LINEAR_KERNEL", None, str)
+
+    # ---------- debug / tensor dump ---------- #
+    # When the dump dir is set the engine runs eager (cuda graph forced
+    # off) and records every selected leaf operator's output, one .pt per
+    # step. FILTER is a JSON array of regexes matched against operator
+    # names (or a single bare pattern); FILTER_FN is a "pkg.mod:func" /
+    # "/path.py:func" predicate. The two filters are mutually exclusive.
+    PHYAI_DEBUG_TENSOR_DUMP_DIR = EnvField("PHYAI_DEBUG_TENSOR_DUMP_DIR", None, str)
+    PHYAI_DEBUG_TENSOR_DUMP_FILTER = EnvField(
+        "PHYAI_DEBUG_TENSOR_DUMP_FILTER", None, _parse_regex_list
+    )
+    PHYAI_DEBUG_TENSOR_DUMP_FILTER_FN = EnvField(
+        "PHYAI_DEBUG_TENSOR_DUMP_FILTER_FN", None, str
+    )
 
 
 __all__ = ["EnvField", "envs"]

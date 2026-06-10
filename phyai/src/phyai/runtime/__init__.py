@@ -6,6 +6,9 @@ Modules:
   graph) and :class:`CudaGraphRegistry` (multi-shape dispatch).
 * :mod:`model_runner` — :class:`ModelRunner` ABC.
 * :mod:`schedule` — scheduler ABC and primitives.
+* :mod:`tensor_dump` — :class:`TensorDumper` (forward-hook activation
+  capture; eager-only) plus :func:`register_tensor_dumper` /
+  :func:`load_pass`.
 * :mod:`ipc_buffer` — :class:`CudaIpcBuffer` (GPU buffer shared across
   processes via cudaIpc) and :class:`HostShmBuffer` (host POSIX shared
   memory). Both expose symmetric ``create()`` / ``attach()`` modes
@@ -33,6 +36,14 @@ from phyai.runtime.ipc_buffer import (
 )
 from phyai.runtime.model_runner import ModelRunner
 from phyai.runtime.schedule import Scheduler
+from phyai.runtime.tensor_dump import (
+    FilterFn,
+    FilterSpec,
+    TensorDumper,
+    load_filter_fn,
+    load_pass,
+    register_tensor_dumper,
+)
 
 
 __all__ = [
@@ -41,8 +52,14 @@ __all__ = [
     "CudaGraphRegistry",
     "CudaIpcBuffer",
     "CudaIpcHandle",
+    "FilterFn",
+    "FilterSpec",
     "HostShmBuffer",
     "HostShmHandle",
     "ModelRunner",
     "Scheduler",
+    "TensorDumper",
+    "load_filter_fn",
+    "load_pass",
+    "register_tensor_dumper",
 ]

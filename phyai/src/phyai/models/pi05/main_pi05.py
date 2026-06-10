@@ -307,5 +307,18 @@ class PI05Entry(Entry):
             self.scheduler = None
         self.model = None
 
+    def dump_targets(self) -> dict[str, torch.nn.Module]:  # type: ignore[override]
+        """Expose the pi0.5 model for engine-driven tensor dumping.
+
+        Returns ``{"model": self.model}`` so dumped operator keys read
+        ``model.paligemma_lm.layers.0.self_attn.o_proj`` etc. (aligned with
+        the ``model.safetensors`` parameter names). Returns ``{}`` before
+        :meth:`setup` has built the model, so a dump-enabled engine that
+        somehow queries early just records nothing instead of crashing.
+        """
+        if self.model is None:
+            return {}
+        return {"model": self.model}
+
 
 __all__ = ["PI05Args", "PI05Entry"]

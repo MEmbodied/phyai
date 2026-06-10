@@ -176,6 +176,41 @@ def main() -> None:
             "(pure engine timing; no tokenizer load)."
         ),
     )
+    parser.add_argument(
+        "--dump-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Enable debug tensor dumping to this directory: every leaf "
+            "operator's output is written to <dir>/rank{R}_pid{P}/pass{N}.pt, "
+            "one file per engine.step(). Forces use_cuda_graph=False (forward "
+            "hooks can't fire under a captured graph), so timing here reflects "
+            "eager mode. Load a pass with phyai.runtime.tensor_dump.load_pass."
+        ),
+    )
+    parser.add_argument(
+        "--dump-filter",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Restrict tensor dumping to operators whose dotted name matches "
+            "any of these regexes (e.g. --dump-filter 'expert_stack\\.layers\\.0\\.' "
+            "'\\.heads\\.'). Omit to dump every operator. No effect without "
+            "--dump-dir; mutually exclusive with --dump-filter-fn."
+        ),
+    )
+    parser.add_argument(
+        "--dump-filter-fn",
+        type=str,
+        default=None,
+        help=(
+            "Path to a (name, module) -> bool predicate for tensor-dump "
+            "selection, as 'pkg.module:func' or '/path/to/file.py:func'. For "
+            "logic a regex can't express. No effect without --dump-dir; "
+            "mutually exclusive with --dump-filter."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.checkpoint.is_dir():
@@ -203,7 +238,18 @@ def main() -> None:
             ),
             config=EngineConfig(
                 device=DeviceConfig(target="cuda", params_dtype=dtype),
-                runtime=RuntimeConfig(use_cuda_graph=True),
+                runtime=RuntimeConfig(
+                    use_cuda_graph=args.dump_dir is None,
+                    debug_tensor_dump_dir=(
+                        str(args.dump_dir) if args.dump_dir is not None else None
+                    ),
+                    debug_tensor_dump_filter=(
+                        tuple(args.dump_filter)
+                        if args.dump_filter is not None
+                        else None
+                    ),
+                    debug_tensor_dump_filter_fn=args.dump_filter_fn,
+                ),
             ),
         )
     )

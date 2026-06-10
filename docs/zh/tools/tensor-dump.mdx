@@ -1,0 +1,176 @@
+---
+title: "Tensor Dump"
+description: "推理时捕获每个算子的激活值，用于调试与数值对比"
+icon: "bug"
+---
+
+# 概述
+
+Tensor dump 会记录模型推理时每个叶子节点的 **输出激活值**，每次 `Engine.step()`
+写一个文件。当你需要回答"某一层在运行时究竟产出了什么"时，它就是首选工具。
+排查数值回归、对比两套后端（如 flashinfer vs eager，或 bf16 vs FP8 构建）、
+或把新移植的模型对照参考实现做校验。
+
+它基于 PyTorch 的 forward hook：给每个被选中且没有子模块的 `nn.Module` 挂一个
+hook，捕获它的返回值，搬到 CPU，并以模块的点分名字
+（`model.expert_stack.layers.0.o_proj`）累积起来。**不会** dump 权重，因为
+权重是静态的，本就存在 checkpoint 里；这里捕获的是随输入变化的中间Tensor。
+
+<Warning>
+**Tensor dump 只能在 eager 模式下工作。** 捕获后的 CUDA graph 在 replay 时不会
+重新进入 Python，所以 forward hook 在 graph replay 期间永远不触发。一旦你设置了
+dump 目录，引擎会 **强制 `use_cuda_graph=False`**（并打印 warning），让 hook 真正
+执行。dump 时请按 eager 模式的速度预期 —— 这是调试路径，不是生产路径。
+</Warning>
+
+# 启用方式
+
+Tensor dump 默认关闭。可以通过 runtime 配置打开，也可以纯靠环境变量打开，
+按你的工作流选择。
+
+<Tabs>
+  <Tab title="环境变量">
+    在不改调用方代码的前提下，为单次运行临时打开 dump 的最轻量方式。`PHYAI_*`
+    变量会叠加在程序传入的任意 config 之上，即便脚本自己构造了（一旦有 ENV 变量，其优先级 > EngineConfig）
+    `EngineConfig` 也照样生效：
+
+    ```bash
+    PHYAI_DEBUG_TENSOR_DUMP_DIR=/tmp/dump \
+        uv run python examples/run_pi05.py --checkpoint /path/to/pi05_base --raw
+    ```
+
+    用一个 JSON 数组的正则（对每个算子的完整点分名字匹配）来限定捕获范围：
+
+    ```bash
+    PHYAI_DEBUG_TENSOR_DUMP_DIR=/tmp/dump \
+    PHYAI_DEBUG_TENSOR_DUMP_FILTER='["expert_stack\\.layers\\.0\\.", "\\.heads\\."]' \
+        uv run python examples/run_pi05.py --checkpoint /path/to/pi05_base --raw
+    ```
+
+    | 变量 | 含义 |
+    | --- | --- |
+    | `PHYAI_DEBUG_TENSOR_DUMP_DIR` | 输出目录。设置它即启用 dump。 |
+    | `PHYAI_DEBUG_TENSOR_DUMP_FILTER` | JSON 数组的正则（或单个裸 pattern）。任一 pattern 命中即记录该算子。 |
+    | `PHYAI_DEBUG_TENSOR_DUMP_FILTER_FN` | `"pkg.module:func"` 或 `"/path/file.py:func"` 谓词。与 `_FILTER` 互斥。 |
+  </Tab>
+  <Tab title="EngineConfig">
+    在代码里构造引擎时，直接在 `RuntimeConfig` 上设置同样的开关：
+
+    ```python
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import EngineConfig, DeviceConfig, RuntimeConfig
+    from phyai.models.pi05.main_pi05 import PI05Args
+
+    engine = Engine(
+        EngineArgs(
+            plugin="pi05",
+            plugin_args=PI05Args(checkpoint_dir="/path/to/pi05_base"),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda"),
+                runtime=RuntimeConfig(
+                    # 设了 dump 目录后 use_cuda_graph 会被自动强制关闭，
+                    # 你不需要自己去关闭这个开关。
+                    debug_tensor_dump_dir="/tmp/dump",
+                    debug_tensor_dump_filter=(r"expert_stack\.layers\.0\.",),
+                ),
+            ),
+        )
+    )
+    ```
+
+    <Note>
+    环境变量始终叠加在显式 `config` 之上。如果环境里设了
+    `PHYAI_DEBUG_TENSOR_DUMP_DIR`，它会覆盖上面那个字段。
+    这正好方便给一个本来硬编码了 config 的程序临时打开 dump。
+    </Note>
+  </Tab>
+</Tabs>
+
+# 选择 dump 什么
+
+VLA 模型并不是单一同构的 decoder stack。仅 pi0.5 就有三个 `layers.<int>`
+stack（视觉 encoder、PaliGemma 语言模型、动作 expert），外加一批根本没有层号的
+组件（`heads`、`rope`、各种 embedding / projector）。`filter` 就是为这个情况准备的
+
+`filter` 接受三种形式：
+
+<AccordionGroup>
+  <Accordion title="None，记录全部（默认）">
+    捕获每一个叶子算子。pi0.5 每步约 1500 个Tensor，所以一旦你明确了要看什么，
+    就尽量用更窄的 filter 来自己捕获 Tensor。
+  </Accordion>
+  <Accordion title="正则列表，任一命中即记录">
+    每条 pattern 用 `re.search` 对算子名匹配，多条之间取并集（OR）。示例：
+
+    | 目标 | 正则 |
+    | --- | --- |
+    | 某个 stack 的第 0 层 | `r"expert_stack\.layers\.0\."` |
+    | 两个 stack 的第 0 层 | `r"expert_stack\.layers\.0\."`、`r"paligemma_lm\.layers\.0\."` |
+    | 所有 output projection | `r"o_proj$"` |
+    | 动作 / 时间 heads（无层号） | `r"\.heads\."` |
+    | 整个视觉塔 | `r"\.vision\."` |
+  </Accordion>
+  <Accordion title="可调用对象，返回 True 即记录">
+    对于正则表达不了的逻辑，传一个 `(name: str, module: nn.Module) -> bool`
+    谓词。它还能拿到 module，所以可以按类型分派：
+
+    ```python
+    from torch import nn
+
+    def keep(name, module):
+        # 除视觉塔以外的所有 output projection。
+        return name.endswith("o_proj") and ".vision." not in name
+    ```
+
+    在 config 或环境变量里以 `"my_pkg.filters:keep"`（import 路径）或
+    `"/tmp/myfilter.py:keep"`（文件路径，临时调试时不用装包，方便使用）指向它。
+  </Accordion>
+</AccordionGroup>
+
+# 输出布局
+
+每个 rank 写到各自的子目录，避免并发进程之间互相覆盖；每次 `Engine.step()` 产生一个
+带编号的 pass 文件：
+
+<Tree>
+  <Tree.Folder name="/tmp/dump" defaultOpen>
+    <Tree.Folder name="rank0_pid3069569" defaultOpen>
+      <Tree.File name="pass00000.pt" />
+      <Tree.File name="pass00001.pt" />
+      <Tree.File name="pass00002.pt" />
+    </Tree.Folder>
+  </Tree.Folder>
+</Tree>
+
+每个 `.pt` 文件是一个 `{算子名: cpu_tensor}` 的字典。当一个算子在单步内触发多次。
+视觉塔每个相机跑一次、动作 expert 每个 Euler 去噪步跑一次，每次调用都会被保留：
+第一次以裸名字为 key，之后的加 `::callN` 后缀。
+
+```
+model.paligemma_lm.layers.0.o_proj
+model.expert_stack.layers.0.attn          # Euler 步 0
+model.expert_stack.layers.0.attn::call1   # Euler 步 1
+model.expert_stack.layers.0.attn::call2   # Euler 步 2
+...
+```
+
+# 加载 dump
+
+用 `load_pass` 读回一个 pass 文件：
+
+```python
+from phyai.runtime.tensor_dump import load_pass
+
+tensors = load_pass("/tmp/dump/rank0_pid3069569/pass00000.pt")
+
+# key 是算子名，value 是 CPU Tensor。
+print(tensors["model.expert_stack.layers.0.o_proj"].shape)
+
+# 逐算子对比两次运行（例如两套后端）。
+a = load_pass("/tmp/dump_a/rank0_pid111/pass00000.pt")
+b = load_pass("/tmp/dump_b/rank0_pid222/pass00000.pt")
+for name in a.keys() & b.keys():
+    diff = (a[name].float() - b[name].float()).abs().max().item()
+    if diff > 1e-3:
+        print(f"{name}: max_abs_diff={diff:.6f}")
+```
