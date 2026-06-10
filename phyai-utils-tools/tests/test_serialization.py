@@ -103,6 +103,27 @@ def test_unknown_step_raises(tmp_path):
         ProcessorPipeline.from_pretrained(tmp_path, "p.json")
 
 
+def test_missing_local_sidecar_raises_filenotfound(tmp_path):
+    """A local config pointing at a missing state_file fails clearly (not via Hub)."""
+    cfg = {
+        "name": "p",
+        "steps": [
+            {
+                "registry_name": "normalizer_processor",
+                "config": {
+                    "eps": 1e-08,
+                    "features": {"observation.state": {"type": "STATE", "shape": [2]}},
+                    "norm_map": {"STATE": "MEAN_STD"},
+                },
+                "state_file": "p_step_0_normalizer_processor.safetensors",  # not written
+            }
+        ],
+    }
+    (tmp_path / "p.json").write_text(json.dumps(cfg))
+    with pytest.raises(FileNotFoundError, match="state_file"):
+        ProcessorPipeline.from_pretrained(tmp_path, "p.json")
+
+
 def test_save_load_roundtrip_with_stats(tmp_path):
     """save_pretrained -> from_pretrained reproduces config + stats sidecar."""
     feats = {_STATE_FEAT: {"type": "STATE", "shape": [3]}}

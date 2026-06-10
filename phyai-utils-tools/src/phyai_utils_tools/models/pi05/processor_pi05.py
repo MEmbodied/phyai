@@ -279,7 +279,10 @@ class PI05Processor(BaseModelProcessor):
         obj.image_size = int(image_size)
         obj.num_channels = int(num_channels)
         obj.num_images = int(num_images)
-        obj.tokenizer_max_length = 200
+        obj.tokenizer_max_length = next(
+            (s.max_length for s in pre.steps if isinstance(s, TokenizerStep)),
+            200,
+        )
         obj.action_dim = action_dim
         obj.tokenizer_name = tokenizer_name
         obj.dataset_stats = None

@@ -327,6 +327,11 @@ class ProcessorPipeline:
             local = base_path / state_file
             if local.is_file():
                 state_path = str(local)
+            elif Path(src).exists():
+                raise FileNotFoundError(
+                    f"Step {registry_name!r} references state_file "
+                    f"{state_file!r}, but it was not found at {local}."
+                )
             else:
                 from huggingface_hub import hf_hub_download
 
