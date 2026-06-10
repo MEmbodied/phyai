@@ -344,3 +344,21 @@ def test_no_leak_when_batch_reuses_nested_prefixes():
         except CacheCapacityError:
             break
     assert cache.available(Tier.DEVICE) == avail_empty
+
+
+def test_failed_plan_does_not_evict_committed_entries():
+    """An invalid sequence later in a batch makes plan() raise WITHOUT having
+    evicted committed entries: validation runs before any ensure_capacity."""
+    cache, pool, planner = _build(num_slots=4, total_units=4)  # ids 1..3 usable
+    c = RadixSequence(_atoms([10, 11, 12]))
+    planner.plan([c])
+    planner.commit([c])
+    planner.release([c])  # C is a committed, evictable cache entry (avail 0)
+    assert int(cache.match(_atoms([10, 11, 12])).matched_atoms[int(Tier.DEVICE)]) == 3
+    good = RadixSequence(_atoms([20, 21, 22]))  # valid; would need to evict C
+    bad = RadixSequence(b"abcde")  # unaligned -> raises
+    with pytest.raises(ValueError, match="page_bytes"):
+        planner.plan([good, bad])
+    # C must survive: the failed plan did no eviction / allocation.
+    assert int(cache.match(_atoms([10, 11, 12])).matched_atoms[int(Tier.DEVICE)]) == 3
+    assert not good.committed and good.suffix_units is None

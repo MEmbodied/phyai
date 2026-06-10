@@ -121,14 +121,22 @@ class RadixAttentionPlanner:
         mode: AttnMode,
         touched: list[RadixSequence],
     ) -> ARAttnMetadata:
+        # Validate the whole batch up front, before any side-effecting match /
+        # ensure_capacity / allocate, so a failed plan never mutates the cache:
+        # ensure_capacity can evict committed entries that _rollback cannot
+        # restore. Raises here on a released or non-page-aligned sequence.
+        for seq in sequences:
+            if seq.released:
+                raise ValueError("cannot plan a released RadixSequence.")
+            self._num_units(seq.atoms)  # raises on non-page-aligned atoms
+
         # Pre-pass: perform every match up front so the radix tree is fully split
         # at all needed prefix boundaries BEFORE we take any NodeRef. A later
         # match that split an already-locked node would orphan the duplicated
         # ref_count the C++ split copies onto the split-off suffix child
         # (node_ref only unlocks the node->root path) and leak its units.
         for seq in sequences:
-            n = len(seq.atoms)
-            if n and not seq.released and n % self.page_bytes == 0:
+            if len(seq.atoms):
                 self.cache.match(seq.atoms)
 
         suffix_lens: list[int] = []
@@ -138,8 +146,6 @@ class RadixAttentionPlanner:
         pos_parts: list[torch.Tensor] = []
 
         for seq in sequences:
-            if seq.released:
-                raise ValueError("cannot plan a released RadixSequence.")
             touched.append(seq)
             num_units = self._num_units(seq.atoms)
             prefix_units, prefix_slots = self._match_prefix(seq, num_units)
