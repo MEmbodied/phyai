@@ -49,12 +49,16 @@ __all__ = [
     "EagerARPlan",
     "FlashInferARBackend",
     "FlashInferARPlan",
-    "RadixAttentionPlanner",
-    "RadixSequence",
     "get_backend_factory",
     "list_backends",
     "register_backend",
 ]
+
+# RadixAttentionPlanner / RadixSequence are intentionally NOT in __all__: they
+# are lazily re-exported via __getattr__ below (the radix bridge pulls in the
+# optional ``phyai-ext`` extra). Keeping them out of __all__ means
+# ``from ...ar import *`` does not eagerly resolve them and so does not require
+# the extension. Import them explicitly: ``from ...ar import RadixAttentionPlanner``.
 
 
 def __getattr__(name: str):

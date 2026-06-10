@@ -283,6 +283,25 @@ def test_ar_import_does_not_pull_radix_extension():
     assert "LAZY_OK" in res.stdout
 
 
+def test_star_import_does_not_pull_radix_extension():
+    """`from ...ar import *` must not eagerly resolve the lazy radix names —
+    that would call __getattr__, import phyai_ext, and break a base install
+    without the optional [ext] extra. So the radix names stay out of __all__."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "from phyai.layers.attention.ar import *  # noqa: F401,F403\n"
+        "assert 'phyai_ext' not in sys.modules, 'star-import pulled phyai_ext'\n"
+        "assert 'phyai.layers.attention.ar.radix' not in sys.modules\n"
+        "print('STAR_OK')\n"
+    )
+    res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert "STAR_OK" in res.stdout
+
+
 def test_no_leak_when_batch_reuses_nested_prefixes():
     """A batch reusing a committed prefix to different depths must not leak
     units. Locking a node that a sibling's shorter match later splits would
