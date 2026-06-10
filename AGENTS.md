@@ -1,5 +1,21 @@
 # Repository Guidelines
 
+Read CLAUDE.md as AGENTS.md!
+Read CLAUDE.md as AGENTS.md!
+Read CLAUDE.md as AGENTS.md!
+Read CLAUDE.md as AGENTS.md!
+Read CLAUDE.md as AGENTS.md!
+Read CLAUDE.md as AGENTS.md!
+
+Follow the instructions in CLAUDE.md!
+
+Read skills from .claude directory!
+Read skills from .claude directory!
+Read skills from .claude directory!
+Read skills from .claude directory!
+Read skills from .claude directory!
+Read skills from .claude directory!
+
 ## Project Structure & Module Organization
 This is a `uv` workspace monorepo for Python 3.12+. The main library lives in `phyai/src/phyai`, with tests in `phyai/tests`. `phyai-kernel/` contains Triton and JIT kernel code under `phyai_kernel/`, plus `tests/` and `benchmark/`. `phyai-ext/` contains the C++ extension: `csrc/`, `include/`, Python wrappers in `src/phyai_ext`, and tests in `tests/`. `phyai-model-optimizer/` and `phyai-utils-tools/` follow the same `src/<package>` and `tests/` layout. Documentation is in `docs/`, examples in `examples/`, helper scripts in `scripts/`, and Dockerfiles in `docker/`.
 

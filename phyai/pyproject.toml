@@ -5,6 +5,7 @@ description = "phyai — Physical AI. Main library."
 requires-python = ">=3.12"
 dependencies = [
     "phyai-kernel",
+    "phyai-utils-tools",
     "numpy",
     "torch==2.11",
     "safetensors",

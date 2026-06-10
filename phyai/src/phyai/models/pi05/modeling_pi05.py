@@ -146,6 +146,23 @@ def _adarms_backend(norm_backend: str) -> str:
     return norm_backend
 
 
+def _vision_norm_backend(norm_backend: str, vision_dtype: torch.dtype) -> str:
+    """Map a generic norm backend to one the vision tower can run at ``vision_dtype``.
+
+    flashinfer's LayerNorm / RMSNorm CUDA kernels hard-require a **bf16**
+    input tensor (``flashinfer.norm.layernorm``: "input ... Need to be
+    bfloat16"). When the vision tower runs in fp32 (the openpi / lerobot
+    parity path keeps SigLIP + projector + their norms in fp32), the
+    flashinfer norm path cannot consume the fp32 activations, so we fall
+    back to ``phyai-kernel`` (Triton, which accepts any floating dtype) —
+    mirroring :func:`_adarms_backend`. When the tower stays at the bf16
+    default, the backend is left untouched.
+    """
+    if norm_backend == "flashinfer" and vision_dtype != torch.bfloat16:
+        return "phyai-kernel"
+    return norm_backend
+
+
 def _engine_to_paged_backend(attn_backend: str) -> str:
     """Map :class:`EngineConfig`'s ``attn_backend`` onto the AR / Diffusion
     paged backend name.
@@ -472,6 +489,22 @@ class PI05VisionTower(nn.Module):
     ``embed_image`` step consumes — including the
     ``* sqrt(projection_dim)`` post-projection scale so callers can drop
     the result straight into the language model's embedding space.
+
+    Precision
+    ---------
+    The tower runs all of its weights, norms, conv, and the projection
+    scale at ``params_dtype`` (the **compute** dtype). The openpi /
+    lerobot parity path keeps the whole vision stack in fp32 while the
+    rest of the model is bf16; pass ``params_dtype=torch.float32`` for
+    that, and ``io_dtype`` (the surrounding model's dtype) so the output
+    is cast back to bf16 before it enters the language-model embedding
+    space — exactly mirroring lerobot's ``embed_image`` (upcast pixels ->
+    run fp32 tower -> downcast features). When ``params_dtype == io_dtype``
+    (the bf16 default) both boundary casts are no-ops, so the captured
+    vision graph is byte-identical to the single-dtype path. fp32 also
+    forces the norm backend to ``phyai-kernel`` via
+    :func:`_vision_norm_backend` (flashinfer's norm kernels require bf16
+    input).
     """
 
     DEFAULT_PREFIX: str = "paligemma_with_expert.paligemma.model"
@@ -481,6 +514,7 @@ class PI05VisionTower(nn.Module):
         config: SiglipVisionConfig,
         *,
         params_dtype: torch.dtype | None = None,
+        io_dtype: torch.dtype | None = None,
         attn_backend: str | None = None,
         norm_backend: str | None = None,
         prefix: str = DEFAULT_PREFIX,
@@ -489,13 +523,22 @@ class PI05VisionTower(nn.Module):
         params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
+        # ``params_dtype`` is the vision *compute* dtype (may be fp32 for the
+        # parity path); ``io_dtype`` is the surrounding model's dtype that the
+        # output is cast back to (bf16). When the two match (bf16 default) the
+        # boundary casts in forward are no-ops.
+        self.compute_dtype = params_dtype
+        self.io_dtype = io_dtype if io_dtype is not None else params_dtype
+        # fp32 activations can't flow through flashinfer's bf16-only norm
+        # kernels; route the vision norms to phyai-kernel when running fp32.
+        vision_norm_backend = _vision_norm_backend(norm_backend, params_dtype)
         self.config = config
         self.prefix = prefix
         self.vision_tower = VisionTowerWrapper(
             config,
             params_dtype=params_dtype,
             attn_backend=attn_backend,
-            norm_backend=norm_backend,
+            norm_backend=vision_norm_backend,
             prefix=f"{prefix}.vision_tower" if prefix else "vision_tower",
         )
         self.multi_modal_projector = MultiModalProjector(
@@ -508,9 +551,16 @@ class PI05VisionTower(nn.Module):
         self.projection_scale = float(config.projection_dim) ** 0.5
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        h = self.vision_tower(pixel_values)  # (B, N, hidden)
+        # Upcast the incoming pixels to the vision compute dtype (bf16 -> fp32
+        # on the parity path; a no-op when the tower is bf16), run the tower +
+        # projector + scale in that dtype, then cast back to the model's
+        # io_dtype. Mirrors lerobot's ``embed_image``. The casts are captured
+        # into the vision CUDA graph; its external interface stays io_dtype.
+        x = pixel_values.to(self.compute_dtype)
+        h = self.vision_tower(x)  # (B, N, hidden)
         h = self.multi_modal_projector(h)  # (B, N, projection_dim)
-        return h * self.projection_scale
+        h = h * self.projection_scale
+        return h.to(self.io_dtype)
 
 
 # ============================================================================ #
@@ -1312,6 +1362,15 @@ class PI05Model(nn.Module):
     Each decoder layer (paligemma + expert) owns its own paged
     attention instance bound to its layer index — paligemma uses
     :class:`ARAttention` and the expert uses :class:`DiffusionAttention`.
+
+    ``vision_params_dtype`` selects the vision tower's compute precision
+    independently of the rest of the model: pass ``torch.float32`` to run
+    SigLIP + projector + their norms in fp32 (the openpi / lerobot parity
+    path) while ``paligemma_lm`` / ``expert_stack`` stay at ``params_dtype``
+    (bf16). ``None`` keeps the tower at the model dtype — the byte-identical
+    single-dtype default. The tower casts its output back to ``params_dtype``
+    internally, so the rest of the pipeline is unaffected.
+
     The runners build the right ctx type per stack
     (:class:`ARAttnCtx` / :class:`DiffusionAttnCtx`) and pass it
     through ``stack(h, position_ids, [cond,] rope, ctx)``. No
@@ -1348,6 +1407,7 @@ class PI05Model(nn.Module):
         config: PI05Config,
         *,
         params_dtype: torch.dtype | None = None,
+        vision_params_dtype: torch.dtype | None = None,
         attn_backend: str | None = None,
         norm_backend: str | None = None,
         rope_backend: str | None = None,
@@ -1357,6 +1417,13 @@ class PI05Model(nn.Module):
         params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
             params_dtype, attn_backend, norm_backend
         )
+        # The vision tower may run at a different (typically higher) precision
+        # than the rest of the model — openpi / lerobot keep SigLIP + projector
+        # in fp32 while the language + expert stacks are bf16. ``None`` keeps it
+        # at the model dtype (the byte-identical single-dtype default).
+        vision_dtype = (
+            vision_params_dtype if vision_params_dtype is not None else params_dtype
+        )
         # RoPE backend defaults follow the attention backend's preference:
         # both flashinfer paths exist and are fast; the eager path is the
         # fallback for non-flashinfer attention backends.
@@ -1364,6 +1431,7 @@ class PI05Model(nn.Module):
             rope_backend = "flashinfer" if attn_backend == "flashinfer" else "eager"
         self.config = config
         self.params_dtype = params_dtype
+        self.vision_params_dtype = vision_dtype
         self.attn_backend = attn_backend
 
         # flashinfer's prefill kernel hard-asserts ``head_dim ∈ {64, 128, 256}``.
@@ -1392,7 +1460,8 @@ class PI05Model(nn.Module):
             )
         self.vision = PI05VisionTower(
             config.vision,
-            params_dtype=params_dtype,
+            params_dtype=vision_dtype,
+            io_dtype=params_dtype,
             attn_backend=vision_attn_backend,
             norm_backend=norm_backend,
         )

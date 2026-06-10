@@ -14,8 +14,8 @@ attribute access keeps ``import phyai`` near-instant while
 
 The functional subpackages (:mod:`phyai.parallel`, :mod:`phyai.layers`,
 :mod:`phyai.vgpu`, :mod:`phyai.cache`, :mod:`phyai.runtime`,
-:mod:`phyai.weights`, :mod:`phyai.payload`, :mod:`phyai.tokenizer`,
-:mod:`phyai.utils`) are addressed by their full path
+:mod:`phyai.weights`, :mod:`phyai.payload`, :mod:`phyai.utils`) are
+addressed by their full path
 (``import phyai.parallel as P``) and are intentionally not hoisted here.
 """
 

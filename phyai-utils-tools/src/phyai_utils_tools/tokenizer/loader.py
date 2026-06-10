@@ -1,4 +1,11 @@
-"""HuggingFace tokenizer loading with optional fastokens acceleration."""
+"""HuggingFace tokenizer loading with optional fastokens acceleration.
+
+Moved from ``phyai.tokenizer`` so all preprocessing dependencies live in
+``phyai-utils-tools``. The only change from the original is the logging import
+(:func:`phyai_utils_tools.logging.rank0_log` instead of
+``phyai.utils.this_rank_log``), keeping this package free of any ``phyai``
+import.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +15,7 @@ from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
-from phyai.utils import this_rank_log
+from phyai_utils_tools.logging import rank0_log
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +23,7 @@ _FASTOKENS_PATCHED = False
 
 
 def fastokens_available() -> bool:
-    """Return True if the optional ``fastokens`` package is importable.
-
-    Driven by whether the user installed ``phyai[fastokenizer]`` extras.
-    """
+    """Return True if the optional ``fastokens`` package is importable."""
     return find_spec("fastokens") is not None
 
 
@@ -42,7 +46,7 @@ def try_enable_fastokens() -> bool:
 
     fastokens.patch_transformers()
     _FASTOKENS_PATCHED = True
-    this_rank_log(logger, logging.INFO, "fastokens backend enabled")
+    rank0_log(logger, logging.INFO, "fastokens backend enabled")
     return True
 
 
@@ -52,9 +56,9 @@ def get_tokenizer(
     """Load a HuggingFace tokenizer, optionally accelerated by fastokens.
 
     Calls :func:`try_enable_fastokens` before instantiation so if the user
-    installed ``phyai[fastokenizer]`` the returned tokenizer's BPE backend is
-    the fastokens shim. Without the extras this falls back transparently to
-    the default HF Rust ``tokenizers`` backend.
+    installed the fastokens extra the returned tokenizer's BPE backend is the
+    fastokens shim. Without it this falls back transparently to the default HF
+    Rust ``tokenizers`` backend.
     """
     try_enable_fastokens()
     return AutoTokenizer.from_pretrained(name_or_path, **kwargs)

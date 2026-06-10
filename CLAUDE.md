@@ -55,6 +55,9 @@ CPU is the default for tests — `phyai/tests/conftest.py` autouses a fixture th
 ## More Conventions provide by human
 
 - all log function in phyai package should use phyai.utils' logging api. U judge using `this_rank_log` or `all_rank_log`
+- Using ENGLISH for comment.
+- Be aware that phyai is a general inference engine for physical AI. Do not modify general components(such as phyai.layers, phyai.runtime) in phyai when supporting new models. Unless lack of layers, or lack of phyai's system components. Modify phyai's general components is a big deal, you should tell user first, let them agree.
+- When user want you to commit to github. You should run pre-commit first.
 - using `flashinfer` by default if CP is not set. When CP is set, pls using `MagiAttention` whose github repo is https://github.com/SandAI-org/MagiAttention.
 
 ## SKILLS! Use SKILLS if needed!
@@ -76,3 +79,4 @@ All coding agents working in this repo should keep a concise work log under `.me
 - Update the memory file as work progresses, especially before handing off, pausing, or finishing.
 - Other agents should read relevant `.memory/` notes before continuing related work.
 - If user want to add documents, pls use mintlify skills set. It those skills are not installed. pls use `npx skills add https://mintlify.com/docs` to install it first.
+- After all your work(including modify files), you should check there is no personal directory path in the code. There are no code that will show someones' PC hardware information. Attach personal information in the public repo code is dangerous.

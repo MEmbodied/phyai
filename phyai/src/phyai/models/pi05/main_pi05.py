@@ -115,6 +115,21 @@ class PI05Args(EntryArgs):
     ``weight_remap`` and ``weight_strict`` pass straight through to
     :func:`load_pretrained` for checkpoints whose key names diverge
     from upstream pi0.5 (HF rewrites, mid-training renames, etc.).
+
+    ``vision_params_dtype`` selects the vision tower's compute precision
+    independently of the engine dtype: pass ``torch.float32`` to run
+    SigLIP + projector + their norms in fp32 (the openpi / lerobot parity
+    path) while the language + expert stacks stay at the engine dtype
+    (bf16). ``None`` (default) keeps the tower at the engine dtype — the
+    byte-identical single-dtype path.
+
+    ``inputs_image_shape`` declares the cameras the model consumes, one
+    ``[H, W, C]`` per image (e.g. ``[[224, 224, 3], [224, 224, 3]]`` for two
+    cameras). ``len(...)`` sets the camera count; each ``[H, W]`` is the
+    native input size, resize-with-padded to the tower's ``image_size`` grid
+    at request time. ``None`` (default) keeps the pi05_base contract of three
+    cameras already at ``image_size``. ``C`` must equal
+    ``config.vision.num_channels``.
     """
 
     checkpoint_dir: str | Path | None = None
@@ -122,6 +137,8 @@ class PI05Args(EntryArgs):
     max_batch_size: int = 1
     weight_remap: Callable[[str], str | None] | dict[str, str] | None = None
     weight_strict: bool = True
+    vision_params_dtype: torch.dtype | None = None
+    inputs_image_shape: list[list[int]] | None = None
 
 
 @Engine.register
@@ -157,7 +174,11 @@ class PI05Entry(Entry):
         # value the user left at its "unset" default.
         eng = self._apply_recommended_engine(eng, config)
 
-        self.model = PI05Model(config, device=eng.device.target)
+        self.model = PI05Model(
+            config,
+            vision_params_dtype=args.vision_params_dtype,
+            device=eng.device.target,
+        )
 
         if args.checkpoint_dir is not None:
             load_pretrained(
@@ -167,13 +188,49 @@ class PI05Entry(Entry):
                 strict=args.weight_strict,
             )
 
+        num_images = self._resolve_num_images(args.inputs_image_shape, config)
+
         self.scheduler = PI05WS1Scheduler(
             self.model,
             max_batch_size=args.max_batch_size,
+            num_images=num_images,
             device=eng.device.target,
             use_cuda_graph=eng.runtime.use_cuda_graph,
         )
         self.scheduler.setup()
+
+    @staticmethod
+    def _resolve_num_images(
+        inputs_image_shape: list[list[int]] | None, config: PI05Config
+    ) -> int:
+        """Validate ``inputs_image_shape`` and return the camera count.
+
+        ``None`` defaults to 3 (the pi05_base contract). Otherwise each entry
+        is a native ``[H, W, C]``; only ``C`` is constrained here (it must
+        equal ``config.vision.num_channels`` — SigLIP's conv has a fixed
+        channel count), while ``H`` / ``W`` are free because the scheduler
+        resize-with-pads each camera to the tower's ``image_size`` grid. The
+        count is ``len(inputs_image_shape)``.
+        """
+        if inputs_image_shape is None:
+            return 3
+        if len(inputs_image_shape) == 0:
+            raise ValueError("inputs_image_shape must list at least one image.")
+        num_channels = config.vision.num_channels
+        for i, shape in enumerate(inputs_image_shape):
+            if len(shape) != 3:
+                raise ValueError(f"inputs_image_shape[{i}]={shape} must be [H, W, C].")
+            h, w, c = shape
+            if h <= 0 or w <= 0:
+                raise ValueError(
+                    f"inputs_image_shape[{i}] H/W must be positive, got [{h}, {w}]."
+                )
+            if c != num_channels:
+                raise ValueError(
+                    f"inputs_image_shape[{i}] channels {c} != "
+                    f"config.vision.num_channels={num_channels}."
+                )
+        return len(inputs_image_shape)
 
     @staticmethod
     def _apply_recommended_engine(eng, config: PI05Config):

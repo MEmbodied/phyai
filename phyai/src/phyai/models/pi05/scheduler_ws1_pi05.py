@@ -161,12 +161,19 @@ def build_joint_paged_kv_indices(
 
 @dataclass
 class PI05Request:
-    """One pi0.5 inference request.
+    """One pi0.5 inference request — canonical, already-preprocessed tensors.
 
-    ``pixel_values`` carries every robot's three cameras stacked along
-    the camera axis: shape ``(B, 3, 3, H, W)`` — ``B`` robots x 3 cameras
-    x 3 channels x ``image_size``x``image_size``. ``B`` may be any value
-    in ``[1, max_batch_size]`` (the scheduler pads up internally).
+    ``phyai`` is strict about inputs: image resize/normalize, tokenization, and
+    state discretization happen in the caller's processor
+    (``phyai_utils_tools.models.pi05.PI05Processor``), **not** here. The
+    scheduler accepts only the canonical tensors that processor produces:
+
+    ``pixel_values`` is the stacked camera tensor
+    ``(B, num_images, C, image_size, image_size)`` — already resized to the
+    SigLIP grid, on the model device/dtype. ``num_images`` is fixed at scheduler
+    construction; ``B`` may be any value in ``[1, max_batch_size]`` (the
+    scheduler pads up internally). H/W must equal ``image_size`` (validated; no
+    resize is performed).
 
     ``input_ids`` is the padded language-token tensor (``(B,
     tokenizer_max_length)`` int64); ``lang_lens`` carries the
@@ -217,6 +224,7 @@ class PI05WS1Scheduler(Scheduler):
         model: PI05Model,
         *,
         max_batch_size: int = 1,
+        num_images: int = 3,
         device: torch.device | str | None = None,
         use_cuda_graph: bool = True,
     ) -> None:
@@ -229,10 +237,13 @@ class PI05WS1Scheduler(Scheduler):
         self.max_batch_size = int(max_batch_size)
         if self.max_batch_size <= 0:
             raise ValueError(f"max_batch_size must be positive, got {max_batch_size}.")
+        self.num_images = int(num_images)
+        if self.num_images <= 0:
+            raise ValueError(f"num_images must be positive, got {num_images}.")
         self.model = model
 
         # Layout knobs.
-        self.image_token_count = cfg.vision.num_patches * 3  # 3 cameras per robot
+        self.image_token_count = cfg.vision.num_patches * self.num_images
         self.n_per_sample = self.image_token_count + cfg.tokenizer_max_length
 
         # Prefix-length buckets. Each LLM prefix runs at a fixed graph
@@ -286,6 +297,7 @@ class PI05WS1Scheduler(Scheduler):
         # graphs run at constant shape.
         self.vision_runner = PI05VisionRunner(
             model.vision,
+            num_images=self.num_images,
             params_dtype=self.params_dtype,
             device=self.device,
             use_cuda_graph=use_cuda_graph,
@@ -424,13 +436,15 @@ class PI05WS1Scheduler(Scheduler):
             self._layout_cache[key] = layout
         plan_changed = key != self._last_layout_key
 
-        # 1. Vision pass — replay the captured (3, 3, H, W) graph once
-        # per real robot. The runner's output aliases its static buffer,
+        # 1. Vision pass — replay the captured (num_images, C, H, W) graph
+        # once per real robot. The runner's output aliases its static buffer,
         # so we eagerly copy each replay into a pre-allocated
         # ``(max_B, image_token_count, D)`` slot before the next replay
         # overwrites it. Padded rows stay zero (their image embeddings
         # are written into the packed prefix at sentinel-routed rows,
-        # so the values don't propagate anywhere).
+        # so the values don't propagate anywhere). ``pixel_values`` is the
+        # caller's canonical, already-resized tensor; we only move it to the
+        # model device/dtype here (no resize — phyai is strict).
         with event_scope("pi05.vision_loop"):
             pixel_values = request.pixel_values.to(device=device, dtype=dtype)
             image_embs: torch.Tensor | None = None
@@ -704,21 +718,40 @@ class PI05WS1Scheduler(Scheduler):
     # ------------------------------------------------------------------ #
 
     def _validate(self, req: PI05Request) -> None:
+        """Strictly validate the canonical request tensors.
+
+        ``phyai`` is strict: it does not resize or reshape. ``pixel_values``
+        must already be the stacked canonical tensor
+        ``(B, num_images, C, image_size, image_size)``; this checks the camera
+        count, H/W, batch-dim bound, and that the text / noise tensors agree
+        with the batch size. Resizing non-square inputs is the caller's
+        processor's job (``phyai_utils_tools.models.pi05.PI05Processor``).
+        """
         cfg = self.cfg
+        if req.pixel_values.dim() != 5:
+            raise ValueError(
+                f"pixel_values must be 5-D (B, num_images, C, image_size, "
+                f"image_size); got shape {tuple(req.pixel_values.shape)}."
+            )
         actual_B = int(req.pixel_values.shape[0])
         if not 1 <= actual_B <= self.max_batch_size:
             raise ValueError(
                 f"pixel_values batch dim {actual_B} not in "
                 f"[1, max_batch_size={self.max_batch_size}]."
             )
-        if req.pixel_values.shape[1] != 3:
+        if req.pixel_values.shape[1] != self.num_images:
             raise ValueError(
-                f"pixel_values must have 3 cameras, got {req.pixel_values.shape[1]}."
+                f"pixel_values has {req.pixel_values.shape[1]} cameras, "
+                f"expected num_images={self.num_images}."
             )
-        if req.pixel_values.shape[-1] != cfg.vision.image_size:
+        if req.pixel_values.shape[-2:] != (
+            cfg.vision.image_size,
+            cfg.vision.image_size,
+        ):
             raise ValueError(
-                f"pixel_values H/W {req.pixel_values.shape[-2:]} != "
-                f"image_size {cfg.vision.image_size}."
+                f"pixel_values H/W {tuple(req.pixel_values.shape[-2:])} != "
+                f"(image_size, image_size)=({cfg.vision.image_size}, "
+                f"{cfg.vision.image_size}). Resize in the caller's processor."
             )
         if req.input_ids.shape != (actual_B, cfg.tokenizer_max_length):
             raise ValueError(

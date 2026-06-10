@@ -7,8 +7,8 @@ at this layer, so a runner can be reused for any composition that
 exposes the same parts.
 
 * :class:`PI05VisionRunner` wraps :class:`PI05VisionTower` at fixed
-  shape ``(3, 3, H, W)`` (three cameras per call) and produces image
-  embeddings ``(3, num_patches, projection_dim)``.
+  shape ``(num_images, C, H, W)`` (all of one robot's cameras per call)
+  and produces image embeddings ``(num_images, num_patches, projection_dim)``.
 * :class:`PI05LLMRunner` runs the prefix forward — paligemma's 18
   decoder layers — at fixed shape ``(B * n_per_sample, hidden_size)``,
   writing per-layer K/V into a :class:`KVCachePool`.
@@ -160,20 +160,23 @@ def _copy_modulation_tables_(
 class PI05VisionRunner(ModelRunner):
     """SigLIP vision-tower runner with optional CUDA-graph capture.
 
-    pi0.5 uses three cameras per inference; the runner is captured at
-    fixed shape ``(3, 3, image_size, image_size)`` and replayed once per
-    robot in the scheduler's batch (``B`` times when ``B > 1``).
+    pi0.5 runs all of a robot's cameras in one tower call; the runner is
+    captured at fixed shape ``(num_images, C, image_size, image_size)`` and
+    replayed once per robot in the scheduler's batch (``B`` times when
+    ``B > 1``). ``num_images`` is fixed at construction (3 for pi05_base).
     """
 
     def __init__(
         self,
         vision_tower: PI05VisionTower,
         *,
+        num_images: int = 3,
         params_dtype: torch.dtype,
         device: torch.device | str,
         use_cuda_graph: bool = True,
     ) -> None:
         self.vision_tower = vision_tower
+        self.num_images = int(num_images)
         self.params_dtype = params_dtype
         self.device = torch.device(device)
         self.use_cuda_graph = bool(use_cuda_graph)
@@ -189,14 +192,15 @@ class PI05VisionRunner(ModelRunner):
             logger,
             logging.INFO,
             "Entering PI05VisionRunner.setup: capturing vision-tower CUDA graph "
-            "at fixed shape (3, %d, %d, %d).",
+            "at fixed shape (%d, %d, %d, %d).",
+            self.num_images,
             self.num_channels,
             self.image_size,
             self.image_size,
         )
         example = {
             "pixel_values": torch.zeros(
-                3,
+                self.num_images,
                 self.num_channels,
                 self.image_size,
                 self.image_size,
