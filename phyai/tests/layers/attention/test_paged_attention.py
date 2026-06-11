@@ -369,12 +369,12 @@ def test_eager_backend_contiguous_offset_slab(flavor: str):
 # --------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("flavor", _PAGED_FLAVORS)
-def test_eager_backend_rejects_non_contiguous_indices(flavor: str):
-    """The eager paged backend must refuse non-contiguous per-sample
-    paged_kv_indices — SDPA-style gather is deliberately not supported."""
-    backend = _factory_for(flavor, "eager")(None)
-    meta = _meta_cls(flavor)(
+def test_diffusion_eager_backend_rejects_non_contiguous_indices():
+    """The diffusion eager backend still requires per-sample contiguous
+    paged_kv_indices (no radix consumer). The AR eager backend gathers
+    instead — see test_ar_eager_backend_gathers_non_contiguous_indices."""
+    backend = get_diffusion_backend_factory("eager")(None)
+    meta = DiffusionAttnMetadata(
         mode=AttnMode.PREFILL,
         layout=AttnLayout.RAGGED_3D,
         batch_size=1,
@@ -422,3 +422,41 @@ def test_ar_and_diffusion_backends_are_independent_classes():
     assert ar_eager is not diff_eager
     assert isinstance(ar_eager(None), ARAttentionBackend)
     assert isinstance(diff_eager(None), DiffusionAttentionBackend)
+
+
+def test_ar_eager_backend_gathers_non_contiguous_indices():
+    """AR eager now gathers arbitrary (radix-reuse) slot layouts; the result
+    matches a recompute over the same logical KV order."""
+    torch.manual_seed(3)
+    H, D, N = 2, 4, 4
+    q = torch.randn(N, H, D)
+    k = torch.randn(N, H, D)
+    v = torch.randn(N, H, D)
+    ref = Attention(
+        num_heads=H, head_dim=D, num_kv_heads=H, causal=False, backend="eager"
+    )
+    ref_out = ref(q, k, v, cu_seqlens_q=torch.tensor([0, N], dtype=torch.int32))
+
+    pool = _make_pool(num_slots=8, num_kv_heads=H, head_dim=D)
+    attn = ARAttention(
+        num_heads=H,
+        head_dim=D,
+        layer_id=0,
+        num_kv_heads=H,
+        causal=False,
+        backend="eager",
+    )
+    slots = torch.tensor([1, 3, 5, 7], dtype=torch.int64)  # non-contiguous
+    ctx = _make_eager_ctx(
+        "ar",
+        pool,
+        cu_seqlens_q=torch.tensor([0, N], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, N], dtype=torch.int32),
+        paged_kv_indices=slots.to(torch.int32),
+        paged_kv_last_page_len=torch.tensor([1], dtype=torch.int32),
+        write_indices=slots,
+        batch_size=1,
+        num_query_tokens=N,
+    )
+    out = attn(q, k, v, ctx)
+    assert torch.allclose(out, ref_out, atol=1e-5)

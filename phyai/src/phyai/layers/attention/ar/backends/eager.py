@@ -1,13 +1,20 @@
 """Pure-PyTorch reference paged-KV attention for the AR (LM-side) stack.
 
-Validates contiguity of ``paged_kv_indices`` per sample at plan
-time and slices ``K_pool[start:start+len]`` directly in
-:meth:`forward` — no gather, no host-side scatter beyond the
-pool's :meth:`KVCachePool.write_kv`.
+Gathers each sample's KV by its ``paged_kv_indices`` — an arbitrary slot
+layout, contiguous static slabs and non-contiguous radix / eviction
+layouts alike — via :meth:`KVCachePool.gather_kv`, then runs the shared
+:func:`eager_attn` reference. CPU/CI only; not graph-captureable.
 
-**Sibling implementation**:
-:class:`phyai.layers.attention.diffusion.backends.eager.EagerDiffusionBackend`.
-Bug fixes here MUST be mirrored to that file.
+The append-prefill causal alignment (``q`` is the tail of ``kv``) is the
+radix prefix-reuse case and is handled by :func:`eager_attn` /
+:func:`build_padded_mask` (``q_pos[i] = i + (S_kv - S_q)``).
+
+**Sibling**:
+:class:`phyai.layers.attention.diffusion.backends.eager.EagerDiffusionBackend`
+still requires per-sample *contiguous* slabs. The two intentionally
+diverge: the AR stack is the radix-cache foundation and must read
+non-contiguous prefix-reuse layouts; the diffusion stack has no radix
+consumer yet.
 """
 
 from __future__ import annotations
@@ -36,17 +43,18 @@ if TYPE_CHECKING:
 class EagerARPlan(ARAttnPlanHandle):
     """Per-step ragged plumbing for :class:`EagerARBackend`.
 
-    Verified-contiguous cache slab boundaries per sample.
+    Carries the query cu-seqlens and the per-sample KV slot lists, read
+    directly via :meth:`KVCachePool.gather_kv` (no contiguity assumption).
     """
 
     cu_seqlens_q: torch.Tensor  # (B+1,) int64
-    kv_starts: torch.Tensor  # (B,) int64 — first slot id per sample
-    kv_lens: torch.Tensor  # (B,) int64 — slot count per sample
+    paged_kv_indptr: torch.Tensor  # (B+1,) int64
+    paged_kv_indices: torch.Tensor  # (sum_kv,) int64
 
 
 @register_backend("eager")
 class EagerARBackend(ARAttentionBackend):
-    """Eager AR attention — contiguous-slab K/V slice + matmul."""
+    """Eager AR attention — gather KV by slot id + masked-softmax matmul."""
 
     def __init__(self, runner: "ModelRunner | None" = None) -> None:
         del runner
@@ -64,32 +72,11 @@ class EagerARBackend(ARAttentionBackend):
                 "EagerARBackend.init_forward_metadata requires cu_seqlens_q, "
                 "paged_kv_indptr, and paged_kv_indices on ARAttnMetadata."
             )
-        cu_q = meta.cu_seqlens_q.to(torch.int64)
-        indptr = meta.paged_kv_indptr.to(torch.int64).tolist()
-        indices = meta.paged_kv_indices.to(torch.int64)
-        B = len(indptr) - 1
-        kv_starts = torch.zeros(B, dtype=torch.int64, device=indices.device)
-        kv_lens = torch.zeros(B, dtype=torch.int64, device=indices.device)
-        for b in range(B):
-            s, e = indptr[b], indptr[b + 1]
-            seg = indices[s:e]
-            n = seg.numel()
-            if n == 0:
-                continue
-            start = int(seg[0].item())
-            expected = torch.arange(
-                start, start + n, dtype=seg.dtype, device=seg.device
-            )
-            if not torch.equal(seg, expected):
-                raise ValueError(
-                    f"EagerARBackend requires contiguous KV slots per "
-                    f"sample; sample {b} has non-contiguous "
-                    f"paged_kv_indices={seg.tolist()}. Use 'flashinfer' "
-                    f"for non-contiguous (radix / eviction) cache layouts."
-                )
-            kv_starts[b] = start
-            kv_lens[b] = n
-        return EagerARPlan(cu_seqlens_q=cu_q, kv_starts=kv_starts, kv_lens=kv_lens)
+        return EagerARPlan(
+            cu_seqlens_q=meta.cu_seqlens_q.to(torch.int64),
+            paged_kv_indptr=meta.paged_kv_indptr.to(torch.int64),
+            paged_kv_indices=meta.paged_kv_indices.to(torch.int64),
+        )
 
     def forward(
         self,
@@ -108,21 +95,20 @@ class EagerARBackend(ARAttentionBackend):
             )
         ctx.kv_pool.write_kv(layer.layer_id, ctx.write_indices, k, v)
         plan = ctx.plan
-        K_pool, V_pool = ctx.kv_pool.kv_buffer(layer.layer_id)
         cu_q = plan.cu_seqlens_q.tolist()
-        kv_starts = plan.kv_starts.tolist()
-        kv_lens = plan.kv_lens.tolist()
+        kv_indptr = plan.paged_kv_indptr.tolist()
+        kv_indices = plan.paged_kv_indices
         out = torch.empty_like(q)
         for b in range(len(cu_q) - 1):
             q_start, q_end = cu_q[b], cu_q[b + 1]
-            kv_start, kv_len = kv_starts[b], kv_lens[b]
             if q_end == q_start:
                 continue
-            if kv_len == 0:
+            kv_lo, kv_hi = kv_indptr[b], kv_indptr[b + 1]
+            if kv_hi == kv_lo:
                 out[q_start:q_end] = 0
                 continue
-            k_seg = K_pool[kv_start : kv_start + kv_len].squeeze(1)
-            v_seg = V_pool[kv_start : kv_start + kv_len].squeeze(1)
+            slots = kv_indices[kv_lo:kv_hi]
+            k_seg, v_seg = ctx.kv_pool.gather_kv(layer.layer_id, slots)
             qi = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
             ki = repeat_kv(
                 k_seg.transpose(0, 1).unsqueeze(0),
