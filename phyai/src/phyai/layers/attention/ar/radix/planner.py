@@ -157,21 +157,23 @@ class RadixAttentionPlanner:
                 # local would let an exception traceback pin it and defeat
                 # rollback's RAII free.
                 seq.suffix_units = self.cache.allocate(self.tier, suffix_units)
+                # ``ids()`` is already a host-side Python list; bounds-check it
+                # here (before building the device tensor) so we never call
+                # ``tensor.max()`` on a CUDA tensor — that forces a GPU->CPU sync
+                # on the per-step hot path.
+                suffix_ids = list(seq.suffix_units.ids())
+                if max(suffix_ids) >= self.num_slots:
+                    raise ValueError(
+                        f"allocated slot id {max(suffix_ids)} >= "
+                        f"kv_pool.num_slots={self.num_slots}; pool smaller than "
+                        f"the cache's device tier."
+                    )
                 suffix_slots = torch.as_tensor(
-                    list(seq.suffix_units.ids()),
-                    dtype=torch.int64,
-                    device=self.device,
+                    suffix_ids, dtype=torch.int64, device=self.device
                 )
             else:
                 suffix_slots = torch.empty(0, dtype=torch.int64, device=self.device)
                 seq.suffix_units = None
-
-            if int(suffix_slots.numel()) and int(suffix_slots.max()) >= self.num_slots:
-                raise ValueError(
-                    f"allocated slot id {int(suffix_slots.max())} >= "
-                    f"kv_pool.num_slots={self.num_slots}; pool smaller than the "
-                    f"cache's device tier."
-                )
 
             seq.prefix_len = prefix_units
             seq.prefix_slots = prefix_slots
