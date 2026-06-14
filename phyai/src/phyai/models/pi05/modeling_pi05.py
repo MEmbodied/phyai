@@ -566,6 +566,7 @@ class PI05VisionTower(nn.Module):
             if prefix
             else "multi_modal_projector",
         )
+
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # Upcast the incoming pixels to the vision compute dtype (bf16 -> fp32
         # on the parity path; a no-op when the tower is bf16), run the tower +
