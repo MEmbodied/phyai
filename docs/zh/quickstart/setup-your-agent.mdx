@@ -40,7 +40,7 @@ Coding Agent 的 skills 位于 `.claude/skills`。它们为复杂任务提供可
 
 | Skill | 位置 | 作用 | 适用场景 |
 | --- | --- | --- | --- |
-| `ncu-report-skill` | `.claude/skills/ncu-report-skill/SKILL.md` | 这个 skill 是 mit-han-lab 的 https://github.com/mit-han-lab/ncu-report-skill/。使用 Nsight Compute 分析 CUDA kernel 性能，重点覆盖 B200 / `sm_100`。它包含 profiling 工作流、harness 模板、报告解析脚本、诊断 playbook 与 Blackwell 参考资料。 | 需要 profile CUDA kernel、解读 `.ncu-rep` 报告、定位性能瓶颈，或制定 kernel 优化方案时使用。 |
+| `ncu-report-skill` | `.claude/skills/ncu-report-skill/SKILL.md` | 这个 skill 是 mit-han-lab 的 https://github.com/mit-han-lab/ncu-report-skill/ 。使用 Nsight Compute 分析 CUDA kernel 性能，重点覆盖 B200 / `sm_100`。它包含 profiling 工作流、harness 模板、报告解析脚本、诊断 playbook 与 Blackwell 参考资料。 | 需要 profile CUDA kernel、解读 `.ncu-rep` 报告、定位性能瓶颈，或制定 kernel 优化方案时使用。 |
 | `phyai-communicate-with-memory` | `.claude/skills/phyai-communicate-with-memory/SKILL.md` | 读取 PhyAI `.memory` 文件或目录，重建历史 agent 会话的工作过程，并将记忆中的主张与代码、git 历史、测试结果相互校验。 | 你提供 `.memory` 产物，并希望理解它做了什么、验证了什么、还遗留了什么问题时使用。 |
 | `phyai-local-env-report` | `.claude/skills/phyai-local-env-report/SKILL.md` | 生成可复现的本地环境报告，覆盖系统、Python、CUDA/GPU、依赖、workspace package、git 状态和 `PHYAI_*` 配置。 | 需要检查或诊断当前 PhyAI 开发/运行环境时使用。 |
 | `phyai-model-arch-research` | `.claude/skills/phyai-model-arch-research/SKILL.md` | 面向模型架构研究，分析论文、模型卡、checkpoint、代码仓库或本地实现，重点关注模块划分、张量形状与 PhyAI 集成风险。 | 你提供论文、模型名、checkpoint、代码仓库或本地代码，并希望得到架构研究或实现导向报告时使用。 |

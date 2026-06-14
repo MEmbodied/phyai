@@ -57,6 +57,24 @@ def resolve_workspace_bytes(override: int | None = None) -> int:
     return get_engine_config().runtime.flashinfer_workspace_bytes
 
 
+def resolve_prefill_backend(override: str | None = None) -> str:
+    """Resolve the flashinfer paged-prefill kernel name for a wrapper.
+
+    Order of precedence: explicit ``override`` ->
+    :class:`~phyai.engine_config.RuntimeConfig.flashinfer_prefill_backend`
+    on the :class:`EngineConfig` singleton (which has already absorbed any
+    ``PHYAI_FLASHINFER_PREFILL_BACKEND`` env override). The config value is
+    ``None`` by default, which maps to flashinfer's ``"auto"`` heuristic;
+    a model that knows its attention shape (see ``PI05RecommendedEngineConfig``)
+    installs a pinned ``"fa2"`` / ``"fa3"`` before its wrappers are built.
+    Returned string is passed straight to the
+    ``BatchPrefillWithPagedKVCacheWrapper(..., backend=...)`` ctor.
+    """
+    if override is not None:
+        return override
+    return get_engine_config().runtime.flashinfer_prefill_backend or "auto"
+
+
 # Process-global flashinfer scratch. Keyed on
 # ``(device.type, device.index)`` so a multi-GPU process gets one
 # buffer per device rather than one buffer total.
@@ -129,5 +147,6 @@ def _reset_global_fi_workspaces() -> None:
 __all__ = [
     "get_global_fi_workspace",
     "register_global_fi_workspace",
+    "resolve_prefill_backend",
     "resolve_workspace_bytes",
 ]

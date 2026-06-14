@@ -49,7 +49,6 @@ from phyai.models.pi05.model_runner_pi05 import (
 )
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.payload import (
-    ExpertForwardBatch,
     LLMForwardBatch,
     VisionForwardBatch,
 )
@@ -60,48 +59,6 @@ from phyai.utils.profile import event_scope
 # ============================================================================ #
 # Batch-layout helpers — pi0.5 specific, only consumed by step() below.        #
 # ============================================================================ #
-
-
-def pack_prefix_per_sample_padded(
-    image_embs: torch.Tensor,
-    lang_embs: torch.Tensor,
-    lang_lens: torch.Tensor,
-    *,
-    n_per_sample: int,
-    image_lens: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Assemble per-sample-padded ``(B * n_per_sample, D)`` prefix buffer.
-
-    Per sample ``b`` the layout is
-    ``[image_b[:image_lens[b]], lang_b[:lang_lens[b]], padding (rest)]``
-    where ``max_N_img + tokenizer_max_length == n_per_sample`` and the
-    padding region holds zeros. The LLM runner is captured at fixed
-    shape, so padding rows are required even though they will write K/V
-    to the sentinel slot.
-
-    Padded *samples* (``b >= actual_B``) are produced by the caller
-    setting ``lang_lens[b] = 0`` and zero-filling ``image_embs[b]`` —
-    pack still walks them, but only writes the (zero) image block; their
-    rows are routed to sentinel by ``build_prefix_padded_write_indices``.
-    """
-    B = image_embs.shape[0]
-    n_img = image_embs.shape[1]
-    D = image_embs.shape[-1]
-    device = image_embs.device
-    dtype = image_embs.dtype
-
-    packed = torch.zeros(B * n_per_sample, D, dtype=dtype, device=device)
-    lang_lens_list = lang_lens.tolist()
-    image_lens_list = [n_img] * B if image_lens is None else image_lens.tolist()
-    for b in range(B):
-        L_img = int(image_lens_list[b])
-        L_lang = int(lang_lens_list[b])
-        base = b * n_per_sample
-        if L_img > 0:
-            packed[base : base + L_img] = image_embs[b, :L_img]
-        if L_lang > 0:
-            packed[base + L_img : base + L_img + L_lang] = lang_embs[b, :L_lang]
-    return packed
 
 
 def build_prefix_padded_write_indices(
@@ -161,6 +118,7 @@ def build_joint_paged_kv_indices(
     *,
     prefix_slot_base: int,
     suffix_slot_base: int,
+    n_full: int | None = None,
 ) -> torch.Tensor:
     """Per-sample interleaved slot list for the joint-attention wrapper.
 
@@ -173,6 +131,10 @@ def build_joint_paged_kv_indices(
     Padded samples (``real_len_b == 0``) contribute only their suffix
     slots — the expert step for those rows self-attends within its own
     chunk, with no real-prefix participation.
+
+    ``n_full`` may be supplied (``sum(real_lens) + B * chunk_size``) when
+    the caller already knows it on the host, to skip the blocking
+    ``int(cu_full[-1])`` device→host read.
     """
     device = real_lens.device
     B = int(real_lens.shape[0])
@@ -183,7 +145,8 @@ def build_joint_paged_kv_indices(
     full_lens = real64 + chunk_size
     cu_full = torch.zeros(B + 1, dtype=torch.int64, device=device)
     cu_full[1:] = torch.cumsum(full_lens, 0)
-    n_full = int(cu_full[-1])
+    if n_full is None:
+        n_full = int(cu_full[-1])
 
     arange_full = torch.arange(n_full, dtype=torch.int64, device=device)
     seg_id = torch.searchsorted(cu_full[1:], arange_full, right=True)
@@ -198,12 +161,19 @@ def build_joint_paged_kv_indices(
 
 @dataclass
 class PI05Request:
-    """One pi0.5 inference request.
+    """One pi0.5 inference request — canonical, already-preprocessed tensors.
 
-    ``pixel_values`` carries every robot's camera images stacked along
-    the camera axis: shape ``(B, Cams, 3, H, W)`` — ``B`` robots x camera
-    count x 3 channels x ``image_size``x``image_size``. ``B`` may be any
-    value in ``[1, max_batch_size]`` (the scheduler pads up internally).
+    ``phyai`` is strict about inputs: image resize/normalize, tokenization, and
+    state discretization happen in the caller's processor
+    (``phyai_utils_tools.models.pi05.PI05Processor``), **not** here. The
+    scheduler accepts only the canonical tensors that processor produces:
+
+    ``pixel_values`` is the stacked camera tensor
+    ``(B, num_images, C, image_size, image_size)`` — already resized to the
+    SigLIP grid, on the model device/dtype. ``num_images`` is fixed at scheduler
+    construction; ``B`` may be any value in ``[1, max_batch_size]`` (the
+    scheduler pads up internally). H/W must equal ``image_size`` (validated; no
+    resize is performed).
 
     ``input_ids`` is the padded language-token tensor (``(B,
     tokenizer_max_length)`` int64); ``lang_lens`` carries the
@@ -222,15 +192,26 @@ class PI05Request:
 
 @dataclass
 class _PI05Layout:
-    """Cached attention layout for one request shape.
+    """Per-``(actual_B, lang_lens)`` attention layout, cached across steps.
 
-    The key includes both image lengths and language lengths so two-camera
-    and three-camera requests never share an incompatible layout.
+    Everything here depends only on the batch shape and the per-sample
+    real lengths — not on the image/text *values* — so for a fixed
+    request shape it is identical on every ``step()`` and across the 10
+    Euler steps. Building it once and reusing it eliminates the
+    per-step metadata rebuild and (more importantly) the host↔device
+    syncs that used to serialize the pipeline (``int(real_lens.sum())``,
+    ``int(cu_full[-1])``, the ``lang_lens.tolist()`` pack loop).
+
+    ``lang_mask`` is the ``(max_B, tokenizer_max_length)`` bool mask used
+    by the vectorized prefix pack (real lang positions True, padding
+    False). ``n_real_total`` is the host-side count of real prefix tokens.
     """
 
     n_real_total: int
+    n_per_sample: int
     position_ids: torch.Tensor
     write_indices: torch.Tensor
+    lang_mask: torch.Tensor
     prefix_meta: ARAttnMetadata
     joint_meta: DiffusionAttnMetadata
 
@@ -243,6 +224,7 @@ class PI05WS1Scheduler(Scheduler):
         model: PI05Model,
         *,
         max_batch_size: int = 1,
+        num_images: int = 3,
         device: torch.device | str | None = None,
         use_cuda_graph: bool = True,
     ) -> None:
@@ -255,13 +237,30 @@ class PI05WS1Scheduler(Scheduler):
         self.max_batch_size = int(max_batch_size)
         if self.max_batch_size <= 0:
             raise ValueError(f"max_batch_size must be positive, got {max_batch_size}.")
+        self.num_images = int(num_images)
+        if self.num_images <= 0:
+            raise ValueError(f"num_images must be positive, got {num_images}.")
         self.model = model
 
-        # Layout knobs. Allocate prefix capacity for up to three cameras; each
-        # request may provide two or three camera streams.
-        self.max_cameras = 3
-        self.image_token_count = cfg.vision.num_patches * self.max_cameras
+        # Layout knobs.
+        self.image_token_count = cfg.vision.num_patches * self.num_images
         self.n_per_sample = self.image_token_count + cfg.tokenizer_max_length
+
+        # Prefix-length buckets. Each LLM prefix runs at a fixed graph
+        # shape, so instead of always padding the lang budget to
+        # ``tokenizer_max_length`` (wasting LLM GEMM work on padding rows),
+        # we capture one graph per bucket and pad up to the smallest bucket
+        # >= the real lang length. ``_lang_buckets`` are lang-token counts
+        # (capped at and always including ``tokenizer_max_length`` as the
+        # fallback); ``_n_per_sample_buckets`` are the matching prefix
+        # lengths the LLM runner captures graphs for.
+        tok_max = cfg.tokenizer_max_length
+        self._lang_buckets = sorted(
+            {b for b in (16, 48, 112) if 0 < b < tok_max} | {tok_max}
+        )
+        self._n_per_sample_buckets = [
+            self.image_token_count + b for b in self._lang_buckets
+        ]
 
         # KVCachePool: sentinel slot 0 + prefix slab + suffix slab.
         # Sized for ``max_batch_size``; smaller actual batches reuse a
@@ -298,6 +297,7 @@ class PI05WS1Scheduler(Scheduler):
         # graphs run at constant shape.
         self.vision_runner = PI05VisionRunner(
             model.vision,
+            num_images=self.num_images,
             params_dtype=self.params_dtype,
             device=self.device,
             use_cuda_graph=use_cuda_graph,
@@ -337,12 +337,16 @@ class PI05WS1Scheduler(Scheduler):
         # broadcast to ``(max_B, expert_hidden)`` via ``expand`` and fed
         # straight to the expert runner's captured input buffer.
         self.time_emb_table: torch.Tensor | None = None
-        self._layout_cache: dict[
-            tuple[int, tuple[int, ...], tuple[int, ...]], _PI05Layout
-        ] = {}
-        self._last_layout_key: tuple[int, tuple[int, ...], tuple[int, ...]] | None = (
-            None
-        )
+
+        # Attention-layout cache, keyed by (actual_B, tuple(lang_lens)).
+        # A fixed request shape hits the cache on every step, so the
+        # metadata is built (and the flashinfer wrappers re-planned) only
+        # when the shape actually changes. ``_last_layout_key`` gates the
+        # per-step ``plan_inference`` calls: when the layout is unchanged
+        # the wrappers' static buffers already hold the right values, so
+        # re-planning (and its host sync) is skipped entirely.
+        self._layout_cache: dict[tuple, _PI05Layout] = {}
+        self._last_layout_key: tuple | None = None
 
     # ------------------------------------------------------------------ #
     # Setup                                                              #
@@ -354,11 +358,29 @@ class PI05WS1Scheduler(Scheduler):
         Must be called **after** ``load_pretrained`` — :attr:`time_emb_table`
         is computed here from the (now-real) ``time_mlp_in/out`` weights,
         so calling this on freshly-allocated weights would bake garbage
-        values into the table.
+        values into the table. The table (and the Euler schedule) is bound
+        to the expert runner **before** it captures, because the expert
+        graph now unrolls the whole denoise loop and reads the table
+        in-graph.
         """
         self.vision_runner.setup()
-        self.llm_runner.setup()
-        self.expert_runner.setup()
+        self.llm_runner.setup(self._n_per_sample_buckets)
+
+        # Precompute the time-embedding table for the linear flow-matching
+        # schedule ``t = 1.0 + step * (-1/N)``. ``embed_time`` is the full
+        # MLP (sinusoidal -> Linear -> SiLU -> Linear -> SiLU); its output
+        # depends only on the time scalar and the time-MLP weights, both
+        # fixed across inferences, so a one-time precompute keeps those
+        # matmuls out of the captured Euler loop.
+        N = self.cfg.num_inference_steps
+        ts = 1.0 + torch.arange(N, dtype=torch.float32, device=self.device) * (-1.0 / N)
+        with torch.no_grad():
+            self.time_emb_table = self.model.heads.embed_time(ts).contiguous()
+        # Bind the schedule before the expert runner captures: its graph
+        # unrolls all N steps and reads ``time_emb_table[step]`` in-graph.
+        self.expert_runner.bind_euler_schedule(
+            self.time_emb_table, dt=-1.0 / N, num_steps=N
+        )
 
         # Suffix write indices are constant — bind them once, sized for
         # max_batch_size. Sample ``b``'s chunk_size tokens write to
@@ -374,16 +396,9 @@ class PI05WS1Scheduler(Scheduler):
         )
         self.expert_runner.set_write_indices(write_indices_suffix)
 
-        # Precompute the time-embedding table for the linear flow-matching
-        # schedule ``t = 1.0 + step * (-1/N)``. ``embed_time`` is the full
-        # MLP (sinusoidal -> Linear -> SiLU -> Linear -> SiLU); its output
-        # depends only on the time scalar and the time-MLP weights, both
-        # fixed across inferences, so a one-time precompute eliminates
-        # the matmuls from every Euler step's captured graph.
-        N = self.cfg.num_inference_steps
-        ts = 1.0 + torch.arange(N, dtype=torch.float32, device=self.device) * (-1.0 / N)
-        with torch.no_grad():
-            self.time_emb_table = self.model.heads.embed_time(ts).contiguous()
+        # Capture the expert graph last — the schedule + write indices it
+        # reads in-graph must already be bound above.
+        self.expert_runner.setup()
 
     # ------------------------------------------------------------------ #
     # Step (one inference)                                               #
@@ -406,35 +421,30 @@ class PI05WS1Scheduler(Scheduler):
         actual_B = int(request.pixel_values.shape[0])
         max_B = self.max_batch_size
 
-        # Build per-sample real_lens with explicit zeros for the padded
-        # tail. Zero entries make ``build_prefix_padded_write_indices``
-        # route every padded q-row to the sentinel slot and make
-        # ``build_joint_paged_kv_indices`` emit zero real-prefix slots
-        # for those samples. flashinfer's wrapper interprets the
-        # zero-length per-sample K segment as an empty attend set —
-        # padded q-rows then produce zeros (or NaNs that we discard).
-        # No K/V written to slot 0 is ever read by attention.
-        lang_lens_actual = request.lang_lens.to(device=device, dtype=torch.int32)
-        num_cameras = int(request.pixel_values.shape[1])
-        tokens_per_camera = cfg.vision.num_patches
-        image_lens_actual = torch.full(
-            (actual_B,),
-            num_cameras * tokens_per_camera,
-            dtype=torch.int32,
-            device=device,
-        )
-        real_lens = torch.zeros(max_B, dtype=torch.int32, device=device)
-        image_lens = torch.zeros(max_B, dtype=torch.int32, device=device)
-        image_lens[:actual_B] = image_lens_actual
-        real_lens[:actual_B] = lang_lens_actual + image_lens_actual
+        # Resolve the attention layout for this request shape. It depends
+        # only on (actual_B, per-sample real lengths) — not on the image /
+        # text values — so a fixed request shape hits the cache on every
+        # step and across all 10 Euler steps. Reading ``lang_lens`` to the
+        # host (one tiny sync for the key) replaces the several large syncs
+        # the per-step rebuild used to incur; a cache hit rebuilds nothing.
+        lang_lens_cpu = tuple(int(x) for x in request.lang_lens.tolist())
+        n_per_sample = self._bucket_n_per_sample(max(lang_lens_cpu, default=0))
+        key = (actual_B, lang_lens_cpu)
+        layout = self._layout_cache.get(key)
+        if layout is None:
+            layout = self._build_layout(actual_B, lang_lens_cpu, n_per_sample)
+            self._layout_cache[key] = layout
+        plan_changed = key != self._last_layout_key
 
-        # 1. Vision pass — run the supplied camera stack once
-        # per real robot. The runner's output aliases its static buffer,
+        # 1. Vision pass — replay the captured (num_images, C, H, W) graph
+        # once per real robot. The runner's output aliases its static buffer,
         # so we eagerly copy each replay into a pre-allocated
         # ``(max_B, image_token_count, D)`` slot before the next replay
         # overwrites it. Padded rows stay zero (their image embeddings
         # are written into the packed prefix at sentinel-routed rows,
-        # so the values don't propagate anywhere).
+        # so the values don't propagate anywhere). ``pixel_values`` is the
+        # caller's canonical, already-resized tensor; we only move it to the
+        # model device/dtype here (no resize — phyai is strict).
         with event_scope("pi05.vision_loop"):
             pixel_values = request.pixel_values.to(device=device, dtype=dtype)
             image_embs: torch.Tensor | None = None
@@ -447,13 +457,14 @@ class PI05WS1Scheduler(Scheduler):
                     image_embs = torch.zeros(
                         max_B, *flat.shape, dtype=flat.dtype, device=flat.device
                     )
-                image_embs[b, : flat.shape[0]] = flat
+                image_embs[b] = flat
             assert image_embs is not None  # actual_B >= 1 enforced by _validate
 
-        # 2. Lang embed (eager) + per-sample padded packing. input_ids
-        # and lang_lens are zero-padded along dim 0 for the unused
-        # samples; lang_lens=0 for padded means pack writes nothing
-        # from those rows beyond their (zero) image block.
+        # 2. Lang embed (eager) + vectorized per-sample padded packing.
+        # The pack is a fixed-stride scatter (image block then a
+        # mask-zeroed lang block) driven by the cached ``lang_mask`` — no
+        # host sync, no Python per-sample loop, bit-identical to the old
+        # per-sample gather.
         with event_scope("pi05.lang_pack"):
             if actual_B < max_B:
                 input_ids_padded = torch.zeros(
@@ -462,37 +473,20 @@ class PI05WS1Scheduler(Scheduler):
                 input_ids_padded[:actual_B] = request.input_ids.to(
                     device=device, dtype=torch.int64
                 )
-                lang_lens_padded = torch.zeros(max_B, dtype=torch.int64, device=device)
-                lang_lens_padded[:actual_B] = lang_lens_actual.to(torch.int64)
             else:
                 input_ids_padded = request.input_ids.to(
                     device=device, dtype=torch.int64
                 )
-                lang_lens_padded = lang_lens_actual.to(torch.int64)
 
             lang_embs = self.model.paligemma_lm.embed_lang(input_ids_padded)
             if lang_embs.dtype != dtype:
                 lang_embs = lang_embs.to(dtype)
-            packed = pack_prefix_per_sample_padded(
-                image_embs,
-                lang_embs,
-                lang_lens_padded,
-                n_per_sample=self.n_per_sample,
-                image_lens=image_lens,
-            )
+            packed = self._pack_prefix(image_embs, lang_embs, layout)
 
-        image_lens_cpu = tuple(int(x) for x in image_lens[:actual_B].tolist())
-        lang_lens_cpu = tuple(int(x) for x in lang_lens_actual.tolist())
-        layout_key = (actual_B, image_lens_cpu, lang_lens_cpu)
-        layout = self._layout_cache.get(layout_key)
-        if layout is None:
-            layout = self._build_layout(actual_B, image_lens_cpu, lang_lens_cpu)
-            self._layout_cache[layout_key] = layout
-        plan_changed = layout_key != self._last_layout_key
-
-        # 3. Reset cache cursors and plan attention only when the request
-        # layout changes. Cached metadata remains valid because it depends on
-        # lengths, not on image/text values.
+        # 3. Plan the prefix layout — only when the layout changed. The
+        # flashinfer wrapper keeps its planned buffers across steps
+        # (use_cuda_graph=True), so an unchanged layout needs no re-plan
+        # and incurs no host sync.
         with event_scope("pi05.llm_prefix_plan"):
             if plan_changed:
                 self.prefix_static.reset()
@@ -501,26 +495,40 @@ class PI05WS1Scheduler(Scheduler):
                 _ = self.suffix_static.allocate(max_B * cfg.chunk_size)
                 self.llm_runner.plan_inference(layout.prefix_meta)
 
-        # 4. Prefix forward — populates the cache pool.
+        # 4. Prefix forward — populates the cache pool. ``packed`` is a
+        # fresh contiguous tensor; the runner's ``replay`` will copy it
+        # into the captured input buffer, so no scheduler-side staging.
+        # Attention metadata was already staged on the runner via
+        # ``plan_inference`` above; the batch carries only the per-call
+        # variable inputs.
         with event_scope("pi05.llm_prefix_fwd"):
             llm_batch = LLMForwardBatch(
                 hidden_states=packed,
                 position_ids=layout.position_ids,
                 write_indices=layout.write_indices,
             )
-            self.llm_runner.forward(llm_batch)
+            self.llm_runner.forward(llm_batch, n_per_sample=layout.n_per_sample)
 
-        # 5. Plan the expert runner's joint-attention metadata only when the
-        # per-sample prefix lengths changed.
+        # 5. Plan the expert joint-attention metadata — same gating as the
+        # prefix: only re-plan when the layout changed.
         with event_scope("pi05.expert_plan"):
             if plan_changed:
                 self.expert_runner.plan_inference(layout.joint_meta)
-        self._last_layout_key = layout_key
+        self._last_layout_key = key
 
-        # 6. Sample noise (or use the user's, padded) and run 10-step Euler.
+        # 6. Sample noise (or use the user's, padded) and run the whole
+        # Euler loop as one captured-graph replay. The expert runner
+        # unrolls all N denoise steps internally — reading the bound
+        # time-embedding table in-graph and applying ``x_t <- x_t + dt*v_t``
+        # — so the scheduler just hands it the initial noise.
         with event_scope("pi05.expert_loop"):
+            if self.time_emb_table is None:
+                raise RuntimeError(
+                    "PI05WS1Scheduler.step() called before setup(); "
+                    "the time-embedding lookup table has not been built."
+                )
             if request.noise is None:
-                x_t = torch.randn(
+                noise = torch.randn(
                     max_B,
                     cfg.chunk_size,
                     cfg.max_action_dim,
@@ -528,66 +536,78 @@ class PI05WS1Scheduler(Scheduler):
                     device=device,
                 )
             else:
-                x_t = torch.zeros(
+                noise = torch.zeros(
                     max_B,
                     cfg.chunk_size,
                     cfg.max_action_dim,
                     dtype=dtype,
                     device=device,
                 )
-                x_t[:actual_B] = request.noise.to(device=device, dtype=dtype)
-
-            if self.time_emb_table is None:
-                raise RuntimeError(
-                    "PI05WS1Scheduler.step() called before setup(); "
-                    "the time-embedding lookup table has not been built."
-                )
-
-            dt = -1.0 / cfg.num_inference_steps
-            for step in range(cfg.num_inference_steps):
-                with event_scope("pi05.expert_step"):
-                    # Look up the precomputed AdaRMS condition for this step's t
-                    # and broadcast across all max_B samples (all batch elements
-                    # share the same t in this scheduler). The expand view is fed
-                    # straight to the expert runner — its ``replay`` materializes
-                    # the broadcast into the captured input buffer.
-                    time_emb = self.time_emb_table[step : step + 1].expand(max_B, -1)
-                    expert_batch = ExpertForwardBatch(x_t=x_t, time_emb=time_emb)
-                    v_t = self.expert_runner.forward(expert_batch)
-                    # Capture-time output buffer is reused; clone is implicit
-                    # via the addition (allocates a fresh tensor each step,
-                    # which we then bind to ``x_t`` for the next iteration).
-                    x_t = x_t + dt * v_t.to(x_t.dtype)
-        # Drop the padded tail before returning.
-        return x_t[:actual_B]
+                noise[:actual_B] = request.noise.to(device=device, dtype=dtype)
+            x_t = self.expert_runner.forward(noise)
+        # ``x_t`` aliases the captured graph's static output buffer — clone
+        # it (and drop the padded tail) so the result survives the next step.
+        return x_t[:actual_B].clone()
 
     # ------------------------------------------------------------------ #
-    # Layout cache                                                       #
+    # Layout build + pack (cached, sync-free)                            #
     # ------------------------------------------------------------------ #
+
+    def _bucket_n_per_sample(self, max_lang: int) -> int:
+        """Per-sample prefix length for the smallest bucket covering ``max_lang``.
+
+        ``max_lang`` is the largest real lang length in the request. Picks
+        the smallest ``_lang_buckets`` entry ``>= max_lang`` (falling back
+        to ``tokenizer_max_length``) and adds the image-token count.
+        """
+        lang_bucket = next(
+            (b for b in self._lang_buckets if b >= max_lang),
+            self.cfg.tokenizer_max_length,
+        )
+        return self.image_token_count + lang_bucket
 
     def _build_layout(
-        self,
-        actual_B: int,
-        image_lens_cpu: tuple[int, ...],
-        lang_lens_cpu: tuple[int, ...],
+        self, actual_B: int, lang_lens_cpu: tuple[int, ...], n_per_sample: int
     ) -> _PI05Layout:
+        """Build the attention layout for ``(actual_B, lang_lens_cpu)``.
+
+        ``n_per_sample`` is the per-sample prefix length for the chosen
+        length bucket (``image_token_count + lang_bucket``); the lang
+        budget ``lang_bucket = n_per_sample - image_token_count`` must be
+        ``>= max(lang_lens_cpu)`` so no real lang token is dropped.
+
+        Every per-sample scalar comes from ``lang_lens_cpu`` (host ints),
+        so this is free of device→host syncs even on a cache miss. Padded
+        samples (``b >= actual_B``) get ``real_len = 0`` — their q-rows
+        route to the sentinel slot and contribute no real-prefix K/V, so
+        no real token ever attends to them.
+        """
         cfg = self.cfg
         device = self.device
         max_B = self.max_batch_size
+        n_img = self.image_token_count
+        n_ps = n_per_sample
+        chunk = cfg.chunk_size
+        lang_bucket = n_ps - n_img
 
         real_list = [0] * max_B
+        lang_list = [0] * max_B
         for b in range(actual_B):
-            real_list[b] = image_lens_cpu[b] + lang_lens_cpu[b]
-
+            lang_list[b] = lang_lens_cpu[b]
+            real_list[b] = lang_lens_cpu[b] + n_img
         n_real_total = sum(real_list)
         real_lens = torch.tensor(real_list, dtype=torch.int32, device=device)
 
+        # Vectorized-pack mask over this bucket's lang budget: real lang
+        # positions True, padding False.
+        lang_lens_t = torch.tensor(lang_list, dtype=torch.int64, device=device)
+        lang_mask = (
+            torch.arange(lang_bucket, device=device)[None, :] < lang_lens_t[:, None]
+        )
+
+        # --- Prefix (LLM self-attention) layout ---
         cu_q_prefix = torch.arange(
-            0,
-            (max_B + 1) * self.n_per_sample,
-            self.n_per_sample,
-            dtype=torch.int32,
-            device=device,
+            0, (max_B + 1) * n_ps, n_ps, dtype=torch.int32, device=device
         )
         paged_kv_indptr_prefix = torch.zeros(
             max_B + 1, dtype=torch.int32, device=device
@@ -602,18 +622,18 @@ class PI05WS1Scheduler(Scheduler):
         paged_kv_last_prefix = (real_lens > 0).to(torch.int32)
         write_indices = build_prefix_padded_write_indices(
             real_lens,
-            n_per_sample=self.n_per_sample,
+            n_per_sample=n_ps,
             prefix_slot_base=self.prefix_base,
             sentinel_slot=self.sentinel_slot,
         )
-        position_ids = torch.arange(
-            self.n_per_sample, dtype=torch.int32, device=device
-        ).repeat(max_B)
+        position_ids = torch.arange(n_ps, dtype=torch.int32, device=device).repeat(
+            max_B
+        )
         prefix_meta = ARAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=max_B,
-            num_query_tokens=max_B * self.n_per_sample,
+            num_query_tokens=max_B * n_ps,
             cu_seqlens_q=cu_q_prefix,
             paged_kv_indptr=paged_kv_indptr_prefix,
             paged_kv_indices=paged_kv_indices_prefix,
@@ -622,28 +642,29 @@ class PI05WS1Scheduler(Scheduler):
             position_ids=position_ids,
         )
 
-        pos_ids_suffix = build_suffix_pos_ids(real_lens, cfg.chunk_size)
+        # --- Joint (expert) attention layout ---
+        pos_ids_suffix = build_suffix_pos_ids(real_lens, chunk)
         cu_q_suffix = torch.arange(
-            0,
-            (max_B + 1) * cfg.chunk_size,
-            cfg.chunk_size,
-            dtype=torch.int32,
-            device=device,
+            0, (max_B + 1) * chunk, chunk, dtype=torch.int32, device=device
         )
         paged_kv_indptr_full = torch.zeros(max_B + 1, dtype=torch.int32, device=device)
-        paged_kv_indptr_full[1:] = torch.cumsum(real_lens + cfg.chunk_size, 0)
+        paged_kv_indptr_full[1:] = torch.cumsum(real_lens + chunk, 0)
+        # Host-side total joint length — passing it skips the blocking
+        # ``int(cu_full[-1])`` read inside build_joint_paged_kv_indices.
+        n_full = n_real_total + max_B * chunk
         paged_kv_indices_full = build_joint_paged_kv_indices(
             real_lens,
-            cfg.chunk_size,
+            chunk,
             prefix_slot_base=self.prefix_base,
             suffix_slot_base=self.suffix_base,
+            n_full=n_full,
         )
         paged_kv_last_full = torch.ones(max_B, dtype=torch.int32, device=device)
         joint_meta = DiffusionAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=max_B,
-            num_query_tokens=max_B * cfg.chunk_size,
+            num_query_tokens=max_B * chunk,
             cu_seqlens_q=cu_q_suffix,
             paged_kv_indptr=paged_kv_indptr_full,
             paged_kv_indices=paged_kv_indices_full,
@@ -653,33 +674,84 @@ class PI05WS1Scheduler(Scheduler):
 
         return _PI05Layout(
             n_real_total=n_real_total,
+            n_per_sample=n_ps,
             position_ids=position_ids,
             write_indices=write_indices,
+            lang_mask=lang_mask,
             prefix_meta=prefix_meta,
             joint_meta=joint_meta,
         )
+
+    def _pack_prefix(
+        self,
+        image_embs: torch.Tensor,
+        lang_embs: torch.Tensor,
+        layout: _PI05Layout,
+    ) -> torch.Tensor:
+        """Vectorized per-sample-padded prefix pack at the layout's bucket.
+
+        Per sample the layout is ``[image (n_img), lang[:L_lang], pad]``
+        over ``layout.n_per_sample`` rows. The image block is a
+        fixed-stride copy; the lang block is ``lang_embs`` truncated to the
+        bucket's lang budget and zeroed past each sample's real length via
+        ``layout.lang_mask`` (multiply by a {0,1} mask — exact in IEEE, so
+        real-token rows are bit-identical to the old per-sample gather).
+        """
+        max_B = self.max_batch_size
+        n_ps = layout.n_per_sample
+        n_img = self.image_token_count
+        lang_bucket = n_ps - n_img
+        D = image_embs.shape[-1]
+        packed = torch.zeros(
+            max_B * n_ps, D, dtype=image_embs.dtype, device=image_embs.device
+        )
+        pv = packed.view(max_B, n_ps, D)
+        pv[:, :n_img] = image_embs
+        mask = layout.lang_mask.to(lang_embs.dtype)[
+            ..., None
+        ]  # (max_B, lang_bucket, 1)
+        pv[:, n_img:] = lang_embs[:, :lang_bucket] * mask
+        return packed
 
     # ------------------------------------------------------------------ #
     # Validation                                                         #
     # ------------------------------------------------------------------ #
 
     def _validate(self, req: PI05Request) -> None:
+        """Strictly validate the canonical request tensors.
+
+        ``phyai`` is strict: it does not resize or reshape. ``pixel_values``
+        must already be the stacked canonical tensor
+        ``(B, num_images, C, image_size, image_size)``; this checks the camera
+        count, H/W, batch-dim bound, and that the text / noise tensors agree
+        with the batch size. Resizing non-square inputs is the caller's
+        processor's job (``phyai_utils_tools.models.pi05.PI05Processor``).
+        """
         cfg = self.cfg
+        if req.pixel_values.dim() != 5:
+            raise ValueError(
+                f"pixel_values must be 5-D (B, num_images, C, image_size, "
+                f"image_size); got shape {tuple(req.pixel_values.shape)}."
+            )
         actual_B = int(req.pixel_values.shape[0])
         if not 1 <= actual_B <= self.max_batch_size:
             raise ValueError(
                 f"pixel_values batch dim {actual_B} not in "
                 f"[1, max_batch_size={self.max_batch_size}]."
             )
-        num_cameras = int(req.pixel_values.shape[1])
-        if num_cameras not in {2, 3}:
+        if req.pixel_values.shape[1] != self.num_images:
             raise ValueError(
-                f"pixel_values must have 2 or 3 cameras, got {num_cameras}."
+                f"pixel_values has {req.pixel_values.shape[1]} cameras, "
+                f"expected num_images={self.num_images}."
             )
-        if req.pixel_values.shape[-1] != cfg.vision.image_size:
+        if req.pixel_values.shape[-2:] != (
+            cfg.vision.image_size,
+            cfg.vision.image_size,
+        ):
             raise ValueError(
-                f"pixel_values H/W {req.pixel_values.shape[-2:]} != "
-                f"image_size {cfg.vision.image_size}."
+                f"pixel_values H/W {tuple(req.pixel_values.shape[-2:])} != "
+                f"(image_size, image_size)=({cfg.vision.image_size}, "
+                f"{cfg.vision.image_size}). Resize in the caller's processor."
             )
         if req.input_ids.shape != (actual_B, cfg.tokenizer_max_length):
             raise ValueError(

@@ -14,7 +14,7 @@ measurement, not correctness.
 
 Run::
 
-    LD_LIBRARY_PATH=/usr/local/cuda-13.1/compat/lib uv run python \\
+    uv run python \\
         benchmark/bench_n_batch_ws1_pi05.py \\
         --checkpoint /path/to/pi05_base \\
         --batch-sizes 1 2 4 --n-warmup 5 --n-timed 30 \\
@@ -81,6 +81,7 @@ _DTYPES = {
 def make_dummy_request(
     *,
     batch_size: int,
+    num_images: int,
     plugin_cfg: PI05Config,
     device: torch.device,
     dtype: torch.dtype,
@@ -88,7 +89,7 @@ def make_dummy_request(
     """Random pixels + single-token prompt PI05Request for ``batch_size`` robots."""
     pixel_values = torch.rand(
         batch_size,
-        3,
+        num_images,
         3,
         plugin_cfg.vision.image_size,
         plugin_cfg.vision.image_size,
@@ -113,6 +114,8 @@ def make_setup_fn(
     dtype: torch.dtype,
     device_target: str,
     use_cuda_graph: bool,
+    num_images: int = 3,
+    vision_params_dtype: torch.dtype | None = None,
 ):
     """Build the per-batch-size ``setup_fn`` closure for :class:`NBatchBenchRunner`.
 
@@ -122,6 +125,10 @@ def make_setup_fn(
     """
     plugin_cfg = load_config(checkpoint, PI05Config)
     device = torch.device(device_target)
+    inputs_image_shape = [
+        [plugin_cfg.vision.image_size, plugin_cfg.vision.image_size, 3]
+        for _ in range(num_images)
+    ]
 
     def setup_fn(batch_size: int) -> bnb.BenchSpec:
         engine = Engine(
@@ -130,6 +137,8 @@ def make_setup_fn(
                 plugin_args=PI05Args(
                     checkpoint_dir=checkpoint,
                     max_batch_size=batch_size,
+                    vision_params_dtype=vision_params_dtype,
+                    inputs_image_shape=inputs_image_shape,
                 ),
                 config=EngineConfig(
                     device=DeviceConfig(target=device_target, params_dtype=dtype),
@@ -139,6 +148,7 @@ def make_setup_fn(
         )
         request = make_dummy_request(
             batch_size=batch_size,
+            num_images=num_images,
             plugin_cfg=plugin_cfg,
             device=device,
             dtype=dtype,
@@ -203,6 +213,21 @@ def main() -> None:
         action="store_true",
         help="Disable CUDA graph capture (engine still runs, just no replay).",
     )
+    parser.add_argument(
+        "--num-images",
+        type=int,
+        default=3,
+        help="Number of cameras per robot (default 3, the pi05_base contract).",
+    )
+    parser.add_argument(
+        "--vision-dtype",
+        choices=("bfloat16", "float32"),
+        default="bfloat16",
+        help=(
+            "Vision tower compute precision. 'float32' runs SigLIP + projector "
+            "in fp32 (openpi/lerobot parity) while the rest stays at --dtype."
+        ),
+    )
 
     bnb.add_bench_cli_args(parser)
     add_profile_cli_args(parser)
@@ -227,6 +252,8 @@ def main() -> None:
         dtype=dtype,
         device_target=args.device,
         use_cuda_graph=use_cuda_graph,
+        num_images=args.num_images,
+        vision_params_dtype=(torch.float32 if args.vision_dtype == "float32" else None),
     )
     extras_fn = make_extras_fn(
         dtype_name=args.dtype,

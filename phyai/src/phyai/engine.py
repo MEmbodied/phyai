@@ -39,17 +39,44 @@ add one import line at the bottom of this file.
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
+from torch import nn
 
 import phyai.layers.linear as L
 import phyai.parallel as P
 from phyai.engine_config import EngineConfig, init_engine_config
 from phyai.parallel.dist import init_dist
+from phyai.runtime.tensor_dump import (
+    TensorDumper,
+    load_filter_fn,
+    register_tensor_dumper,
+)
+from phyai.utils import this_rank_log
 from phyai.utils.cuda import init_cublas, init_cuda
+
+
+logger = logging.getLogger(__name__)
+
+
+def _force_eager_for_dump(cfg: EngineConfig) -> EngineConfig:
+    """Return ``cfg`` with ``use_cuda_graph`` forced off for tensor dumping.
+
+    The forward-hook tensor dumper records module outputs from Python
+    callbacks, which never run during a captured CUDA-graph replay. So
+    activation capture is only possible in eager mode — when a dump
+    directory is configured the engine routes the config through here
+    before building any runner. Returns ``cfg`` unchanged when it is
+    already eager (so the caller can detect whether a flip happened by
+    identity).
+    """
+    if not cfg.runtime.use_cuda_graph:
+        return cfg
+    return cfg.replace(runtime=replace(cfg.runtime, use_cuda_graph=False))
 
 
 @dataclass
@@ -94,6 +121,25 @@ class Entry(abc.ABC):
         """Release pinned GPU resources. Default: no-op."""
         return None
 
+    def dump_targets(self) -> dict[str, nn.Module]:
+        """Modules to attach the debug tensor dumper to.
+
+        Returns a mapping of *root name* to ``nn.Module``; the engine
+        registers forward hooks on every leaf submodule of each, so each
+        :meth:`step` records that module's activations to disk (see
+        :class:`~phyai.runtime.tensor_dump.TensorDumper`). The root name
+        prefixes every recorded operator key
+        (``{"model": m}`` -> ``model.<...>.o_proj``).
+
+        Default: ``{}`` — the plugin opts out of tensor dumping and the
+        engine simply never builds a dumper. Plugins that want it override
+        this to expose their top-level model module(s). Only consulted
+        when :attr:`RuntimeConfig.debug_tensor_dump_dir` is set; returning
+        an empty mapping while a dump dir is configured is reported once
+        as a warning so a mis-wired plugin doesn't fail silently.
+        """
+        return {}
+
 
 @dataclass
 class EngineArgs:
@@ -102,10 +148,18 @@ class EngineArgs:
     Mandatory fields: which plugin to run and the typed arg bundle the
     plugin's :meth:`Entry.setup` consumes. Engine-wide defaults
     (device, dtype, backends, parallelism, runtime knobs) live on
-    :class:`~phyai.engine_config.EngineConfig` —— pass ``config=`` to
-    override; leave it ``None`` to let
-    :meth:`EngineConfig.from_env` pick up host-appropriate defaults
-    plus any ``PHYAI_*`` env-var overrides.
+    :class:`~phyai.engine_config.EngineConfig`.
+
+    ``config`` is used as the *base* the ``PHYAI_*`` env vars overlay on
+    top of: the engine resolves the effective config via
+    :meth:`EngineConfig.from_env(base=config) <EngineConfig.from_env>`,
+    so any set env var overrides the matching field while every unset
+    field carries over from ``config`` verbatim. Leave ``config`` as
+    ``None`` to start from :meth:`EngineConfig.auto` (host-appropriate
+    defaults) before the same env overlay. This means an env var is
+    always honoured — even when an explicit ``config`` is supplied —
+    which is what makes ``PHYAI_*`` usable as a run-time toggle (e.g.
+    flipping on tensor dump for one run without editing the caller).
     """
 
     plugin: str
@@ -160,9 +214,33 @@ class Engine:
         # 1. Resolve EngineConfig and seed the process singleton so every
         #    model constructor downstream picks up the requested
         #    device / dtype / backends without explicit plumbing.
-        self.config: EngineConfig = init_engine_config(
-            args.config if args.config is not None else EngineConfig.from_env()
-        )
+        #    ``from_env(base=args.config)`` makes the explicit config the
+        #    base and overlays any set ``PHYAI_*`` env var on top, so a
+        #    var like PHYAI_DEBUG_TENSOR_DUMP_DIR is honoured even when the
+        #    caller passed a config (env = run-time toggle). ``args.config``
+        #    is None -> the base falls back to ``auto()`` inside from_env.
+        #    When a tensor-dump directory ends up set, force eager *before*
+        #    installing the singleton: the dumper's forward hooks can't
+        #    fire inside a captured CUDA-graph replay, and the pi05
+        #    scheduler reads ``use_cuda_graph`` off this singleton at
+        #    setup time, so the flip has to land before any runner builds.
+        resolved = EngineConfig.from_env(base=args.config)
+        self._dump_enabled = resolved.runtime.debug_tensor_dump_dir is not None
+        if self._dump_enabled:
+            forced = _force_eager_for_dump(resolved)
+            if forced is not resolved:
+                this_rank_log(
+                    logger,
+                    logging.WARNING,
+                    "Tensor dump enabled (debug_tensor_dump_dir=%s): forcing "
+                    "use_cuda_graph=False. Forward hooks cannot fire during a "
+                    "captured CUDA-graph replay, so activation capture runs "
+                    "eager-only (slower than the normal graph path).",
+                    resolved.runtime.debug_tensor_dump_dir,
+                )
+            resolved = forced
+        self.config: EngineConfig = init_engine_config(resolved)
+        self._dumper: TensorDumper | None = None
 
         device_type = torch.device(self.config.device.target).type
 
@@ -218,13 +296,71 @@ class Engine:
         self.entry: Entry = entry_cls()
         self.entry.setup(args.plugin_args)
 
+        # 6. If tensor dumping is on, attach the dumper to the modules the
+        #    plugin exposes. Built after setup() so the model + weights are
+        #    fully constructed; the runners were already forced eager in
+        #    step 1, so the leaf forward hooks will actually fire.
+        if self._dump_enabled:
+            self._dumper = self._build_dumper()
+
+    def _build_dumper(self) -> TensorDumper | None:
+        """Construct the tensor dumper from the entry's dump targets.
+
+        Returns ``None`` (and warns) when the plugin exposes no dump
+        targets, so a mis-wired plugin surfaces loudly instead of
+        silently recording nothing.
+        """
+        runtime = self.config.runtime
+        targets = self.entry.dump_targets()
+        if not targets:
+            this_rank_log(
+                logger,
+                logging.WARNING,
+                "Tensor dump is enabled but plugin %r exposes no dump_targets(); "
+                "nothing will be recorded. Override Entry.dump_targets() to return "
+                "the model module(s) to capture.",
+                self.args.plugin,
+            )
+            return None
+        filter_spec = self._resolve_dump_filter()
+        return register_tensor_dumper(
+            targets,
+            dump_dir=runtime.debug_tensor_dump_dir,
+            filter=filter_spec,
+        )
+
+    def _resolve_dump_filter(self):
+        """Turn the two runtime dump-filter knobs into a single filter spec.
+
+        ``debug_tensor_dump_filter_fn`` (a ``"module:func"`` path) wins and
+        is resolved to a callable; otherwise the regex tuple
+        ``debug_tensor_dump_filter`` (or ``None`` -> record everything) is
+        passed through. The two are already validated mutually exclusive on
+        :class:`~phyai.engine_config.RuntimeConfig`.
+        """
+        runtime = self.config.runtime
+        if runtime.debug_tensor_dump_filter_fn is not None:
+            return load_filter_fn(runtime.debug_tensor_dump_filter_fn)
+        return runtime.debug_tensor_dump_filter
+
     def step(self, request: Any) -> Any:
-        """Run one inference round; forwards to the registered entry."""
-        return self.entry.step(request)
+        """Run one inference round; forwards to the registered entry.
+
+        When tensor dumping is active, the activations recorded during
+        this round are flushed to a single ``pass{N}.pt`` file once the
+        entry returns.
+        """
+        result = self.entry.step(request)
+        if self._dumper is not None:
+            self._dumper.flush_pass()
+        return result
 
     def close(self) -> None:
         """Release the plugin entry's resources, then tear down distributed
         state if the engine was the one to bring it up."""
+        if self._dumper is not None:
+            self._dumper.detach()
+            self._dumper = None
         self.entry.close()
         if self._owns_pg and dist.is_initialized():
             dist.destroy_process_group()

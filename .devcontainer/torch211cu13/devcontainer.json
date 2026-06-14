@@ -1,0 +1,30 @@
+{
+    "name": "phyai-torch211-cu13",
+    "build": {
+        "dockerfile": "../../docker/Dockerfile.torch211cu13"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.black-formatter",
+                "matepek.vscode-catch2-test-adapter",
+                "llvm-vs-code-extensions.vscode-clangd",
+                "streetsidesoftware.code-spell-checker",
+                "GitHub.vscode-pull-request-github",
+                "eamodio.gitlens",
+                "llvm-vs-code-extensions.lldb-dap",
+                "ms-python.vscode-pylance",
+                "ms-python.python",
+                "ms-python.debugpy",
+                "charliermarsh.ruff",
+                "Gruntfuggly.todo-tree",
+                "benjamin-simmonds.pythoncpp-debug",
+                "cschlosser.doxdocgen",
+                "redhat.vscode-yaml",
+                "ms-vscode.cmake-tools",
+                "editorconfig.editorconfig",
+                "golang.go"
+            ]
+        }
+    }
+}

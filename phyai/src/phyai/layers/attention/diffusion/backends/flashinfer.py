@@ -26,7 +26,10 @@ from phyai.layers.attention.diffusion.base import (
     DiffusionAttnPlanHandle,
 )
 from phyai.layers.attention.diffusion.registry import register_backend
-from phyai.layers.attention.utils import get_global_fi_workspace
+from phyai.layers.attention.utils import (
+    get_global_fi_workspace,
+    resolve_prefill_backend,
+)
 
 
 if TYPE_CHECKING:
@@ -103,10 +106,12 @@ class FlashInferDiffusionBackend(DiffusionAttentionBackend):
             max_batch_size, dtype=torch.int32, device=device
         )
         workspace = get_global_fi_workspace(device)
+        # Kernel choice is shape-dependent and comes from the engine config
+        # (``RuntimeConfig.flashinfer_prefill_backend``), not baked in here.
         self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
             workspace,
             "NHD",
-            backend="auto",
+            backend=resolve_prefill_backend(),
             use_cuda_graph=True,
             qo_indptr_buf=self._cu_q_buf,
             paged_kv_indptr_buf=self._paged_kv_indptr_buf,

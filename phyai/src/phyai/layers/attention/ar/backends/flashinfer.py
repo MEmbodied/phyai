@@ -30,7 +30,10 @@ from phyai.layers.attention.ar.base import (
     ARAttnPlanHandle,
 )
 from phyai.layers.attention.ar.registry import register_backend
-from phyai.layers.attention.utils import get_global_fi_workspace
+from phyai.layers.attention.utils import (
+    get_global_fi_workspace,
+    resolve_prefill_backend,
+)
 
 
 if TYPE_CHECKING:
@@ -107,10 +110,13 @@ class FlashInferARBackend(ARAttentionBackend):
             max_batch_size, dtype=torch.int32, device=device
         )
         workspace = get_global_fi_workspace(device)
+        # Kernel choice comes from the engine config
+        # (``RuntimeConfig.flashinfer_prefill_backend``); ``None`` -> "auto".
+        # Mirrors the diffusion backend — keep the two in lockstep.
         self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
             workspace,
             "NHD",
-            backend="auto",
+            backend=resolve_prefill_backend(),
             use_cuda_graph=True,
             qo_indptr_buf=self._cu_q_buf,
             paged_kv_indptr_buf=self._paged_kv_indptr_buf,

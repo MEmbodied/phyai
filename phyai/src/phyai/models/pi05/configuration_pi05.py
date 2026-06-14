@@ -160,6 +160,38 @@ class GemmaExpertConfig(PretrainedConfig):
 
 
 @dataclass(frozen=True)
+class PI05RecommendedEngineConfig(PretrainedConfig):
+    """pi0.5's recommended engine runtime tunables for *this* repo's kernels.
+
+    A model ships the engine settings it was tuned against instead of
+    baking them into the shared backends. :meth:`PI05Entry.setup` reads
+    this and installs it on the :class:`EngineConfig` singleton **before**
+    building the model — but only where the user hasn't already pinned a
+    value, so an explicit ``EngineConfig`` / ``PHYAI_*`` override always
+    wins. Field names mirror
+    :class:`~phyai.engine_config.RuntimeConfig` so the apply step is a
+    straight key copy (no engine_config import here — this stays a config
+    leaf).
+
+    Fields
+    ------
+    flashinfer_prefill_backend:
+        ``"fa2"``: the action-expert joint attention is short-query
+        (chunk 50) against a long cached prefix at head_dim 256; FA2 is
+        ~2.5x faster than the ``"auto"``-selected FA3 there under CUDA
+        graph replay (numerically equal to bf16 ulp level). ``None`` would
+        defer to flashinfer's auto heuristic.
+    flashinfer_workspace_bytes:
+        FA2's split-tmp scratch for this shape needs ~132 MiB, just over
+        the engine default 128 MiB; 256 MiB covers it. Only applied (as a
+        floor) when the effective prefill backend is FA2.
+    """
+
+    flashinfer_prefill_backend: str | None = "fa2"
+    flashinfer_workspace_bytes: int = 256 * 1024 * 1024
+
+
+@dataclass(frozen=True)
 class PI05Config(PretrainedConfig):
     """Top-level pi0.5 inference config: vision + text + expert + flow-matching.
 
@@ -189,6 +221,13 @@ class PI05Config(PretrainedConfig):
     min_period: float = 4e-3
     max_period: float = 4.0
     tokenizer_max_length: int = 200
+
+    # Engine runtime knobs pi0.5 was tuned against; applied by
+    # PI05Entry.setup (user/env overrides still win). Not part of the
+    # upstream checkpoint config.json — defaults are used when absent.
+    recommended_engine: PI05RecommendedEngineConfig = field(
+        default_factory=PI05RecommendedEngineConfig
+    )
 
     def __post_init__(self) -> None:
         if self.vision.projection_dim != self.text.hidden_size:
@@ -224,8 +263,7 @@ class PI05Config(PretrainedConfig):
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}.")
         if self.num_inference_steps <= 0:
             raise ValueError(
-                f"num_inference_steps must be positive, got "
-                f"{self.num_inference_steps}."
+                f"num_inference_steps must be positive, got {self.num_inference_steps}."
             )
 
     @property
@@ -238,5 +276,6 @@ __all__ = [
     "SiglipVisionConfig",
     "PaliGemmaTextConfig",
     "GemmaExpertConfig",
+    "PI05RecommendedEngineConfig",
     "PI05Config",
 ]

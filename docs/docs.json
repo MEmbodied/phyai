@@ -32,6 +32,12 @@
                 ]
               }
             ]
+          },
+          {
+            "group": "Tools",
+            "pages": [
+              "tools/tensor-dump"
+            ]
           }
         ]
       },
@@ -55,6 +61,12 @@
                   "zh/models/pi05/ws1"
                 ]
               }
+            ]
+          },
+          {
+            "group": "工具",
+            "pages": [
+              "zh/tools/tensor-dump"
             ]
           }
         ]

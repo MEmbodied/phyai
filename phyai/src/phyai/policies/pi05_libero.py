@@ -52,6 +52,10 @@ class PI05LiberoPolicy:
                     checkpoint_dir=self.checkpoint_dir,
                     max_batch_size=self.max_batch_size,
                     weight_remap=_lerobot_pi05_weight_remap,
+                    inputs_image_shape=[
+                        [self.pipeline.image_size, self.pipeline.image_size, 3]
+                        for _ in self.pipeline.camera_names
+                    ],
                 ),
                 config=EngineConfig(
                     backends=BackendConfig(

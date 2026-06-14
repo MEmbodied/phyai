@@ -45,6 +45,7 @@ pattern is to install the config first and then build models.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from threading import Lock
 
@@ -55,6 +56,18 @@ from phyai.env import envs
 
 def _canonical_backend_name(name: str) -> str:
     return name.lower().replace("_", "-")
+
+
+# flashinfer paged-prefill kernels (BatchPrefillWithPagedKVCacheWrapper).
+# Per flashinfer's own ctor docstring the accepted names are
+# auto / fa2 / fa3 / cudnn / trtllm-gen ("cute-dsl" is explicitly rejected
+# for paged KV). "auto" lets flashinfer pick. We validate against this set
+# so a typo fails at config construction rather than deep in wrapper init;
+# whether a given kernel actually supports a model's head_dim / dtype is
+# flashinfer's call at plan/run time.
+_VALID_FLASHINFER_PREFILL_BACKENDS: frozenset[str] = frozenset(
+    {"auto", "fa2", "fa3", "cudnn", "trtllm-gen"}
+)
 
 
 # ---------------------------------------------------------------------- #
@@ -294,17 +307,58 @@ class RuntimeConfig:
         head counts or long-context prefill that pushes split-k off
         the fast path. Consumed by
         :func:`phyai.layers.attention.utils.resolve_workspace_bytes`.
+    flashinfer_prefill_backend:
+        Which flashinfer prefill kernel the paged-KV attention wrappers
+        request. ``None`` (the default) defers to flashinfer's ``"auto"``
+        heuristic; otherwise one of the names
+        ``BatchPrefillWithPagedKVCacheWrapper`` accepts —
+        ``"fa2"`` / ``"fa3"`` / ``"cudnn"`` / ``"trtllm-gen"``. The right
+        choice is *shape-dependent* (e.g. the FA2 kernel beats the
+        auto-selected FA3 by ~2.5x on the pi0.5 action-expert's tiny-query
+        joint attention at head_dim 256), so this is a tunable rather than
+        a baked-in default — models that know their shape ship a
+        recommendation (see ``PI05RecommendedEngineConfig``) instead of forcing
+        it here. Consumed by
+        :func:`phyai.layers.attention.utils.resolve_prefill_backend`.
     force_linear_kernel:
         Hard override for :class:`~phyai.layers.linear.KernelDispatcher`
         — when set, every :meth:`select` returns the kernel registered
         under that name regardless of (spec, regime). Useful for A/B
         comparisons; ``None`` lets the registry's ``prefer_for``
         ordering decide.
+    debug_tensor_dump_dir:
+        Base directory for forward-hook activation dumps. ``None`` (the
+        default) disables dumping. When set, the engine records every
+        selected leaf operator's output to
+        ``<dir>/rank{R}_pid{P}/pass{N}.pt`` — one file per
+        :meth:`~phyai.engine.Engine.step`. Because a captured CUDA graph
+        replays without re-entering Python (so forward hooks never fire),
+        the engine **forces ``use_cuda_graph`` off** whenever this is set;
+        expect eager-mode speed while dumping. See
+        :mod:`phyai.runtime.tensor_dump`.
+    debug_tensor_dump_filter:
+        Optional tuple of regex strings selecting which operators to dump,
+        matched against each operator's full dotted name
+        (``model.expert_stack.layers.0.o_proj``). A leaf is recorded if
+        **any** pattern ``re.search``-matches (a union). ``None`` records
+        every operator. Mutually exclusive with
+        ``debug_tensor_dump_filter_fn``. No effect unless
+        ``debug_tensor_dump_dir`` is also set.
+    debug_tensor_dump_filter_fn:
+        Optional ``"pkg.module:func"`` / ``"/path/to/file.py:func"`` path
+        to a ``(name, module) -> bool`` predicate, for selection logic a
+        regex can't express. Mutually exclusive with
+        ``debug_tensor_dump_filter``. No effect unless
+        ``debug_tensor_dump_dir`` is also set.
     """
 
     use_cuda_graph: bool = True
     flashinfer_workspace_bytes: int = 128 * 1024 * 1024
+    flashinfer_prefill_backend: str | None = None
     force_linear_kernel: str | None = None
+    debug_tensor_dump_dir: str | None = None
+    debug_tensor_dump_filter: tuple[str, ...] | None = None
+    debug_tensor_dump_filter_fn: str | None = None
 
     def __post_init__(self) -> None:
         v = self.flashinfer_workspace_bytes
@@ -312,6 +366,38 @@ class RuntimeConfig:
             raise ValueError(
                 f"RuntimeConfig.flashinfer_workspace_bytes must be a "
                 f"positive int (bytes), got {v!r}."
+            )
+        be = self.flashinfer_prefill_backend
+        if be is not None and be not in _VALID_FLASHINFER_PREFILL_BACKENDS:
+            raise ValueError(
+                f"RuntimeConfig.flashinfer_prefill_backend={be!r} must be "
+                f"None or one of {sorted(_VALID_FLASHINFER_PREFILL_BACKENDS)} "
+                f"(the names BatchPrefillWithPagedKVCacheWrapper accepts; "
+                f"'cute-dsl' is paged-incompatible)."
+            )
+        flt = self.debug_tensor_dump_filter
+        if flt is not None:
+            if not isinstance(flt, tuple) or not all(isinstance(x, str) for x in flt):
+                raise ValueError(
+                    f"RuntimeConfig.debug_tensor_dump_filter must be None or a "
+                    f"tuple of regex strings, got {flt!r}."
+                )
+            for pat in flt:
+                try:
+                    re.compile(pat)
+                except re.error as e:
+                    raise ValueError(
+                        f"RuntimeConfig.debug_tensor_dump_filter has an invalid "
+                        f"regex {pat!r}: {e}"
+                    ) from e
+        if (
+            self.debug_tensor_dump_filter is not None
+            and self.debug_tensor_dump_filter_fn is not None
+        ):
+            raise ValueError(
+                "RuntimeConfig.debug_tensor_dump_filter and "
+                "debug_tensor_dump_filter_fn are mutually exclusive; set at "
+                "most one."
             )
         # ``force_linear_kernel`` is *not* validated against the global
         # linear-kernel registry: a kernel registered into a
@@ -411,8 +497,16 @@ class EngineConfig:
             runtime_kw["use_cuda_graph"] = v
         if (v := envs.PHYAI_FLASHINFER_WORKSPACE_BYTES.get()) is not None:
             runtime_kw["flashinfer_workspace_bytes"] = v
+        if (v := envs.PHYAI_FLASHINFER_PREFILL_BACKEND.get()) is not None:
+            runtime_kw["flashinfer_prefill_backend"] = v
         if (v := envs.PHYAI_FORCE_LINEAR_KERNEL.get()) is not None:
             runtime_kw["force_linear_kernel"] = v
+        if (v := envs.PHYAI_DEBUG_TENSOR_DUMP_DIR.get()) is not None:
+            runtime_kw["debug_tensor_dump_dir"] = v
+        if (v := envs.PHYAI_DEBUG_TENSOR_DUMP_FILTER.get()) is not None:
+            runtime_kw["debug_tensor_dump_filter"] = v
+        if (v := envs.PHYAI_DEBUG_TENSOR_DUMP_FILTER_FN.get()) is not None:
+            runtime_kw["debug_tensor_dump_filter_fn"] = v
 
         return cls(
             backends=replace(base.backends, **backends_kw)
