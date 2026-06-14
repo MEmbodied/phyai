@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "huggingface-hub",
     "numpy",
+    "safetensors",
     "torch==2.11",
     "transformers==5.8.1",
 ]

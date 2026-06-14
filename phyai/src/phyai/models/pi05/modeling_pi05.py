@@ -289,9 +289,27 @@ class SiglipVisionEmbeddings(nn.Module):
                 f"config: expected (B, {self.config.num_channels}, "
                 f"{self.config.image_size}, {self.config.image_size})."
             )
-        h_patch = self.patch_embedding(pixel_values)  # (B, hidden, H/p, W/p)
+        # OpenPI/SigLIP keeps patch extraction and positional embedding in fp32,
+        # then casts back to the model dtype before the encoder. This preserves
+        # pi0.5 LIBERO action alignment without changing the rest of the model's
+        # compute dtype.
+        weight = self.patch_embedding.weight.float()
+        bias = (
+            None
+            if self.patch_embedding.bias is None
+            else self.patch_embedding.bias.float()
+        )
+        h_patch = F.conv2d(
+            pixel_values.float(),
+            weight,
+            bias,
+            self.patch_embedding.stride,
+            self.patch_embedding.padding,
+            self.patch_embedding.dilation,
+            self.patch_embedding.groups,
+        )
         embeds = h_patch.flatten(2).transpose(1, 2)  # (B, num_patches, hidden)
-        embeds = embeds + self.position_embedding()  # broadcast (N, D) over batch
+        embeds = embeds + self.position_embedding().float()
         return embeds
 
 
@@ -408,6 +426,7 @@ class SiglipVisionModel(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         h = self.embeddings(pixel_values)
+        h = h.to(self.post_layernorm.weight.dtype)
         h = self.encoder(h)
         h = self.post_layernorm(h)
         return h
@@ -486,23 +505,22 @@ class PI05VisionTower(nn.Module):
     :func:`phyai.weights.load_pretrained` matches keys directly without
     a ``remap=`` argument. ``forward`` returns the
     ``(B, num_patches, projection_dim)`` token bank that pi0.5's
-    ``embed_image`` step consumes — including the
-    ``* sqrt(projection_dim)`` post-projection scale so callers can drop
-    the result straight into the language model's embedding space.
+    ``embed_image`` step consumes. The projector output is already in the
+    expected PaliGemma embedding scale, so no extra ``sqrt(dim)`` scaling is
+    applied here.
 
     Precision
     ---------
-    The tower runs all of its weights, norms, conv, and the projection
-    scale at ``params_dtype`` (the **compute** dtype). The openpi /
-    lerobot parity path keeps the whole vision stack in fp32 while the
-    rest of the model is bf16; pass ``params_dtype=torch.float32`` for
-    that, and ``io_dtype`` (the surrounding model's dtype) so the output
-    is cast back to bf16 before it enters the language-model embedding
-    space — exactly mirroring lerobot's ``embed_image`` (upcast pixels ->
-    run fp32 tower -> downcast features). When ``params_dtype == io_dtype``
-    (the bf16 default) both boundary casts are no-ops, so the captured
-    vision graph is byte-identical to the single-dtype path. fp32 also
-    forces the norm backend to ``phyai-kernel`` via
+    The tower runs all of its weights, norms, conv, and projector at
+    ``params_dtype`` (the **compute** dtype). The openpi / lerobot parity
+    path keeps the vision stack in fp32 while the rest of the model is bf16;
+    pass ``params_dtype=torch.float32`` for that, and ``io_dtype`` (the
+    surrounding model's dtype) so the output is cast back to bf16 before it
+    enters the language-model embedding space — exactly mirroring lerobot's
+    ``embed_image`` (upcast pixels -> run fp32 tower -> downcast features).
+    When ``params_dtype == io_dtype`` (the bf16 default) both boundary casts
+    are no-ops, so the captured vision graph is byte-identical to the
+    single-dtype path. fp32 also forces the norm backend to ``phyai-kernel`` via
     :func:`_vision_norm_backend` (flashinfer's norm kernels require bf16
     input).
     """
@@ -548,18 +566,16 @@ class PI05VisionTower(nn.Module):
             if prefix
             else "multi_modal_projector",
         )
-        self.projection_scale = float(config.projection_dim) ** 0.5
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         # Upcast the incoming pixels to the vision compute dtype (bf16 -> fp32
         # on the parity path; a no-op when the tower is bf16), run the tower +
-        # projector + scale in that dtype, then cast back to the model's
-        # io_dtype. Mirrors lerobot's ``embed_image``. The casts are captured
-        # into the vision CUDA graph; its external interface stays io_dtype.
+        # projector in that dtype, then cast back to the model's io_dtype.
+        # Mirrors lerobot's ``embed_image``. The casts are captured into the
+        # vision CUDA graph; its external interface stays io_dtype.
         x = pixel_values.to(self.compute_dtype)
         h = self.vision_tower(x)  # (B, N, hidden)
         h = self.multi_modal_projector(h)  # (B, N, projection_dim)
-        h = h * self.projection_scale
         return h.to(self.io_dtype)
 
 
@@ -569,7 +585,7 @@ class PI05VisionTower(nn.Module):
 
 
 class PaliGemmaEmbedTokens(nn.Module):
-    """Gemma vocab embedding with the pi0.5-specific double scaling.
+    """Gemma vocab embedding with the pi0.5 language scale.
 
     Wraps :class:`VocabParallelEmbedding` so the post-lookup scale
     factor is fused into the embedding op (zero-cost when
@@ -580,17 +596,9 @@ class PaliGemmaEmbedTokens(nn.Module):
     :func:`~phyai.weights.load_pretrained` matches the right tensor
     without needing a ``remap=`` argument.
 
-    Scale convention: pi0.5 lang tokens are scaled by ``hidden_size`` —
-    *not* the textbook ``sqrt(hidden_size)``. lerobot's port hits this
-    scale by composition: HF's ``GemmaTextScaledWordEmbedding`` applies
-    ``x sqrt(hidden_size)`` inside its forward, and pi0.5's
-    ``embed_prefix`` then multiplies by ``sqrt(hidden_size)`` again
-    (``lang_emb * math.sqrt(lang_emb_dim)``), total ``x hidden_size``.
-    The matching openpi reference does the same. Vision tokens, in
-    contrast, only get a single ``x sqrt(hidden_size)`` scale (applied
-    by :class:`PI05VisionTower.projection_scale`); lang and image
-    streams therefore live at *different* magnitudes by design — the
-    model was trained with that asymmetry.
+    Scale convention: the current LeRobot/PaliGemma reference applies
+    Gemma's standard ``sqrt(hidden_size)`` embedding scale. No additional
+    pi0.5 prefix-side language scaling is applied here.
 
     Forward signature: ``forward(input_ids: (B, S) int) -> (B, S, hidden_size)``.
     """
@@ -611,7 +619,7 @@ class PaliGemmaEmbedTokens(nn.Module):
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
             params_dtype=params_dtype,
-            embed_scale=float(config.hidden_size),
+            embed_scale=float(config.hidden_size) ** 0.5,
             prefix=prefix,
         )
 
