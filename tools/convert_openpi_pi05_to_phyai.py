@@ -11,9 +11,9 @@
 # ///
 """Convert an OpenPI JAX/Orbax pi0.5 checkpoint to PhyAI native safetensors.
 
-Source : ``/mnt/data2/shared_models/pi05_libero`` (OpenPI Orbax/OCDBT).
-Target : ``/mnt/data2/shared_models/pi05_libero_phyai_converted`` style
-         LeRobot/HF safetensors that ``phyai.weights.load_pretrained``
+Source : an OpenPI Orbax/OCDBT ``pi05_libero`` checkpoint directory.
+Target : a PhyAI checkpoint directory containing safetensors plus sidecar
+         config/processor files that ``phyai.weights.load_pretrained``
          consumes for the native pi0.5 engine (see ``modeling_pi05.py``).
 
 This is a faithful rewrite of the original (lost) converter, reconstructed
@@ -96,7 +96,7 @@ EXP_HIDDEN = 1024
 EXP_MLP = 4096
 EXP_ADARMS = 3072  # 3 * 1024 (scale|shift|gate)
 JOINT_ATTN = TXT_HEADS * TXT_HEAD_DIM  # 2048, shared q/o joint space
-KV_DIM = TXT_KV_HEADS * TXT_HEAD_DIM   # 256
+KV_DIM = TXT_KV_HEADS * TXT_HEAD_DIM  # 256
 
 # Target key prefixes (every product key is prefixed with ``model.``).
 ROOT = "model."
@@ -127,8 +127,8 @@ def read_safetensors_header(path: Path) -> dict[str, dict]:
 def load_openpi_state(checkpoint_dir: Path) -> dict[tuple, np.ndarray]:
     """Load the OpenPI Orbax checkpoint into a flat path->ndarray dict.
 
-    ``checkpoint_dir`` points at the checkpoint root that contains ``params/``
-    (e.g. ``/mnt/data2/shared_models/pi05_libero``). We restore the full State
+    ``checkpoint_dir`` points at the checkpoint root that contains ``params/``.
+    We restore the full State
     via orbax so every tensor is materialised at its true (unsharded) shape.
 
     OpenPI's public ``pi05_libero`` checkpoint was saved from an 8-device mesh.
@@ -351,13 +351,13 @@ def _build_text(src: Source, out: dict[str, np.ndarray]) -> None:
         "PaliGemma/llm/final_norm/scale"
     )
 
-    q = src.get("PaliGemma/llm/layers/attn/q_einsum/w")       # [18, 8, 256, 2048]
-    kv = src.get("PaliGemma/llm/layers/attn/kv_einsum/w")     # [18, 2, 1, 256, 2048]
+    q = src.get("PaliGemma/llm/layers/attn/q_einsum/w")  # [18, 8, 256, 2048]
+    kv = src.get("PaliGemma/llm/layers/attn/kv_einsum/w")  # [18, 2, 1, 256, 2048]
     o = src.get("PaliGemma/llm/layers/attn/attn_vec_einsum/w")  # [18, 8, 256, 2048]
     gate_up = src.get("PaliGemma/llm/layers/mlp/gating_einsum")  # [18, 2, 2048, 16384]
-    down = src.get("PaliGemma/llm/layers/mlp/linear")           # [18, 16384, 2048]
+    down = src.get("PaliGemma/llm/layers/mlp/linear")  # [18, 16384, 2048]
     pre_attn = src.get("PaliGemma/llm/layers/pre_attention_norm/scale")  # [18, 2048]
-    pre_ffw = src.get("PaliGemma/llm/layers/pre_ffw_norm/scale")         # [18, 2048]
+    pre_ffw = src.get("PaliGemma/llm/layers/pre_ffw_norm/scale")  # [18, 2048]
 
     for i in range(GEMMA_LAYERS):
         p = f"{PALI}.language_model.layers.{i}."
@@ -383,15 +383,15 @@ def _build_expert(src: Source, out: dict[str, np.ndarray]) -> None:
 
     # final norm is AdaRMS (Dense_0)
     fn_k = src.get("PaliGemma/llm/final_norm_1/Dense_0/kernel")  # [1024, 3072]
-    fn_b = src.get("PaliGemma/llm/final_norm_1/Dense_0/bias")    # [3072]
+    fn_b = src.get("PaliGemma/llm/final_norm_1/Dense_0/bias")  # [3072]
     out[EXPERT + ".norm.dense.weight"] = kT(fn_k)
     out[EXPERT + ".norm.dense.bias"] = fn_b
 
-    q = src.get("PaliGemma/llm/layers/attn/q_einsum_1/w")        # [18, 8, 256, 1024]
-    kv = src.get("PaliGemma/llm/layers/attn/kv_einsum_1/w")      # [18, 2, 1, 256, 1024]
+    q = src.get("PaliGemma/llm/layers/attn/q_einsum_1/w")  # [18, 8, 256, 1024]
+    kv = src.get("PaliGemma/llm/layers/attn/kv_einsum_1/w")  # [18, 2, 1, 256, 1024]
     o = src.get("PaliGemma/llm/layers/attn/attn_vec_einsum_1/w")  # [18, 8, 256, 1024]
     gate_up = src.get("PaliGemma/llm/layers/mlp_1/gating_einsum")  # [18, 2, 1024, 4096]
-    down = src.get("PaliGemma/llm/layers/mlp_1/linear")           # [18, 4096, 1024]
+    down = src.get("PaliGemma/llm/layers/mlp_1/linear")  # [18, 4096, 1024]
     pre_attn_k = src.get(
         "PaliGemma/llm/layers/pre_attention_norm_1/Dense_0/kernel"
     )  # [18, 1024, 3072]
@@ -431,7 +431,9 @@ def _gemma_q_w(per_layer: np.ndarray, in_dim: int) -> np.ndarray:
         head_dim = b
         normalized = np.swapaxes(per_layer, 1, 2)
     else:
-        raise AssertionError(f"q shape {per_layer.shape} incompatible with in_dim={in_dim}")
+        raise AssertionError(
+            f"q shape {per_layer.shape} incompatible with in_dim={in_dim}"
+        )
     return np.ascontiguousarray(normalized.reshape(heads * head_dim, in_dim))
 
 
@@ -449,7 +451,9 @@ def _gemma_kv_w(per_kv: np.ndarray, in_dim: int) -> np.ndarray:
         normalized = np.swapaxes(per_kv, 1, 2)
         head_dim = b
     else:
-        raise AssertionError(f"kv shape {per_kv.shape} incompatible with in_dim={in_dim}")
+        raise AssertionError(
+            f"kv shape {per_kv.shape} incompatible with in_dim={in_dim}"
+        )
     return np.ascontiguousarray(normalized.reshape(head_dim, in_dim))
 
 
@@ -476,15 +480,13 @@ NP_TO_ST = {
 }
 
 
-def diff_against_reference(
-    built: dict[str, np.ndarray], reference: Path
-) -> int:
+def diff_against_reference(built: dict[str, np.ndarray], reference: Path) -> int:
     ref = read_safetensors_header(reference)
     ref_keys = set(ref)
     built_keys = set(built)
 
-    missing = sorted(ref_keys - built_keys)   # in product, not produced
-    extra = sorted(built_keys - ref_keys)     # produced, not in product
+    missing = sorted(ref_keys - built_keys)  # in product, not produced
+    extra = sorted(built_keys - ref_keys)  # produced, not in product
     mismatched = []
     for k in sorted(ref_keys & built_keys):
         rshape = list(ref[k]["shape"])
@@ -605,21 +607,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("/mnt/data2/shared_models/pi05_libero"),
+        required=True,
         help="OpenPI checkpoint root containing params/",
     )
     ap.add_argument(
         "--reference",
         type=Path,
-        default=Path(
-            "/mnt/data2/shared_models/pi05_libero_phyai_converted/model.safetensors"
-        ),
+        required=True,
         help="reference product safetensors (read-only, shapes only)",
     )
     ap.add_argument(
         "--metadata-source",
         type=Path,
-        default=Path("/mnt/data2/shared_models/pi05_libero_phyai_converted"),
         help=(
             "complete converted checkpoint directory to copy config/processor "
             "sidecars from when --write is used"
@@ -633,10 +632,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--out",
         type=Path,
-        default=Path(
-            "/mnt/data2/shared_models/pi05_libero_phyai_reconverted/model.safetensors"
-        ),
-        help="output safetensors path for --write (default: a NEW dir)",
+        help="output safetensors path for --write",
     )
     ap.add_argument(
         "--allow-overwrite",
@@ -645,6 +641,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--dtype", default="bf16", help="write dtype for non-fp32 params")
     args = ap.parse_args(argv)
+
+    if args.write and args.out is None:
+        ap.error("--out is required when --write is used")
+    if args.write and args.metadata_source is None:
+        ap.error("--metadata-source is required when --write is used")
 
     # Header reader works without OpenPI; load source only when needed (always,
     # since both dry-run and write build the target dict).
@@ -673,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
         return rc
 
     out = args.out
+    assert out is not None
     if out.resolve() == args.reference.resolve() and not args.allow_overwrite:
         print(
             f"\nrefusing to overwrite the reference product at {out};\n"
@@ -687,6 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     write_safetensors(built, out, args.dtype)
+    assert args.metadata_source is not None
     write_checkpoint_sidecars(out.parent, args.metadata_source)
     return 0
 

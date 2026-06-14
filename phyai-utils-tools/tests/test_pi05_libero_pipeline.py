@@ -36,7 +36,6 @@ def test_pi05_libero_pipeline_shapes():
     inputs = pipeline.observation_to_inputs(obs)
 
     assert tuple(inputs["pixel_values"].shape) == (1, 2, 3, 224, 224)
-    assert "image_masks" not in inputs
     assert tuple(inputs["input_ids"].shape) == (1, 200)
     assert tuple(inputs["lang_lens"].shape) == (1,)
     assert inputs["lang_lens"].item() == 3

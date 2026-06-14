@@ -1,4 +1,4 @@
-"""轻量可配置 processor pipeline。"""
+"""Lightweight configurable processor pipeline."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ ProcessorFn = Callable[[dict[str, Any]], dict[str, Any]]
 
 @dataclass
 class ProcessorStep:
-    """单个处理步骤。"""
+    """Single processing step."""
 
     name: str
     fn: ProcessorFn
@@ -23,7 +23,7 @@ class ProcessorStep:
 
 
 class ProcessorPipeline:
-    """按顺序执行 processor 的简单 Pipeline。"""
+    """Simple pipeline that runs processors in order."""
 
     def __init__(self, steps: list[ProcessorStep]) -> None:
         self.steps = steps

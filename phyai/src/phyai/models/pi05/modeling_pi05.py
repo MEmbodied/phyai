@@ -275,7 +275,11 @@ class SiglipVisionEmbeddings(nn.Module):
         # then casts back to the model dtype before the encoder.  Gripper output
         # is sensitive to this small prefix difference on LIBERO.
         weight = self.patch_embedding.weight.float()
-        bias = None if self.patch_embedding.bias is None else self.patch_embedding.bias.float()
+        bias = (
+            None
+            if self.patch_embedding.bias is None
+            else self.patch_embedding.bias.float()
+        )
         h_patch = F.conv2d(
             pixel_values.float(),
             weight,

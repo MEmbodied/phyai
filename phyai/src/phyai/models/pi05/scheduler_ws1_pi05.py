@@ -209,10 +209,6 @@ class PI05Request:
     tokenizer_max_length)`` int64); ``lang_lens`` carries the
     un-padded real lengths.
 
-    ``image_masks`` is optional; when present it has shape ``(B, Cams)`` and
-    marks which camera streams are real. If omitted, every supplied camera is
-    treated as valid.
-
     ``noise`` is optional; if ``None`` the scheduler samples a fresh
     Gaussian (over the *real* batch only — the padded tail uses zeros
     that get discarded with the rest of the padded output).
@@ -221,8 +217,22 @@ class PI05Request:
     pixel_values: torch.Tensor
     input_ids: torch.Tensor
     lang_lens: torch.Tensor
-    image_masks: torch.Tensor | None = None
     noise: torch.Tensor | None = None
+
+
+@dataclass
+class _PI05Layout:
+    """Cached attention layout for one request shape.
+
+    The key includes both image lengths and language lengths so two-camera
+    and three-camera requests never share an incompatible layout.
+    """
+
+    n_real_total: int
+    position_ids: torch.Tensor
+    write_indices: torch.Tensor
+    prefix_meta: ARAttnMetadata
+    joint_meta: DiffusionAttnMetadata
 
 
 class PI05WS1Scheduler(Scheduler):
@@ -327,6 +337,12 @@ class PI05WS1Scheduler(Scheduler):
         # broadcast to ``(max_B, expert_hidden)`` via ``expand`` and fed
         # straight to the expert runner's captured input buffer.
         self.time_emb_table: torch.Tensor | None = None
+        self._layout_cache: dict[
+            tuple[int, tuple[int, ...], tuple[int, ...]], _PI05Layout
+        ] = {}
+        self._last_layout_key: tuple[int, tuple[int, ...], tuple[int, ...]] | None = (
+            None
+        )
 
     # ------------------------------------------------------------------ #
     # Setup                                                              #
@@ -401,16 +417,16 @@ class PI05WS1Scheduler(Scheduler):
         lang_lens_actual = request.lang_lens.to(device=device, dtype=torch.int32)
         num_cameras = int(request.pixel_values.shape[1])
         tokens_per_camera = cfg.vision.num_patches
-        if request.image_masks is None:
-            image_masks_actual = torch.ones(actual_B, num_cameras, dtype=torch.bool, device=device)
-        else:
-            image_masks_actual = request.image_masks.to(device=device, dtype=torch.bool)
-        image_lens_actual = image_masks_actual.to(torch.int32).sum(dim=1) * tokens_per_camera
+        image_lens_actual = torch.full(
+            (actual_B,),
+            num_cameras * tokens_per_camera,
+            dtype=torch.int32,
+            device=device,
+        )
         real_lens = torch.zeros(max_B, dtype=torch.int32, device=device)
         image_lens = torch.zeros(max_B, dtype=torch.int32, device=device)
         image_lens[:actual_B] = image_lens_actual
         real_lens[:actual_B] = lang_lens_actual + image_lens_actual
-        n_real_total = int(real_lens.sum())
 
         # 1. Vision pass — run the supplied camera stack once
         # per real robot. The runner's output aliases its static buffer,
@@ -431,10 +447,7 @@ class PI05WS1Scheduler(Scheduler):
                     image_embs = torch.zeros(
                         max_B, *flat.shape, dtype=flat.dtype, device=flat.device
                     )
-                camera_tokens = flat.view(num_cameras, tokens_per_camera, flat.shape[-1])
-                valid_tokens = camera_tokens[image_masks_actual[b]].reshape(-1, flat.shape[-1])
-                if valid_tokens.numel() > 0:
-                    image_embs[b, : valid_tokens.shape[0]] = valid_tokens
+                image_embs[b, : flat.shape[0]] = flat
             assert image_embs is not None  # actual_B >= 1 enforced by _validate
 
         # 2. Lang embed (eager) + per-sample padded packing. input_ids
@@ -468,120 +481,41 @@ class PI05WS1Scheduler(Scheduler):
                 image_lens=image_lens,
             )
 
-        # 3. Reset caches and plan the prefix layout.
+        image_lens_cpu = tuple(int(x) for x in image_lens[:actual_B].tolist())
+        lang_lens_cpu = tuple(int(x) for x in lang_lens_actual.tolist())
+        layout_key = (actual_B, image_lens_cpu, lang_lens_cpu)
+        layout = self._layout_cache.get(layout_key)
+        if layout is None:
+            layout = self._build_layout(actual_B, image_lens_cpu, lang_lens_cpu)
+            self._layout_cache[layout_key] = layout
+        plan_changed = layout_key != self._last_layout_key
+
+        # 3. Reset cache cursors and plan attention only when the request
+        # layout changes. Cached metadata remains valid because it depends on
+        # lengths, not on image/text values.
         with event_scope("pi05.llm_prefix_plan"):
-            self.prefix_static.reset()
-            self.suffix_static.reset()
-            # The static cache's role is bookkeeping; the actual write goes
-            # to slots inferred from real_lens / prefix_slot_base. We
-            # explicitly bump the cursor to ``n_real_total`` to record the
-            # allocation. Suffix is sized at ``max_B * chunk_size`` because
-            # every sample (real or padded) gets its own suffix slot range.
-            _ = self.prefix_static.allocate(n_real_total)
-            _ = self.suffix_static.allocate(max_B * cfg.chunk_size)
+            if plan_changed:
+                self.prefix_static.reset()
+                self.suffix_static.reset()
+                _ = self.prefix_static.allocate(layout.n_real_total)
+                _ = self.suffix_static.allocate(max_B * cfg.chunk_size)
+                self.llm_runner.plan_inference(layout.prefix_meta)
 
-            cu_q_prefix = torch.arange(
-                0,
-                (max_B + 1) * self.n_per_sample,
-                self.n_per_sample,
-                dtype=torch.int32,
-                device=device,
-            )
-            paged_kv_indptr_prefix = torch.zeros(
-                max_B + 1, dtype=torch.int32, device=device
-            )
-            paged_kv_indptr_prefix[1:] = torch.cumsum(real_lens, 0)
-            # Real prefix tokens are written contiguously starting at
-            # ``prefix_base`` (see ``build_prefix_padded_write_indices``), so the
-            # paged-kv-indices for the prefix self-attention wrapper is just
-            # the contiguous range. Padded samples contribute 0 entries.
-            paged_kv_indices_prefix = torch.arange(
-                self.prefix_base,
-                self.prefix_base + n_real_total,
-                dtype=torch.int32,
-                device=device,
-            )
-            # ``page_size=1``: empty samples have last-page-len 0, non-empty 1.
-            paged_kv_last_prefix = (real_lens > 0).to(torch.int32)
-            write_indices = build_prefix_padded_write_indices(
-                real_lens,
-                n_per_sample=self.n_per_sample,
-                prefix_slot_base=self.prefix_base,
-                sentinel_slot=self.sentinel_slot,
-            )
-            # Per-sample local positions: every padded row gets its in-sample
-            # index ``j``; padding rows produce K rotations that go to the
-            # sentinel slot and are never read by attention.
-            position_ids = torch.arange(
-                self.n_per_sample, dtype=torch.int32, device=device
-            ).repeat(max_B)
-
-            # Plan the LLM runner's wrapper / sdpa metadata buffers.
-            prefix_meta = ARAttnMetadata(
-                mode=AttnMode.PREFILL,
-                layout=AttnLayout.RAGGED_3D,
-                batch_size=max_B,
-                num_query_tokens=max_B * self.n_per_sample,
-                cu_seqlens_q=cu_q_prefix,
-                paged_kv_indptr=paged_kv_indptr_prefix,
-                paged_kv_indices=paged_kv_indices_prefix,
-                paged_kv_last_page_len=paged_kv_last_prefix,
-                write_indices=write_indices,
-                position_ids=position_ids,
-            )
-            self.llm_runner.plan_inference(prefix_meta)
-
-        # 4. Prefix forward — populates the cache pool. ``packed`` is a
-        # fresh contiguous tensor; the runner's ``replay`` will copy it
-        # into the captured input buffer, so no scheduler-side staging.
-        # Attention metadata was already staged on the runner via
-        # ``plan_inference`` above; the batch carries only the per-call
-        # variable inputs.
+        # 4. Prefix forward — populates the cache pool.
         with event_scope("pi05.llm_prefix_fwd"):
             llm_batch = LLMForwardBatch(
                 hidden_states=packed,
-                position_ids=position_ids,
-                write_indices=write_indices,
+                position_ids=layout.position_ids,
+                write_indices=layout.write_indices,
             )
             self.llm_runner.forward(llm_batch)
 
-        # 5. Plan the expert runner's joint-attention metadata.
+        # 5. Plan the expert runner's joint-attention metadata only when the
+        # per-sample prefix lengths changed.
         with event_scope("pi05.expert_plan"):
-            pos_ids_suffix = build_suffix_pos_ids(real_lens, cfg.chunk_size)
-            cu_q_suffix = torch.arange(
-                0,
-                (max_B + 1) * cfg.chunk_size,
-                cfg.chunk_size,
-                dtype=torch.int32,
-                device=device,
-            )
-            paged_kv_indptr_full = torch.zeros(
-                max_B + 1, dtype=torch.int32, device=device
-            )
-            paged_kv_indptr_full[1:] = torch.cumsum(real_lens + cfg.chunk_size, 0)
-            paged_kv_indices_full = build_joint_paged_kv_indices(
-                real_lens,
-                cfg.chunk_size,
-                prefix_slot_base=self.prefix_base,
-                suffix_slot_base=self.suffix_base,
-            )
-            # Joint last-page-len: every sample has chunk_size > 0 suffix
-            # tokens under page_size=1, so the last page always holds
-            # exactly one token — including padded samples (their suffix is
-            # garbage but lives in real slots and self-attends correctly).
-            paged_kv_last_full = torch.ones(max_B, dtype=torch.int32, device=device)
-            joint_meta = DiffusionAttnMetadata(
-                mode=AttnMode.PREFILL,
-                layout=AttnLayout.RAGGED_3D,
-                batch_size=max_B,
-                num_query_tokens=max_B * cfg.chunk_size,
-                cu_seqlens_q=cu_q_suffix,
-                paged_kv_indptr=paged_kv_indptr_full,
-                paged_kv_indices=paged_kv_indices_full,
-                paged_kv_last_page_len=paged_kv_last_full,
-                position_ids=pos_ids_suffix,
-            )
-            self.expert_runner.plan_inference(joint_meta)
+            if plan_changed:
+                self.expert_runner.plan_inference(layout.joint_meta)
+        self._last_layout_key = layout_key
 
         # 6. Sample noise (or use the user's, padded) and run 10-step Euler.
         with event_scope("pi05.expert_loop"):
@@ -628,6 +562,104 @@ class PI05WS1Scheduler(Scheduler):
         return x_t[:actual_B]
 
     # ------------------------------------------------------------------ #
+    # Layout cache                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _build_layout(
+        self,
+        actual_B: int,
+        image_lens_cpu: tuple[int, ...],
+        lang_lens_cpu: tuple[int, ...],
+    ) -> _PI05Layout:
+        cfg = self.cfg
+        device = self.device
+        max_B = self.max_batch_size
+
+        real_list = [0] * max_B
+        for b in range(actual_B):
+            real_list[b] = image_lens_cpu[b] + lang_lens_cpu[b]
+
+        n_real_total = sum(real_list)
+        real_lens = torch.tensor(real_list, dtype=torch.int32, device=device)
+
+        cu_q_prefix = torch.arange(
+            0,
+            (max_B + 1) * self.n_per_sample,
+            self.n_per_sample,
+            dtype=torch.int32,
+            device=device,
+        )
+        paged_kv_indptr_prefix = torch.zeros(
+            max_B + 1, dtype=torch.int32, device=device
+        )
+        paged_kv_indptr_prefix[1:] = torch.cumsum(real_lens, 0)
+        paged_kv_indices_prefix = torch.arange(
+            self.prefix_base,
+            self.prefix_base + n_real_total,
+            dtype=torch.int32,
+            device=device,
+        )
+        paged_kv_last_prefix = (real_lens > 0).to(torch.int32)
+        write_indices = build_prefix_padded_write_indices(
+            real_lens,
+            n_per_sample=self.n_per_sample,
+            prefix_slot_base=self.prefix_base,
+            sentinel_slot=self.sentinel_slot,
+        )
+        position_ids = torch.arange(
+            self.n_per_sample, dtype=torch.int32, device=device
+        ).repeat(max_B)
+        prefix_meta = ARAttnMetadata(
+            mode=AttnMode.PREFILL,
+            layout=AttnLayout.RAGGED_3D,
+            batch_size=max_B,
+            num_query_tokens=max_B * self.n_per_sample,
+            cu_seqlens_q=cu_q_prefix,
+            paged_kv_indptr=paged_kv_indptr_prefix,
+            paged_kv_indices=paged_kv_indices_prefix,
+            paged_kv_last_page_len=paged_kv_last_prefix,
+            write_indices=write_indices,
+            position_ids=position_ids,
+        )
+
+        pos_ids_suffix = build_suffix_pos_ids(real_lens, cfg.chunk_size)
+        cu_q_suffix = torch.arange(
+            0,
+            (max_B + 1) * cfg.chunk_size,
+            cfg.chunk_size,
+            dtype=torch.int32,
+            device=device,
+        )
+        paged_kv_indptr_full = torch.zeros(max_B + 1, dtype=torch.int32, device=device)
+        paged_kv_indptr_full[1:] = torch.cumsum(real_lens + cfg.chunk_size, 0)
+        paged_kv_indices_full = build_joint_paged_kv_indices(
+            real_lens,
+            cfg.chunk_size,
+            prefix_slot_base=self.prefix_base,
+            suffix_slot_base=self.suffix_base,
+        )
+        paged_kv_last_full = torch.ones(max_B, dtype=torch.int32, device=device)
+        joint_meta = DiffusionAttnMetadata(
+            mode=AttnMode.PREFILL,
+            layout=AttnLayout.RAGGED_3D,
+            batch_size=max_B,
+            num_query_tokens=max_B * cfg.chunk_size,
+            cu_seqlens_q=cu_q_suffix,
+            paged_kv_indptr=paged_kv_indptr_full,
+            paged_kv_indices=paged_kv_indices_full,
+            paged_kv_last_page_len=paged_kv_last_full,
+            position_ids=pos_ids_suffix,
+        )
+
+        return _PI05Layout(
+            n_real_total=n_real_total,
+            position_ids=position_ids,
+            write_indices=write_indices,
+            prefix_meta=prefix_meta,
+            joint_meta=joint_meta,
+        )
+
+    # ------------------------------------------------------------------ #
     # Validation                                                         #
     # ------------------------------------------------------------------ #
 
@@ -658,11 +690,6 @@ class PI05WS1Scheduler(Scheduler):
         if req.lang_lens.shape != (actual_B,):
             raise ValueError(
                 f"lang_lens shape {tuple(req.lang_lens.shape)} != (B,)=({actual_B},)."
-            )
-        if req.image_masks is not None and req.image_masks.shape != (actual_B, num_cameras):
-            raise ValueError(
-                f"image_masks shape {tuple(req.image_masks.shape)} != "
-                f"(B, num_cameras)=({actual_B}, {num_cameras})."
             )
         if req.noise is not None and req.noise.shape != (
             actual_B,

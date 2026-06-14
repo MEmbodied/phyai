@@ -1,4 +1,4 @@
-"""pi0.5 LIBERO 高层推理封装。"""
+"""High-level pi0.5 LIBERO inference wrapper."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from phyai_utils_tools.pipeline import PI05LiberoPipeline
 
 
 def _lerobot_pi05_weight_remap(key: str) -> str | None:
-    """兼容 LeRobot 保存时额外包了一层 model. 的 checkpoint key。"""
+    """Handle LeRobot checkpoints that wrap keys with an extra model. prefix."""
     if key.startswith("model."):
         key = key[len("model.") :]
     if key == "paligemma_with_expert.gemma_expert.lm_head.weight":
@@ -25,7 +25,7 @@ def _lerobot_pi05_weight_remap(key: str) -> str | None:
 
 
 class PI05LiberoPolicy:
-    """把 vla-eval/LIBERO observation 封装为 PhyAI Engine 推理。"""
+    """Wrap vla-eval/LIBERO observations for PhyAI Engine inference."""
 
     def __init__(
         self,
@@ -38,6 +38,7 @@ class PI05LiberoPolicy:
         attn_backend: str = "flashinfer",
         norm_backend: str = "flashinfer",
         linear_backend: str | None = None,
+        flashinfer_workspace_bytes: int = 512 * 1024 * 1024,
     ) -> None:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.device = device
@@ -59,7 +60,11 @@ class PI05LiberoPolicy:
                         linear=linear_backend,
                     ),
                     device=DeviceConfig(target=device, params_dtype=params_dtype),
-                    runtime=RuntimeConfig(use_cuda_graph=use_cuda_graph, force_linear_kernel=linear_backend),
+                    runtime=RuntimeConfig(
+                        use_cuda_graph=use_cuda_graph,
+                        flashinfer_workspace_bytes=flashinfer_workspace_bytes,
+                        force_linear_kernel=linear_backend,
+                    ),
                 ),
             )
         )

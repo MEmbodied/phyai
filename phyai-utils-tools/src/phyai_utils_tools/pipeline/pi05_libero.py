@@ -1,4 +1,4 @@
-"""pi0.5 LIBERO 输入输出处理。"""
+"""pi0.5 LIBERO input and output processing."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from safetensors.torch import load_file
 
 
 class PI05LiberoPipeline:
-    """把 LIBERO/vla-eval observation 转成 PhyAI PI05Request 所需张量。"""
+    """Convert LIBERO/vla-eval observations into PhyAI PI05Request tensors."""
 
     def __init__(
         self,
@@ -36,9 +36,7 @@ class PI05LiberoPipeline:
         )
 
         self.image_size = int(
-            image_size
-            or self.config.get("image_resolution", [224, 224])[0]
-            or 224
+            image_size or self.config.get("image_resolution", [224, 224])[0] or 224
         )
         self.tokenizer_max_length = int(
             tokenizer_max_length
@@ -46,14 +44,27 @@ class PI05LiberoPipeline:
             or self._tokenizer_config().get("max_length")
             or 200
         )
-        configured_tokenizer = tokenizer_name or self._tokenizer_config().get(
-            "tokenizer_name", "google/paligemma-3b-pt-224"
+        configured_tokenizer = (
+            tokenizer_name
+            or os.environ.get("PHYAI_TOKENIZER_PATH")
+            or self._tokenizer_config().get(
+                "tokenizer_name", "google/paligemma-3b-pt-224"
+            )
         )
         self.tokenizer_name = self._resolve_tokenizer_path(configured_tokenizer)
         self.empty_cameras = int(self.config.get("empty_cameras", 1))
-        self.unflip_images = os.environ.get("PHYAI_LIBERO_UNFLIP_IMAGES", "0") in {"1", "true", "True", "yes"}
-        self.prompt_mode = str(self.config.get("phyai_prompt_mode", "lerobot_state_bins"))
-        self.normalization_mode = str(self.config.get("phyai_normalization_mode", "mean_std"))
+        self.unflip_images = os.environ.get("PHYAI_LIBERO_UNFLIP_IMAGES", "0") in {
+            "1",
+            "true",
+            "True",
+            "yes",
+        }
+        self.prompt_mode = str(
+            self.config.get("phyai_prompt_mode", "lerobot_state_bins")
+        )
+        self.normalization_mode = str(
+            self.config.get("phyai_normalization_mode", "mean_std")
+        )
         self.camera_mode = str(
             os.environ.get("PHYAI_CAMERA_MODE")
             or self.config.get("phyai_camera_mode", "two_camera")
@@ -68,14 +79,20 @@ class PI05LiberoPipeline:
             if self.camera_mode == "two_camera"
             else ["agentview", "wrist", "empty"]
         )
-        self.camera_names = list(self.config.get("phyai_camera_names", default_camera_names))
+        self.camera_names = list(
+            self.config.get("phyai_camera_names", default_camera_names)
+        )
         expected_cameras = 2 if self.camera_mode == "two_camera" else 3
         if len(self.camera_names) != expected_cameras:
             raise ValueError(
                 f"phyai_camera_names must contain {expected_cameras} entries for "
                 f"{self.camera_mode}, got {self.camera_names!r}."
             )
-        self.action_dim = int(self.config.get("output_features", {}).get("action", {}).get("shape", [7])[0])
+        self.action_dim = int(
+            self.config.get("output_features", {})
+            .get("action", {})
+            .get("shape", [7])[0]
+        )
         self.max_action_dim = int(self.config.get("max_action_dim", 32))
         self.chunk_size = int(self.config.get("chunk_size", 50))
 
@@ -94,20 +111,14 @@ class PI05LiberoPipeline:
             raise ValueError(f"{path} must contain a JSON object")
         return data
 
-
     def _resolve_tokenizer_path(self, name_or_path: str) -> str:
-        local_candidates = {
-            "google/paligemma-3b-pt-224": [
-                Path("/mnt/data2/shared_models/paligemma-3b-pt-224"),
-                Path("/mnt/data2/shared_models/google_paligemma-3b-pt-224"),
-            ]
-        }
         path = Path(name_or_path)
         if path.exists():
             return str(path)
-        for candidate in local_candidates.get(name_or_path, []):
-            if (candidate / "tokenizer.json").exists() or (candidate / "tokenizer.model").exists():
-                return str(candidate)
+        if (self.checkpoint_dir / "tokenizer.json").exists() or (
+            self.checkpoint_dir / "tokenizer.model"
+        ).exists():
+            return str(self.checkpoint_dir)
         return name_or_path
 
     def _tokenizer_config(self) -> dict[str, Any]:
@@ -116,7 +127,9 @@ class PI05LiberoPipeline:
                 return dict(step.get("config") or {})
         return {}
 
-    def _load_step_state(self, config: dict[str, Any], registry_name: str) -> dict[str, torch.Tensor]:
+    def _load_step_state(
+        self, config: dict[str, Any], registry_name: str
+    ) -> dict[str, torch.Tensor]:
         for step in config.get("steps", []):
             if step.get("registry_name") != registry_name:
                 continue
@@ -135,8 +148,10 @@ class PI05LiberoPipeline:
         return self._tokenizer
 
     def observation_to_inputs(self, obs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """转换 vla-eval observation 为 PI05Request 所需 tensor 字段。"""
-        empty = torch.full((3, self.image_size, self.image_size), -1.0, dtype=torch.float32)
+        """Convert a vla-eval observation into PI05Request tensor fields."""
+        empty = torch.full(
+            (3, self.image_size, self.image_size), -1.0, dtype=torch.float32
+        )
         cameras: list[torch.Tensor] = []
         for idx, name in enumerate(self.camera_names):
             if name in {"empty", "empty_camera", "empty_camera_0"}:
@@ -162,20 +177,26 @@ class PI05LiberoPipeline:
         }
 
     def observation_to_request(self, obs: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """向后兼容别名：返回 PI05Request 所需字段，而不是具体请求类。"""
+        """Backward-compatible alias returning PI05Request fields."""
         return self.observation_to_inputs(obs)
-
 
     def _tokenize_inputs(
         self, tasks: list[str], states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if states.dim() != 2:
-            raise ValueError(f"states must be (B, state_dim), got {tuple(states.shape)}")
+            raise ValueError(
+                f"states must be (B, state_dim), got {tuple(states.shape)}"
+            )
         if states.shape[0] != len(tasks):
-            raise ValueError(f"states batch dim {states.shape[0]} != len(tasks) {len(tasks)}")
+            raise ValueError(
+                f"states batch dim {states.shape[0]} != len(tasks) {len(tasks)}"
+            )
         prompts = []
         if self.prompt_mode == "openpi_task":
-            prompts = [task.strip().replace("_", " ").replace("\n", " ") + "\n" for task in tasks]
+            prompts = [
+                task.strip().replace("_", " ").replace("\n", " ") + "\n"
+                for task in tasks
+            ]
         else:
             state_np = states.detach().cpu().numpy()
             bins = np.linspace(-1.0, 1.0, 257)[:-1]
@@ -197,7 +218,7 @@ class PI05LiberoPipeline:
         return input_ids, lang_lens
 
     def postprocess_actions(self, actions: torch.Tensor | np.ndarray) -> np.ndarray:
-        """取前 7 维并执行 action 反归一化。"""
+        """Select benchmark action dimensions and unnormalize them."""
         if not isinstance(actions, torch.Tensor):
             action_t = torch.as_tensor(actions)
         else:
@@ -206,7 +227,9 @@ class PI05LiberoPipeline:
         action_t = self._unnormalize_action(action_t)
         return action_t.numpy().astype(np.float32)
 
-    def _extract_image(self, obs: dict[str, Any], key: str, *, fallback_index: int) -> np.ndarray:
+    def _extract_image(
+        self, obs: dict[str, Any], key: str, *, fallback_index: int
+    ) -> np.ndarray:
         images = obs.get("images", {})
         img = images.get(key) if isinstance(images, dict) else None
         if img is None and isinstance(images, dict):
@@ -238,9 +261,13 @@ class PI05LiberoPipeline:
         tensor = tensor * 2.0 - 1.0
         return tensor.squeeze(0).permute(2, 0, 1).contiguous()
 
-    def _resize_with_pad(self, images: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    def _resize_with_pad(
+        self, images: torch.Tensor, height: int, width: int
+    ) -> torch.Tensor:
         if images.dim() != 4 or images.shape[-1] != 3:
-            raise ValueError(f"Expected BHWC RGB images, got shape {tuple(images.shape)}")
+            raise ValueError(
+                f"Expected BHWC RGB images, got shape {tuple(images.shape)}"
+            )
         images = images.permute(0, 3, 1, 2)
         _, _, cur_height, cur_width = images.shape
         ratio = max(cur_width / width, cur_height / height)
