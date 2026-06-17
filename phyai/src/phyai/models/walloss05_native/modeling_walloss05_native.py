@@ -395,6 +395,65 @@ class WallOSS05NormMoeNative(nn.Module):
         return new_hidden_states, None, None
 
 
+
+
+class WallOSS05DecoderFFNBlockNative(nn.Module):
+    """Non-attention FFN/MoE subpath of a WALL-OSS-0.5 decoder layer.
+
+    This mirrors the post-attention part of Qwen2_5_VLDecoderLayer_with_MoE:
+    residual -> post_attention_norm_moe -> sparse_moe -> residual add.
+    Attention and KV-cache logic are intentionally out of scope for this block.
+    """
+
+    def __init__(
+        self,
+        config: WallOSS05NativeConfig,
+        *,
+        layer_idx: int,
+        params_dtype: torch.dtype = torch.float32,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__()
+        self.post_attention_norm = WallOSS05NormMoeNative(
+            config,
+            layer_idx=layer_idx,
+            kind="post_attention",
+            dtype=torch.float32,
+            device=device,
+        )
+        self.moe = WallOSS05SparseMoeBlockNative(
+            config,
+            layer_idx=layer_idx,
+            params_dtype=params_dtype,
+            device=device,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+        adarms_conds: list[torch.Tensor | None] | None = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states, gate, gate_mask = self.post_attention_norm(
+            hidden_states,
+            start_indices,
+            end_indices,
+            adarms_conds=adarms_conds,
+        )
+        if gate is not None or gate_mask is not None:
+            raise NotImplementedError("WALL-OSS-0.5 baseline FFN block expects no adaptive RMSNorm gate")
+
+        hidden_states = self.moe(
+            hidden_states,
+            experts_indices=None,
+            start_indices=start_indices,
+            end_indices=end_indices,
+        )
+        return residual + hidden_states
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
@@ -409,6 +468,7 @@ def walloss05_native_weight_remap(key: str) -> str | None:
 __all__ = [
     "WallOSS05ActionProcessorNative",
     "WallOSS05BlockSparseMLPNative",
+    "WallOSS05DecoderFFNBlockNative",
     "WallOSS05NormMoeNative",
     "WallOSS05Qwen2RMSNormNative",
     "WallOSS05SparseMoeBlockNative",

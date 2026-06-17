@@ -4,6 +4,7 @@ from .configuration_walloss05_native import WallOSS05NativeConfig
 from .modeling_walloss05_native import (
     WallOSS05ActionProcessorNative,
     WallOSS05BlockSparseMLPNative,
+    WallOSS05DecoderFFNBlockNative,
     WallOSS05NormMoeNative,
     WallOSS05Qwen2RMSNormNative,
     WallOSS05SparseMoeBlockNative,
@@ -15,6 +16,7 @@ __all__ = [
     "WallOSS05NativeConfig",
     "WallOSS05ActionProcessorNative",
     "WallOSS05BlockSparseMLPNative",
+    "WallOSS05DecoderFFNBlockNative",
     "WallOSS05NormMoeNative",
     "WallOSS05Qwen2RMSNormNative",
     "WallOSS05SparseMoeBlockNative",
