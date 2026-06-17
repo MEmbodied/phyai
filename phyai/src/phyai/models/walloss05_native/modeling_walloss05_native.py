@@ -651,6 +651,158 @@ class WallOSS05MRoPENative(nn.Module):
         return q_embed.to(q_dtype), k_embed.to(k_dtype)
 
 
+
+
+class WallOSS05AttentionCoreNative(nn.Module):
+    """Eager/SDPA attention core for WALL-OSS-0.5 JointQwen2VLAttention.
+
+    Inputs are expected after qkv projection and M-RoPE:
+      query_states: [B, S, num_heads, head_dim]
+      key_states:   [B, S, num_kv_heads, head_dim]
+      value_states: [B, S, num_kv_heads, head_dim]
+
+    This module covers transpose, repeat_kv, mask handling, SDPA, and reshape.
+    Projection, RoPE, output projection, and KV cache are intentionally out of scope.
+    """
+
+    def __init__(self, config: WallOSS05NativeConfig):
+        super().__init__()
+        self.hidden_size = int(config.hidden_size)
+        self.num_heads = int(config.num_attention_heads)
+        self.num_key_value_heads = int(config.num_key_value_heads)
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.attention_dropout = float(config.attention_dropout)
+        self.is_causal = True
+
+    @staticmethod
+    def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """Match official JointQwen2VLAttention.repeat_kv layout.
+
+        Input:  [B, S, num_kv_heads, D]
+        Output: [B, S, num_kv_heads * n_rep, D]
+        """
+        if n_rep == 1:
+            return hidden_states
+
+        batch, slen, num_key_value_heads, head_dim = hidden_states.shape
+        hidden_states = hidden_states.unsqueeze(3)
+        hidden_states = hidden_states.expand(
+            batch,
+            slen,
+            num_key_value_heads,
+            n_rep,
+            head_dim,
+        )
+        return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
+
+    @staticmethod
+    def _prepare_causal_mask(
+        attention_mask: torch.Tensor | None,
+        *,
+        bsz: int,
+        q_len: int,
+        key_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        causal_mask = attention_mask
+        if attention_mask is not None:
+            if len(attention_mask.shape) == 2:
+                _, seq_len = attention_mask.shape
+                causal_mask = attention_mask.view(bsz, 1, 1, seq_len).expand(
+                    bsz, 1, q_len, seq_len
+                )
+            elif len(attention_mask.shape) == 3:
+                causal_mask = attention_mask.unsqueeze(1)
+            elif len(attention_mask.shape) == 4:
+                causal_mask = attention_mask
+            else:
+                raise ValueError(f"Unsupported attention_mask shape: {attention_mask.shape}")
+
+            causal_mask = causal_mask.to(torch.bool)
+
+        if q_len == 1:
+            causal_mask = torch.ones(
+                bsz,
+                1,
+                1,
+                key_len,
+                device=device,
+                dtype=dtype,
+            ).contiguous()
+            causal_mask = causal_mask.to(torch.bool)
+
+        return causal_mask
+
+    def forward(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        *,
+        projection_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        bsz, q_len, num_heads, head_dim = query_states.shape
+        if num_heads != self.num_heads or head_dim != self.head_dim:
+            raise ValueError(
+                f"query shape mismatch: got heads={num_heads}, head_dim={head_dim}, "
+                f"expected heads={self.num_heads}, head_dim={self.head_dim}"
+            )
+
+        if key_states.shape[:2] != (bsz, q_len) or value_states.shape[:2] != (bsz, q_len):
+            raise ValueError("key/value states must have same batch and sequence length as query")
+
+        key_states = self.repeat_kv(key_states, self.num_key_value_groups)
+        value_states = self.repeat_kv(value_states, self.num_key_value_groups)
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        if projection_dtype is not None:
+            if query_states.dtype != projection_dtype:
+                query_states = query_states.to(projection_dtype)
+            if key_states.dtype != projection_dtype:
+                key_states = key_states.to(projection_dtype)
+            if value_states.dtype != projection_dtype:
+                value_states = value_states.to(projection_dtype)
+
+        causal_mask = self._prepare_causal_mask(
+            attention_mask,
+            bsz=bsz,
+            q_len=q_len,
+            key_len=key_states.shape[2],
+            device=query_states.device,
+            dtype=query_states.dtype,
+        )
+
+        if query_states.device.type == "cuda" and attention_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        is_causal = True if causal_mask is None and q_len > 1 else False
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=causal_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, -1)
+
+        if projection_dtype is not None and attn_output.dtype != projection_dtype:
+            attn_output = attn_output.to(projection_dtype)
+
+        return attn_output
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
@@ -666,6 +818,7 @@ def walloss05_native_weight_remap(key: str) -> str | None:
 
 __all__ = [
     "WallOSS05ActionProcessorNative",
+    "WallOSS05AttentionCoreNative",
     "WallOSS05BlockSparseMLPNative",
     "WallOSS05DecoderFFNBlockNative",
     "WallOSS05JointAttentionProjectionNative",

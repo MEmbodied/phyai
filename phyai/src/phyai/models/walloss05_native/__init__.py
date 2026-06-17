@@ -3,6 +3,7 @@
 from .configuration_walloss05_native import WallOSS05NativeConfig
 from .modeling_walloss05_native import (
     WallOSS05ActionProcessorNative,
+    WallOSS05AttentionCoreNative,
     WallOSS05BlockSparseMLPNative,
     WallOSS05DecoderFFNBlockNative,
     WallOSS05JointAttentionProjectionNative,
@@ -17,6 +18,7 @@ from .modeling_walloss05_native import (
 __all__ = [
     "WallOSS05NativeConfig",
     "WallOSS05ActionProcessorNative",
+    "WallOSS05AttentionCoreNative",
     "WallOSS05BlockSparseMLPNative",
     "WallOSS05DecoderFFNBlockNative",
     "WallOSS05JointAttentionProjectionNative",
