@@ -454,6 +454,137 @@ class WallOSS05DecoderFFNBlockNative(nn.Module):
         return residual + hidden_states
 
 
+
+
+class WallOSS05JointAttentionProjectionNative(nn.Module):
+    """Projection-only native subset of WALL-OSS-0.5 JointQwen2VLAttention.
+
+    This covers qkv_proj_experts and o_proj_experts only. RoPE, attention core,
+    KV cache, and mask handling are intentionally out of scope for this module.
+    """
+
+    def __init__(
+        self,
+        config: WallOSS05NativeConfig,
+        *,
+        layer_idx: int,
+        params_dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__()
+        self.hidden_size = int(config.hidden_size)
+        self.num_heads = int(config.num_attention_heads)
+        self.num_key_value_heads = int(config.num_key_value_heads)
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.dim_inputs = tuple(int(v) for v in config.dim_inputs)
+
+        qkv_out_features = (
+            self.num_heads * self.head_dim
+            + 2 * self.num_key_value_heads * self.head_dim
+        )
+
+        self.qkv_proj_experts = nn.ModuleList(
+            [
+                ReplicatedLinear(
+                    dim_input,
+                    qkv_out_features,
+                    bias=True,
+                    params_dtype=params_dtype,
+                    device=device,
+                    prefix=f"model.layers.{layer_idx}.self_attn.qkv_proj_experts.{expert_idx}",
+                )
+                for expert_idx, dim_input in enumerate(self.dim_inputs)
+            ]
+        )
+
+        self.o_proj_experts = nn.ModuleList(
+            [
+                ReplicatedLinear(
+                    self.num_heads * self.head_dim,
+                    dim_input,
+                    bias=False,
+                    params_dtype=params_dtype,
+                    device=device,
+                    prefix=f"model.layers.{layer_idx}.self_attn.o_proj_experts.{expert_idx}",
+                )
+                for expert_idx, dim_input in enumerate(self.dim_inputs)
+            ]
+        )
+
+    def project_qkv_permuted(
+        self,
+        hidden_states: torch.Tensor,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        total_tokens, hidden_dim = hidden_states.shape
+        if hidden_dim != self.hidden_size:
+            raise ValueError(f"hidden dim {hidden_dim} != expected {self.hidden_size}")
+
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        kv_dim = self.num_key_value_heads * self.head_dim
+
+        q_buffer = torch.zeros(total_tokens, self.hidden_size, device=device, dtype=dtype)
+        k_buffer = torch.zeros(total_tokens, kv_dim, device=device, dtype=dtype)
+        v_buffer = torch.zeros(total_tokens, kv_dim, device=device, dtype=dtype)
+
+        for expert_idx, qkv_proj in enumerate(self.qkv_proj_experts):
+            start = int(start_indices[expert_idx].item())
+            end = int(end_indices[expert_idx].item())
+            if start == end:
+                continue
+
+            dim_input = self.dim_inputs[expert_idx]
+            expert_input = hidden_states[start:end, :dim_input]
+            if expert_input.dtype != qkv_proj.weight.dtype:
+                expert_input = expert_input.to(qkv_proj.weight.dtype)
+
+            qkv_out = _linear_forward(qkv_proj, expert_input)
+            q_out, k_out, v_out = torch.split(
+                qkv_out,
+                [self.hidden_size, kv_dim, kv_dim],
+                dim=-1,
+            )
+
+            q_buffer[start:end] = q_out.to(dtype)
+            k_buffer[start:end] = k_out.to(dtype)
+            v_buffer[start:end] = v_out.to(dtype)
+
+        return q_buffer, k_buffer, v_buffer
+
+    def project_output_permuted(
+        self,
+        attn_output: torch.Tensor,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        total_tokens, hidden_dim = attn_output.shape
+        if hidden_dim != self.hidden_size:
+            raise ValueError(f"attention hidden dim {hidden_dim} != expected {self.hidden_size}")
+
+        device = attn_output.device
+        dtype = attn_output.dtype
+        output_buffer = torch.zeros(total_tokens, self.hidden_size, device=device, dtype=dtype)
+
+        for expert_idx, o_proj in enumerate(self.o_proj_experts):
+            start = int(start_indices[expert_idx].item())
+            end = int(end_indices[expert_idx].item())
+            if start == end:
+                continue
+
+            dim_input = self.dim_inputs[expert_idx]
+            expert_input = attn_output[start:end]
+            if expert_input.dtype != o_proj.weight.dtype:
+                expert_input = expert_input.to(o_proj.weight.dtype)
+
+            projected = _linear_forward(o_proj, expert_input)
+            output_buffer[start:end, :dim_input] = projected[:, :dim_input].to(dtype)
+
+        return output_buffer
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
@@ -462,6 +593,8 @@ def walloss05_native_weight_remap(key: str) -> str | None:
         return key
     if key.startswith("model.layers.") and (".input_layernorms." in key or ".post_attention_layernorms." in key):
         return key
+    if key.startswith("model.layers.") and (".self_attn.qkv_proj_experts." in key or ".self_attn.o_proj_experts." in key):
+        return key
     return None
 
 
@@ -469,6 +602,7 @@ __all__ = [
     "WallOSS05ActionProcessorNative",
     "WallOSS05BlockSparseMLPNative",
     "WallOSS05DecoderFFNBlockNative",
+    "WallOSS05JointAttentionProjectionNative",
     "WallOSS05NormMoeNative",
     "WallOSS05Qwen2RMSNormNative",
     "WallOSS05SparseMoeBlockNative",
