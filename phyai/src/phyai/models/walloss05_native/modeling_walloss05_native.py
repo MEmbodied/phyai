@@ -803,6 +803,144 @@ class WallOSS05AttentionCoreNative(nn.Module):
         return attn_output
 
 
+
+
+def walloss05_permute_by_expert(
+    tokens: torch.Tensor,
+    expert_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stable PyTorch equivalent of official permute(tokens, expert_indices)."""
+    if expert_indices.dim() == 1:
+        expert_indices = expert_indices.view(-1, 1)
+    expand_factor = expert_indices.size(1)
+    flatten_indices = expert_indices.view(-1)
+    sorted_indices = torch.argsort(flatten_indices, stable=True)
+    permuted_tokens = tokens.index_select(0, sorted_indices // expand_factor)
+    return permuted_tokens, sorted_indices
+
+
+def walloss05_unpermute_by_map(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    probs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Stable PyTorch equivalent of official unpermute(permuted, sorted_indices, probs)."""
+    if probs is not None:
+        merge_factor = probs.size(1)
+    else:
+        merge_factor = 1
+
+    unpermuted_tokens = torch.zeros_like(permuted_tokens)
+    unpermuted_tokens.index_copy_(0, sorted_indices.long(), permuted_tokens)
+    unpermuted_tokens = unpermuted_tokens.reshape(
+        -1,
+        merge_factor,
+        permuted_tokens.size(-1),
+    )
+
+    if probs is not None:
+        unpermuted_tokens = unpermuted_tokens * probs.unsqueeze(-1)
+
+    return unpermuted_tokens.sum(dim=1)
+
+
+class WallOSS05JointAttentionNative(nn.Module):
+    """No-cache, mot_opt native JointQwen2VLAttention path for WALL-OSS-0.5."""
+
+    def __init__(
+        self,
+        config: WallOSS05NativeConfig,
+        *,
+        layer_idx: int,
+        params_dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__()
+        if not config.mot_opt:
+            raise NotImplementedError("Initial native JointAttention supports mot_opt=True only")
+
+        rope_scaling = config.rope_scaling or {}
+        mrope_section = rope_scaling.get("mrope_section")
+        if mrope_section is None:
+            raise ValueError("config.rope_scaling['mrope_section'] is required")
+
+        self.hidden_size = int(config.hidden_size)
+        self.num_heads = int(config.num_attention_heads)
+        self.num_key_value_heads = int(config.num_key_value_heads)
+        self.head_dim = self.hidden_size // self.num_heads
+        self.dim_inputs = tuple(int(v) for v in config.dim_inputs)
+
+        self.projections = WallOSS05JointAttentionProjectionNative(
+            config,
+            layer_idx=layer_idx,
+            params_dtype=params_dtype,
+            device=device,
+        )
+        self.mrope = WallOSS05MRoPENative(mrope_section)
+        self.core = WallOSS05AttentionCoreNative(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        token_types: torch.Tensor,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+        row_id_map: torch.Tensor,
+        probs: torch.Tensor | None,
+        orig_shape: tuple[int, int, int],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        projection_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        bsz, q_len, _ = orig_shape
+        if projection_dtype is None:
+            projection_dtype = self.projections.qkv_proj_experts[0].weight.dtype
+
+        q_buffer, k_buffer, v_buffer = self.projections.project_qkv_permuted(
+            hidden_states,
+            start_indices,
+            end_indices,
+        )
+
+        q_unpermuted = walloss05_unpermute_by_map(q_buffer, row_id_map, probs)
+        k_unpermuted = walloss05_unpermute_by_map(k_buffer, row_id_map, probs)
+        v_unpermuted = walloss05_unpermute_by_map(v_buffer, row_id_map, probs)
+
+        query_states = q_unpermuted.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = k_unpermuted.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = v_unpermuted.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        cos, sin = position_embeddings
+        query_states, key_states = self.mrope(
+            query_states.contiguous(),
+            key_states.contiguous(),
+            cos[..., : (cos.size(3) // 2)].contiguous().float(),
+            sin[..., : (sin.size(3) // 2)].contiguous().float(),
+        )
+
+        attn_output = self.core(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=attention_mask,
+            projection_dtype=projection_dtype,
+        )
+
+        flat_attn_output = attn_output.view(-1, self.hidden_size)
+        flat_expert_indices = token_types.reshape(-1)
+        permuted_attn_output, _ = walloss05_permute_by_expert(
+            flat_attn_output,
+            flat_expert_indices,
+        )
+
+        return self.projections.project_output_permuted(
+            permuted_attn_output,
+            start_indices,
+            end_indices,
+        )
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
@@ -821,6 +959,7 @@ __all__ = [
     "WallOSS05AttentionCoreNative",
     "WallOSS05BlockSparseMLPNative",
     "WallOSS05DecoderFFNBlockNative",
+    "WallOSS05JointAttentionNative",
     "WallOSS05JointAttentionProjectionNative",
     "WallOSS05MRoPENative",
     "WallOSS05NormMoeNative",
