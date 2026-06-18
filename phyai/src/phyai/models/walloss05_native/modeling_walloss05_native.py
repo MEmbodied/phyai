@@ -941,6 +941,93 @@ class WallOSS05JointAttentionNative(nn.Module):
         )
 
 
+
+
+class WallOSS05DecoderLayerNative(nn.Module):
+    """No-cache, mot_opt decoder layer for WALL-OSS-0.5.
+
+    Covers:
+      input_norm_moe -> joint_attention -> residual add ->
+      post_attention_norm_moe -> sparse_moe -> residual add.
+    """
+
+    def __init__(
+        self,
+        config: WallOSS05NativeConfig,
+        *,
+        layer_idx: int,
+        params_dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cpu",
+    ):
+        super().__init__()
+        self.input_norm = WallOSS05NormMoeNative(
+            config,
+            layer_idx=layer_idx,
+            kind="input",
+            dtype=torch.float32,
+            device=device,
+        )
+        self.self_attn = WallOSS05JointAttentionNative(
+            config,
+            layer_idx=layer_idx,
+            params_dtype=params_dtype,
+            device=device,
+        )
+        self.ffn = WallOSS05DecoderFFNBlockNative(
+            config,
+            layer_idx=layer_idx,
+            params_dtype=params_dtype,
+            device=device,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        token_types: torch.Tensor,
+        start_indices: torch.Tensor,
+        end_indices: torch.Tensor,
+        row_id_map: torch.Tensor,
+        probs: torch.Tensor | None,
+        orig_shape: tuple[int, int, int],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
+        adarms_conds: list[torch.Tensor | None] | None = None,
+        projection_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states, gate, gate_mask = self.input_norm(
+            hidden_states,
+            start_indices,
+            end_indices,
+            adarms_conds=adarms_conds,
+        )
+        if gate is not None or gate_mask is not None:
+            raise NotImplementedError("WALL-OSS-0.5 baseline expects no adaptive RMSNorm gate")
+
+        hidden_states = self.self_attn(
+            hidden_states,
+            token_types=token_types,
+            start_indices=start_indices,
+            end_indices=end_indices,
+            row_id_map=row_id_map,
+            probs=probs,
+            orig_shape=orig_shape,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            projection_dtype=projection_dtype,
+        )
+        hidden_states = residual + hidden_states
+
+        hidden_states = self.ffn(
+            hidden_states,
+            start_indices,
+            end_indices,
+            adarms_conds=adarms_conds,
+        )
+        return hidden_states
+
+
 def walloss05_native_weight_remap(key: str) -> str | None:
     """Initial remap for the action processor subset."""
     if key.startswith("action_preprocessor."):
@@ -959,6 +1046,7 @@ __all__ = [
     "WallOSS05AttentionCoreNative",
     "WallOSS05BlockSparseMLPNative",
     "WallOSS05DecoderFFNBlockNative",
+    "WallOSS05DecoderLayerNative",
     "WallOSS05JointAttentionNative",
     "WallOSS05JointAttentionProjectionNative",
     "WallOSS05MRoPENative",
