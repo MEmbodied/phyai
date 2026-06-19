@@ -7,8 +7,31 @@ TODO(wch): make this scheduler public for other models.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
+
+
+def resolve_use_karras_sigmas(value: bool | None, ckpt: str | Path) -> bool:
+    """Resolve the UniPC sigma-schedule choice for a checkpoint.
+
+    Explicit ``value`` wins; ``None`` reads ``use_karras_sigmas`` from the
+    checkpoint's ``scheduler/scheduler_config.json`` (defaulting to ``True`` when the
+    file or key is absent). ``True`` selects the Karras sigma schedule; ``False``
+    selects the linear flow schedule warped by ``flow_shift``.
+    """
+    if value is not None:
+        return bool(value)
+    cfg_path = Path(ckpt) / "scheduler" / "scheduler_config.json"
+    if cfg_path.is_file():
+        import json
+
+        try:
+            return bool(json.loads(cfg_path.read_text()).get("use_karras_sigmas", True))
+        except (ValueError, OSError):
+            return True
+    return True
 
 
 class UniPCMultistepSampler:
@@ -23,6 +46,7 @@ class UniPCMultistepSampler:
         sigma_max: float = 200.0,
         karras_rho: float = 7.0,
         flow_shift: float = 1.0,
+        use_karras_sigmas: bool = True,
         lower_order_final: bool = True,
     ) -> None:
         self.num_train_timesteps = int(num_train_timesteps)
@@ -31,6 +55,7 @@ class UniPCMultistepSampler:
         self.sigma_max = float(sigma_max)
         self.karras_rho = float(karras_rho)
         self.flow_shift = float(flow_shift)
+        self.use_karras_sigmas = bool(use_karras_sigmas)
         self.lower_order_final = bool(lower_order_final)
         self.solver_type = "bh2"
         self.predict_x0 = True
@@ -53,19 +78,39 @@ class UniPCMultistepSampler:
     def set_timesteps(
         self, num_inference_steps: int, device: torch.device | str | None = None
     ) -> None:
-        """Build the Karras→flow-remapped sigma schedule (+ trailing 0)."""
+        """Build the sigma schedule (+ trailing 0).
+
+        Two schedules selected by ``use_karras_sigmas``:
+
+        * ``True`` (default): Karras sigmas between the configured bounds, then the
+          flow remap ``sigma/(sigma+1)``. ``flow_shift`` is not applied on this path.
+        * ``False``: linear flow sigmas ``linspace(1, 1/num_train, n+1)[:-1]`` warped
+          by ``flow_shift*s/(1+(flow_shift-1)*s)``; a larger ``flow_shift`` keeps more
+          steps at high noise.
+        """
         n = int(num_inference_steps)
-        # Karras sigmas from the configured bounds (alphas_cumprod not needed on
-        # the flow path: _convert_to_karras reads sigma_min/max directly).
-        ramp = np.linspace(0, 1, n)
-        min_inv_rho = self.sigma_min ** (1.0 / self.karras_rho)
-        max_inv_rho = self.sigma_max ** (1.0 / self.karras_rho)
-        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self.karras_rho
-        # Flow remap (matches diffusers use_flow_sigmas + use_karras_sigmas path):
-        # sigmas/(sigmas+1), then timesteps = sigma * num_train_timesteps. flow_shift
-        # is not applied on the karras path (the diffusers __call__ leaves it at the
-        # scheduler_config 1.0), so it is intentionally unused beyond record-keeping.
-        sigmas = sigmas / (sigmas + 1.0)
+        if self.use_karras_sigmas:
+            # Karras sigmas from the configured bounds (read sigma_min/max directly),
+            # then the flow remap sigma/(sigma+1). flow_shift is unused on this path.
+            ramp = np.linspace(0, 1, n)
+            min_inv_rho = self.sigma_min ** (1.0 / self.karras_rho)
+            max_inv_rho = self.sigma_max ** (1.0 / self.karras_rho)
+            sigmas = (
+                max_inv_rho + ramp * (min_inv_rho - max_inv_rho)
+            ) ** self.karras_rho
+            sigmas = sigmas / (sigmas + 1.0)
+        else:
+            shift = self.flow_shift
+            base = (
+                1.0
+                - np.linspace(
+                    1.0, 1.0 / self.num_train_timesteps, self.num_train_timesteps
+                )[::-1]
+            )
+            base = shift * base / (1.0 + (shift - 1.0) * base)
+            sigma_max, sigma_min = float(base[0]), float(base[-1])
+            sigmas = np.linspace(sigma_max, sigma_min, n + 1)[:-1]
+            sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
         timesteps = (sigmas * self.num_train_timesteps).copy()
         # final_sigmas_type="zero": append a trailing zero sigma.
         sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)

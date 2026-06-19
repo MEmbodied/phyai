@@ -24,7 +24,7 @@ modeling_xxx.py     - Pure architecture definition: stateless, no KV cache, no r
 model_runner_xxx.py - Runtime state management: KV cache pool, condition cache, prefill/decode switching
 scheduler_xxx.py    - Orchestration loop: denoise loop, sampler, CFG, multi-step orchestration,
                       multi-GPU and multi-stage coordination
-vae.py              - Extra models or processing files, such as VAE, tokenizers, and auxiliary models
+vae.py              - Extra models or processing files, such as VAE, and auxiliary models
 ```
 
 **Never:**
@@ -201,6 +201,25 @@ class XxxModel(nn.Module):
 
 ## Validation Workflow
 
+Validation must compare PHYAI against the original reference implementation, not only against
+shape checks or smoke tests. Keep the reference repository available locally when possible, run the
+same checkpoint and deterministic inputs through both implementations, and save enough intermediate
+tensors to identify the first layer that diverges.
+
+Before judging final quality, align the basics with the reference repository:
+
+1. Use the same checkpoint, tokenizer or processor, preprocessing rules, dtype policy, random seed,
+   timestep schedule, sampler settings, guidance settings, and device placement.
+2. Verify config parity: every architecture field that affects tensor shapes, attention layout,
+   normalization, MLP width, RoPE, patching, channel order, or action/video dimensions must match
+   the reference.
+3. Verify weight parity: map each checkpoint tensor to the intended PHYAI parameter, check missing
+   and unexpected keys, and spot-check representative tensor values after loading.
+4. Verify input parity: feed identical model-ready tensors to both implementations. If processors
+   differ, dump the processed tensors and compare them before running the model.
+5. Compare progressively: embedding/projection outputs, each block or major submodule, final model
+   outputs, and finally the scheduler or end-to-end result.
+
 ### Single-Step Velocity Parity
 
 ```python
@@ -209,12 +228,25 @@ class XxxModel(nn.Module):
 cosine = F.cosine_similarity(phyai_out.flatten(), ref_out.flatten(), dim=0)
 ```
 
+For a diffusion or flow model, compare the predicted velocity/noise/action for one fixed step
+against the reference repository first. The final single-step output cosine similarity must be
+greater than `0.99`. If it is below `0.99`, do not treat the port as validated; find the earliest
+diverging intermediate tensor and fix the corresponding config, weight mapping, layout, precision,
+or preprocessing issue.
+
 ### End-to-End Inference Validation
 
 ```python
 # Determinism: same seed -> exactly identical output, cosine = 1.0.
 # Convergence: after the denoise loop, output std should be far below noise std.
 ```
+
+After single-step parity passes, run the full PHYAI scheduler against the reference repository with
+the same request and deterministic seed. The final end-to-end result should also reach cosine
+similarity greater than `0.99` against the reference output, unless the reference uses a documented
+non-deterministic kernel. If it cannot meet this threshold, document the exact source of drift and
+whether it comes from precision, sampler implementation, preprocessing, or an intentional algorithmic
+deviation.
 
 ### Weight Loading Validation
 

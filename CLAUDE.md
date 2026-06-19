@@ -33,7 +33,7 @@ uv run pytest phyai/tests/layers/attention/test_static_cached_attention.py
 uv run pytest phyai/tests/parallel/test_collectives.py::test_all_reduce_basic
 
 # End-to-end pi0.5 demo (edit PI05_BASE_WEIGHTS in the script first)
-uv run python examples/run_pi05.py
+uv run python examples/pi05/run_pi05.py
 
 # Pre-commit: clang-format (C/C++, excludes third_party/), codespell, ruff-format
 scripts/setup_dev_env.sh            # one-time: install pre-commit hooks

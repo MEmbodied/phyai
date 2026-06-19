@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from phyai.models.cosmos3.model_runner_policy_cosmos3 import Cosmos3ActionRunner
 from phyai.models.cosmos3.model_runner_vae_cosmos3 import Cosmos3VAERunner
 from phyai.models.cosmos3.modeling_cosmos3 import Cosmos3Transformer
 from phyai.models.cosmos3.sampler_unipc import UniPCMultistepSampler
-from phyai.models.cosmos3.scheduler_ws1_cosmos3 import (
-    Cosmos3ActionRequest,
-    _ACTION_MODES,
-)
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
 from phyai.runtime.schedule import Scheduler
 from phyai.utils import this_rank_log
@@ -21,6 +19,52 @@ from phyai.utils.profile import event_scope
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Cosmos3ActionRequest:
+    """One Cosmos3 action request — policy / forward_dynamics / inverse_dynamics.
+
+    ``mode`` selects what is clean (conditioned) vs noised (generated):
+
+    * ``policy`` — observation frame 0 clean, rest of the video noised; action all
+      noised. Produces the action trajectory (+ a rollout video).
+    * ``forward_dynamics`` — frame 0 clean + the action all clean (given); video
+      noised. Produces the rollout video.
+    * ``inverse_dynamics`` — the whole video clean (given); action all noised.
+      Recovers the action trajectory.
+
+    ``cond_video_latents`` are VAE-encoded observation latents ``[1, C, t, h, w]``
+    (the clean frames are read from it); ``cond_action`` ``[1, chunk, action_dim]``
+    is the clean action (forward_dynamics). ``raw_action_dim`` is the embodiment's
+    true action width (the tail up to ``action_dim`` is zero-padded / sliced off).
+    """
+
+    text_ids: torch.Tensor
+    text_mask: torch.Tensor
+    neg_text_ids: torch.Tensor
+    neg_text_mask: torch.Tensor
+    video_shape: tuple[int, int, int]
+    mode: str
+    domain_id: int
+    action_chunk: int
+    raw_action_dim: int
+    action_dim: int = 64
+    cond_video_latents: torch.Tensor | None = None
+    cond_video_pixels: torch.Tensor | None = None
+    cond_action: torch.Tensor | None = None
+    # Clean (conditioned) video latent-frame indices. ``None`` uses the per-mode
+    # default (inverse_dynamics = all frames; policy/forward_dynamics = ``[0]``).
+    # For a multi-frame VIDEO observation conditioned on its first two latent frames,
+    # pass ``(0, 1)``.
+    cond_frame_indexes: tuple[int, ...] | None = None
+    fps: float = 24.0
+    num_inference_steps: int = 30
+    guidance_scale: float = 1.0
+    seed: int = 42
+
+
+_ACTION_MODES = ("policy", "forward_dynamics", "inverse_dynamics")
 
 
 class Cosmos3PolicyScheduler(Scheduler):
@@ -32,7 +76,8 @@ class Cosmos3PolicyScheduler(Scheduler):
         *,
         vae: Cosmos3WanVAE | None = None,
         device: torch.device | str | None = None,
-        flow_shift: float = 1.0,
+        flow_shift: float = 10.0,
+        use_karras_sigmas: bool = True,
         use_cuda_graph: bool = True,
     ) -> None:
         self.transformer = transformer
@@ -43,6 +88,7 @@ class Cosmos3PolicyScheduler(Scheduler):
         self.dtype = next(transformer.parameters()).dtype
         self.latent_channel = transformer.latent_channel_size
         self._flow_shift = flow_shift
+        self._use_karras_sigmas = bool(use_karras_sigmas)
         self.runner = Cosmos3ActionRunner(
             transformer, device=self.device, use_cuda_graph=use_cuda_graph
         )
@@ -108,21 +154,31 @@ class Cosmos3PolicyScheduler(Scheduler):
         )
         domain = torch.tensor([request.domain_id], device=dev, dtype=torch.long)
 
-        # Clean (conditioned) vs noised (generated) per mode.
-        video_clean = list(range(t_lat)) if request.mode == "inverse_dynamics" else [0]
+        # Clean (conditioned) vs noised (generated) per mode. ``cond_frame_indexes``
+        # overrides the per-mode default (e.g. [0,1] for a video observation).
+        if request.cond_frame_indexes is not None:
+            video_clean = list(request.cond_frame_indexes)
+        elif request.mode == "inverse_dynamics":
+            video_clean = list(range(t_lat))
+        else:
+            video_clean = [0]
         action_clean = request.mode == "forward_dynamics"
 
-        # Seeding order mirrors Cosmos3T2VScheduler.step_action exactly (video then
-        # action from the same CPU generator) so the two paths are bit-comparable.
-        gen = torch.Generator(device="cpu").manual_seed(int(request.seed))
-        video = torch.randn(
-            (1, self.latent_channel, t_lat, h_lat, w_lat),
-            generator=gen,
-            dtype=torch.float32,
+        # Initial noise uses a fresh ``np.random.RandomState(seed)`` per modality
+        # (video and action each reseeded with the same seed). The leading batch-1
+        # axis is row-major over the per-sample draw. Kept identical to
+        # ``Cosmos3T2VScheduler.step_action`` so the two paths stay comparable.
+        seed = int(request.seed)
+        video = torch.from_numpy(
+            np.random.RandomState(seed)
+            .standard_normal((1, self.latent_channel, t_lat, h_lat, w_lat))
+            .astype("float32")
         ).to(dev, dt)
-        action = torch.randn((1, chunk, ad), generator=gen, dtype=torch.float32).to(
-            dev, dt
-        )
+        action = torch.from_numpy(
+            np.random.RandomState(seed)
+            .standard_normal((1, chunk, ad))
+            .astype("float32")
+        ).to(dev, dt)
         action[:, :, raw:] = 0.0  # zero the pad tail beyond the embodiment's dim
 
         cond_video = (
@@ -151,9 +207,13 @@ class Cosmos3PolicyScheduler(Scheduler):
         neg_ids, neg_mask = request.neg_text_ids.to(dev), request.neg_text_mask.to(dev)
         do_cfg = request.guidance_scale > 1.0
 
-        uni_v = UniPCMultistepSampler(flow_shift=self._flow_shift)
+        uni_v = UniPCMultistepSampler(
+            flow_shift=self._flow_shift, use_karras_sigmas=self._use_karras_sigmas
+        )
         uni_v.set_timesteps(request.num_inference_steps, device=dev)
-        uni_a = UniPCMultistepSampler(flow_shift=self._flow_shift)
+        uni_a = UniPCMultistepSampler(
+            flow_shift=self._flow_shift, use_karras_sigmas=self._use_karras_sigmas
+        )
         uni_a.set_timesteps(request.num_inference_steps, device=dev)
 
         self.runner.reset()
@@ -209,4 +269,4 @@ class Cosmos3PolicyScheduler(Scheduler):
         return out
 
 
-__all__ = ["Cosmos3PolicyScheduler"]
+__all__ = ["Cosmos3ActionRequest", "Cosmos3PolicyScheduler"]

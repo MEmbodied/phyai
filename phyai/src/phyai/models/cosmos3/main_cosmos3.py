@@ -24,6 +24,7 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3Transformer,
     cosmos3_weight_remap,
 )
+from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
 from phyai.models.cosmos3.scheduler_ws1_cosmos3 import (
     Cosmos3T2VRequest,
     Cosmos3T2VScheduler,
@@ -42,7 +43,12 @@ class Cosmos3Args(EntryArgs):
 
     checkpoint_dir: str | Path | None = None
     config: Cosmos3Config | None = None
-    flow_shift: float = 1.0
+    # cosmos-framework native generation default (sample_args ``shift=10.0``).
+    flow_shift: float = 10.0
+    # UniPC sigma schedule. Default False = linear-flow + flow_shift, matching the
+    # cosmos-framework native generation sampler. True = Karras (diffusers); ``None``
+    # reads use_karras_sigmas from the checkpoint's scheduler_config.json.
+    use_karras_sigmas: bool | None = False
     load_sound: bool | None = None
     weight_strict: bool = False
     torch_compile: bool = False
@@ -124,12 +130,14 @@ class Cosmos3Entry(Entry):
             )
             self.avae = self.avae.to(device=device, dtype=dtype).eval()
 
+        use_karras = resolve_use_karras_sigmas(args.use_karras_sigmas, ckpt)
         self.scheduler = Cosmos3T2VScheduler(
             self.transformer,
             vae=self.vae,
             avae=self.avae,
             device=device,
             flow_shift=args.flow_shift,
+            use_karras_sigmas=use_karras,
             torch_compile=args.torch_compile,
             compile_kwargs=args.compile_kwargs,
         )
@@ -137,9 +145,11 @@ class Cosmos3Entry(Entry):
         this_rank_log(
             logger,
             logging.INFO,
-            "Cosmos3 generation plugin ready (sound=%s, flow_shift=%s).",
+            "Cosmos3 generation plugin ready (sound=%s, flow_shift=%s, "
+            "use_karras_sigmas=%s).",
             self.avae is not None,
             args.flow_shift,
+            use_karras,
         )
 
     def step(

@@ -17,6 +17,7 @@ from phyai_utils_tools.models.cosmos3.steps_cosmos3 import (
     COND_ACTION,
     DOMAIN_ID,
     EMBODIMENT_TO_DOMAIN_ID,
+    EMBODIMENT_TO_RAW_ACTION_DIM,
     MODE,
     NEG_TEXT_IDS,
     NEG_TEXT_MASK,
@@ -28,7 +29,10 @@ from phyai_utils_tools.models.cosmos3.steps_cosmos3 import (
     Cosmos3DomainResolveStep,
     Cosmos3ImagePreprocessStep,
     Cosmos3TextTokenizeStep,
+    cosmos3_default_negative_prompt,
+    cosmos3_generation_caption,
     resolve_domain_id,
+    resolve_raw_action_dim,
 )
 from phyai_utils_tools.processing.transition import PIXEL_VALUES
 
@@ -61,22 +65,71 @@ class Cosmos3TokenizedPrompt:
 
 
 class Cosmos3Processor:
-    """Qwen2 chat-template tokenizer for Cosmos3 T2V prompts."""
+    """Qwen2 chat-template tokenizer for Cosmos3 T2V/I2V/T2AV prompts.
+
+    When the generation dims (``fps``/``num_frames``/``height``/``width``) are given
+    and ``append_metadata`` is set, the positive prompt gets native-style
+    duration/resolution metadata appended (see :func:`cosmos3_generation_caption`).
+    The negative prompt defaults to the native structured "bad video" negative
+    (:func:`cosmos3_default_negative_prompt`); pass an explicit string (e.g. ``""``)
+    to override.
+    """
 
     def __init__(
-        self, tokenizer_name_or_path: str, *, use_system_prompt: bool = False
+        self,
+        tokenizer_name_or_path: str,
+        *,
+        use_system_prompt: bool = False,
+        fps: float | None = None,
+        num_frames: int | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        aspect_ratio: str | None = None,
+        append_metadata: bool = True,
+        negative_prompt: str | None = None,
     ) -> None:
         self.tokenizer = get_tokenizer(tokenizer_name_or_path)
         self.use_system_prompt = use_system_prompt
+        self.fps = fps
+        self.num_frames = num_frames
+        self.height = height
+        self.width = width
+        self.aspect_ratio = aspect_ratio
+        self.append_metadata = bool(append_metadata)
+        self._negative_prompt = negative_prompt
         self.eos_token_id = int(self.tokenizer.eos_token_id)
         self.vision_start_token_id = int(
             self.tokenizer.convert_tokens_to_ids(COSMOS3_VISION_START_TOKEN)
         )
 
+    def _augment(self, prompt: str) -> str:
+        """Append native duration/resolution metadata when the dims are known."""
+        if not self.append_metadata:
+            return prompt
+        if None in (self.fps, self.num_frames, self.height, self.width):
+            return prompt
+        return cosmos3_generation_caption(
+            prompt,
+            fps=self.fps,
+            num_frames=self.num_frames,
+            height=self.height,
+            width=self.width,
+            aspect_ratio=self.aspect_ratio,
+        )
+
     def tokenize(
-        self, prompt: str, *, device: torch.device | str = "cpu"
+        self,
+        prompt: str,
+        *,
+        device: torch.device | str = "cpu",
+        augment: bool = True,
     ) -> Cosmos3TokenizedPrompt:
-        """Tokenize one prompt -> ``[1, S]`` ids + all-ones mask."""
+        """Tokenize one prompt -> ``[1, S]`` ids + all-ones mask.
+
+        ``augment`` controls whether duration/resolution metadata is appended (on
+        for the positive prompt; off for the negative, matching native).
+        """
+        content = self._augment(prompt) if augment else prompt
         conversation = []
         if self.use_system_prompt:
             conversation.append(
@@ -85,7 +138,7 @@ class Cosmos3Processor:
                     "content": "You are a helpful assistant who will generate videos from a given prompt.",
                 }
             )
-        conversation.append({"role": "user", "content": prompt})
+        conversation.append({"role": "user", "content": content})
         out = self.tokenizer.apply_chat_template(
             conversation, tokenize=True, add_generation_prompt=True
         )
@@ -98,13 +151,23 @@ class Cosmos3Processor:
     def tokenize_pair(
         self,
         prompt: str,
-        negative_prompt: str = "",
+        negative_prompt: str | None = None,
         *,
         device: torch.device | str = "cpu",
     ) -> tuple[Cosmos3TokenizedPrompt, Cosmos3TokenizedPrompt]:
-        """Tokenize the conditional + unconditional (negative/empty) prompts."""
-        return self.tokenize(prompt, device=device), self.tokenize(
-            negative_prompt, device=device
+        """Tokenize the conditional + unconditional prompts.
+
+        ``negative_prompt=None`` falls back to the processor's ``negative_prompt``,
+        then to the native structured default. Pass ``""`` for an empty negative.
+        The positive prompt is metadata-augmented; the negative is not.
+        """
+        if negative_prompt is None:
+            negative_prompt = self._negative_prompt
+        if negative_prompt is None:
+            negative_prompt = cosmos3_default_negative_prompt()
+        return (
+            self.tokenize(prompt, device=device, augment=True),
+            self.tokenize(negative_prompt, device=device, augment=False),
         )
 
 
@@ -123,6 +186,7 @@ class Cosmos3PolicyProcessedInputs:
     action_chunk: int
     raw_action_dim: int
     video_shape: tuple[int, int, int]
+    cond_frame_indexes: tuple[int, ...] | None = None
 
 
 class Cosmos3PolicyProcessor(BaseModelProcessor):
@@ -142,9 +206,17 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         mode: str = "policy",
         domain_name: str | int = "agibotworld",
         action_chunk_size: int = 16,
-        raw_action_dim: int = 29,
+        raw_action_dim: int | None = None,
         action_dim: int = 64,
         negative_prompt: str = "",
+        fps: float = 24.0,
+        image_size: int | None = None,
+        append_metadata: bool = True,
+        prompt_format: str = "plain",
+        view_point: str = "ego_view",
+        cond_frame_indexes: tuple[int, ...] | None = None,
+        action_stats_path: str | None = None,
+        action_normalization: str = "minmax",
         device: torch.device | str = "cpu",
         params_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
@@ -155,12 +227,107 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         self.mode = mode
         self.domain_name = domain_name
         self.action_chunk_size = int(action_chunk_size)
-        self.raw_action_dim = int(raw_action_dim)
+        # Resolve the embodiment's raw action width: explicit value wins (and is
+        # cross-checked against the embodiment table when both are known);
+        # otherwise it is looked up from the domain name.
+        self.raw_action_dim = self._resolve_raw_action_dim(raw_action_dim, domain_name)
         self.action_dim = int(action_dim)
         self.negative_prompt = negative_prompt
+        self.fps = float(fps)
+        self.image_size = int(image_size) if image_size is not None else None
+        self.append_metadata = bool(append_metadata)
+        self.prompt_format = prompt_format
+        self.view_point = view_point
+        self.cond_frame_indexes = (
+            tuple(cond_frame_indexes) if cond_frame_indexes is not None else None
+        )
+        self.action_normalization = action_normalization
         self.device = device
         self.params_dtype = params_dtype
+        # Optional output denormalization: tensors built once from an external stats
+        # JSON, applied in postprocess.
+        self._action_mean: torch.Tensor | None = None
+        self._action_std: torch.Tensor | None = None
+        self._action_min: torch.Tensor | None = None
+        self._action_range: torch.Tensor | None = None
+        if action_stats_path is not None:
+            self._load_action_stats(action_stats_path)
         super().__init__()
+
+    def _resolve_raw_action_dim(
+        self, raw_action_dim: int | None, domain_name: str | int
+    ) -> int:
+        """Resolve raw_action_dim from the embodiment, cross-checking if explicit."""
+        if raw_action_dim is None:
+            return resolve_raw_action_dim(domain_name)
+        raw_action_dim = int(raw_action_dim)
+        # Cross-check against the table when the domain name is resolvable.
+        if isinstance(domain_name, str):
+            try:
+                expected = resolve_raw_action_dim(domain_name)
+            except ValueError:
+                expected = None
+            if expected is not None and expected != raw_action_dim:
+                raise ValueError(
+                    f"raw_action_dim={raw_action_dim} conflicts with the table value "
+                    f"{expected} for domain_name={domain_name!r}; pass the matching "
+                    f"value or omit raw_action_dim to auto-resolve."
+                )
+        return raw_action_dim
+
+    def _load_action_stats(self, stats_path: str) -> None:
+        """Load output-denormalization tensors from an external stats JSON.
+
+        The JSON is a dict, optionally with a ``"global"`` (or ``"global_raw"`` for
+        ``quantile_rot``) block. ``meanstd`` uses ``mean``/``std``; ``minmax`` uses
+        ``min``/``max``; ``quantile``/``quantile_rot`` use ``q01``/``q99``.
+        """
+        import json
+
+        with open(stats_path) as f:
+            raw_stats = json.load(f)
+        if not isinstance(raw_stats, dict):
+            raise ValueError(f"Action stats file must contain a dict: {stats_path}")
+        stats_key = (
+            "global_raw" if self.action_normalization == "quantile_rot" else "global"
+        )
+        stats = raw_stats.get(stats_key, raw_stats)
+        if self.action_normalization == "meanstd":
+            self._action_mean = torch.tensor(stats["mean"], dtype=torch.float32)
+            self._action_std = torch.clamp(
+                torch.tensor(stats["std"], dtype=torch.float32), min=1e-8
+            )
+        elif self.action_normalization in ("quantile", "quantile_rot"):
+            self._action_min = torch.tensor(stats["q01"], dtype=torch.float32)
+            q99 = torch.tensor(stats["q99"], dtype=torch.float32)
+            self._action_range = torch.clamp(q99 - self._action_min, min=1e-6)
+        elif self.action_normalization == "minmax":
+            self._action_min = torch.tensor(stats["min"], dtype=torch.float32)
+            amax = torch.tensor(stats["max"], dtype=torch.float32)
+            self._action_range = torch.clamp(amax - self._action_min, min=1e-6)
+        else:
+            raise ValueError(
+                "action_normalization must be one of 'meanstd', 'minmax', "
+                f"'quantile', 'quantile_rot'; got {self.action_normalization!r}."
+            )
+
+    def _denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Invert the configured normalization on the raw-dim action channels.
+
+        Slice to the stats width, then ``x*std+mean`` (meanstd) or
+        ``(x+1)/2*range+min`` (minmax / quantile). No-op when no stats are loaded.
+        """
+        if self._action_mean is not None and self._action_std is not None:
+            dim = self._action_mean.shape[0]
+            mean = self._action_mean.to(action.device)
+            std = self._action_std.to(action.device)
+            return action[..., :dim] * std + mean
+        if self._action_min is not None and self._action_range is not None:
+            dim = self._action_min.shape[0]
+            amin = self._action_min.to(action.device)
+            arange = self._action_range.to(action.device)
+            return (action[..., :dim] + 1.0) / 2.0 * arange + amin
+        return action
 
     def _to_transition(self, raw: dict[str, Any]) -> Transition:
         """Adapt caller's raw dict into the canonical transition."""
@@ -186,16 +353,27 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
             action_chunk=transition[ACTION_CHUNK],
             raw_action_dim=transition[RAW_ACTION_DIM],
             video_shape=transition[VIDEO_SHAPE],
+            cond_frame_indexes=self.cond_frame_indexes,
         )
 
     def build_preprocessor(self) -> ProcessorPipeline:
         steps = [
             Cosmos3ImagePreprocessStep(
-                height=self.height, width=self.width, mode=self.mode
+                height=self.height,
+                width=self.width,
+                mode=self.mode,
+                image_size=self.image_size,
             ),
             Cosmos3TextTokenizeStep(
                 tokenizer_name_or_path=self.tokenizer_name_or_path,
                 negative_prompt=self.negative_prompt,
+                append_metadata=self.append_metadata,
+                prompt_format=self.prompt_format,
+                view_point=self.view_point,
+                # Duration in the caption uses the rollout length = chunk + 1
+                # (the target frame count), not the observation frame count.
+                fps=self.fps,
+                num_frames=self.action_chunk_size + 1,
             ),
             Cosmos3ActionPadStep(
                 action_chunk_size=self.action_chunk_size,
@@ -221,12 +399,21 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         )
 
     def postprocess(self, output: dict[str, Any] | torch.Tensor) -> dict[str, Any]:
-        """Slice action to raw_action_dim and move tensors to CPU."""
+        """Slice action to raw_action_dim, optionally denormalize, move to CPU.
+
+        When action stats were loaded (``action_stats_path``), the sliced action is
+        denormalized back to physical units before moving to CPU; otherwise it is
+        returned in the model's (normalized) action space.
+        """
         if isinstance(output, torch.Tensor):
-            return {"action": output[:, :, : self.raw_action_dim].cpu()}
+            action = self._denormalize_action(output[:, :, : self.raw_action_dim])
+            return {"action": action.cpu()}
         result: dict[str, Any] = {}
         if "action" in output:
-            result["action"] = output["action"][:, :, : self.raw_action_dim].cpu()
+            action = self._denormalize_action(
+                output["action"][:, :, : self.raw_action_dim]
+            )
+            result["action"] = action.cpu()
         if "pixels" in output:
             result["pixels"] = output["pixels"].cpu()
         if "video" in output:
@@ -241,5 +428,9 @@ __all__ = [
     "Cosmos3TokenizedPrompt",
     "COSMOS3_VISION_START_TOKEN",
     "EMBODIMENT_TO_DOMAIN_ID",
+    "EMBODIMENT_TO_RAW_ACTION_DIM",
+    "cosmos3_default_negative_prompt",
+    "cosmos3_generation_caption",
     "resolve_domain_id",
+    "resolve_raw_action_dim",
 ]

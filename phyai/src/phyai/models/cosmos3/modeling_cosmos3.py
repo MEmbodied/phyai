@@ -790,10 +790,10 @@ class Cosmos3Transformer(nn.Module):
         ``[B, S, 1, D]`` (the ``1`` broadcasts over the head axis). When
         ``action_len > 0`` the GEN positions are ``cat([video, action])`` — action
         shares the video's media temporal offset, a ``(T,1,1)`` grid at tcf=1 with
-        ``start_frame_offset=1`` (matches the reference action packing). When
+        ``start_frame_offset=1`` (the action packing convention). When
         ``sound_len > 0`` a sound ``(T,1,1)`` grid (tcf=1, ``start_frame_offset=0``,
         modulated by ``sound_fps``) is appended after the video/action positions
-        (matches the reference sound packing).
+        (the sound packing convention).
         """
         B = text_mask.shape[0]
         s_text = text_mask.shape[1]
@@ -833,6 +833,12 @@ class Cosmos3Transformer(nn.Module):
                     fps=effective_fps,
                     base_fps=self.base_fps,
                     temporal_compression_factor=1,
+                    # Action runs at frame rate (tcf=1) but its fps modulation is
+                    # normalized against the VIDEO temporal compression factor, so
+                    # action and video share a comparable temporal coordinate.
+                    # Omitting base_temporal_compression_factor here would scale the
+                    # action temporal positions by ``temporal_compression_factor``.
+                    base_temporal_compression_factor=self.temporal_compression_factor,
                     enable_fps_modulation=self.enable_fps_modulation,
                     start_frame_offset=1,
                 )

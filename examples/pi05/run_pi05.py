@@ -11,7 +11,7 @@ numbers are meaningless (inputs are random); this verifies wiring + timing.
 
 Run::
 
-    uv run python examples/run_pi05.py --checkpoint /path/to/pi05_base/
+    uv run python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base/
 
 The argument is a HuggingFace-style checkpoint **folder** (or a HuggingFace
 repo id, downloaded on first use): it must contain ``config.json`` and either

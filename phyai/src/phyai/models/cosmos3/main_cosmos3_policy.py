@@ -19,8 +19,11 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3Transformer,
     cosmos3_weight_remap,
 )
-from phyai.models.cosmos3.scheduler_ws1_cosmos3 import Cosmos3ActionRequest
-from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import Cosmos3PolicyScheduler
+from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
+from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
+    Cosmos3ActionRequest,
+    Cosmos3PolicyScheduler,
+)
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
 from phyai.utils import load_config, this_rank_log
 from phyai.weights import load_pretrained
@@ -35,7 +38,12 @@ class Cosmos3PolicyArgs(EntryArgs):
 
     checkpoint_dir: str | Path | None = None
     config: Cosmos3Config | None = None
-    flow_shift: float = 1.0
+    # Default flow_shift for the action-policy sampler.
+    flow_shift: float = 10.0
+    # UniPC sigma schedule: True=Karras (the checkpoint scheduler_config.json
+    # default), False=linear-flow + flow_shift. ``None`` reads ``use_karras_sigmas``
+    # from the checkpoint's ``scheduler/scheduler_config.json`` (falling back to True).
+    use_karras_sigmas: bool | None = None
     decode_video: bool = False
     weight_strict: bool = False
 
@@ -92,20 +100,24 @@ class Cosmos3PolicyEntry(Entry):
             )
             self.vae = self.vae.to(device=device, dtype=dtype).eval()
 
+        use_karras = resolve_use_karras_sigmas(args.use_karras_sigmas, ckpt)
         self.scheduler = Cosmos3PolicyScheduler(
             self.transformer,
             vae=self.vae,
             device=device,
             flow_shift=args.flow_shift,
+            use_karras_sigmas=use_karras,
             use_cuda_graph=eng.runtime.use_cuda_graph,
         )
         self.scheduler.setup()
         this_rank_log(
             logger,
             logging.INFO,
-            "Cosmos3 policy plugin ready (decode_video=%s, flow_shift=%s).",
+            "Cosmos3 policy plugin ready (decode_video=%s, flow_shift=%s, "
+            "use_karras_sigmas=%s).",
             self.decode_video,
             args.flow_shift,
+            use_karras,
         )
 
     def step(

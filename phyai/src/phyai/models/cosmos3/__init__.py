@@ -24,12 +24,14 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
 )
 from phyai.models.cosmos3.sampler_unipc import UniPCMultistepSampler
 from phyai.models.cosmos3.scheduler_ws1_cosmos3 import (
-    Cosmos3ActionRequest,
     Cosmos3T2VRequest,
     Cosmos3T2VScheduler,
     pixel_to_latent_shape,
 )
-from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import Cosmos3PolicyScheduler
+from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
+    Cosmos3ActionRequest,
+    Cosmos3PolicyScheduler,
+)
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from phyai.models.cosmos3.avae_sound import Cosmos3AVAESoundDecoder
@@ -76,47 +77,6 @@ class Cosmos3T2VRequest:
     sound_latent_fps: float = 25.0
 
 
-@dataclass
-class Cosmos3ActionRequest:
-    """One Cosmos3 action request — policy / forward_dynamics / inverse_dynamics.
-
-    ``mode`` selects what is clean (conditioned) vs noised (generated):
-
-    * ``policy`` — observation frame 0 clean, rest of the video noised; action all
-      noised. Produces the action trajectory (+ a rollout video).
-    * ``forward_dynamics`` — frame 0 clean + the action all clean (given); video
-      noised. Produces the rollout video.
-    * ``inverse_dynamics`` — the whole video clean (given); action all noised.
-      Recovers the action trajectory.
-
-    ``cond_video_latents`` are VAE-encoded observation latents ``[1, C, t, h, w]``
-    (the clean frames are read from it); ``cond_action`` ``[1, chunk, action_dim]``
-    is the clean action (forward_dynamics). ``raw_action_dim`` is the embodiment's
-    true action width (the tail up to ``action_dim`` is zero-padded / sliced off).
-    """
-
-    text_ids: torch.Tensor
-    text_mask: torch.Tensor
-    neg_text_ids: torch.Tensor
-    neg_text_mask: torch.Tensor
-    video_shape: tuple[int, int, int]
-    mode: str
-    domain_id: int
-    action_chunk: int
-    raw_action_dim: int
-    action_dim: int = 64
-    cond_video_latents: torch.Tensor | None = None
-    cond_video_pixels: torch.Tensor | None = None
-    cond_action: torch.Tensor | None = None
-    fps: float = 24.0
-    num_inference_steps: int = 30
-    guidance_scale: float = 1.0
-    seed: int = 42
-
-
-_ACTION_MODES = ("policy", "forward_dynamics", "inverse_dynamics")
-
-
 def pixel_to_latent_shape(
     num_frames: int, height: int, width: int, *, temporal: int = 4, spatial: int = 16
 ) -> tuple[int, int, int]:
@@ -139,7 +99,8 @@ class Cosmos3T2VScheduler(Scheduler):
         vae: Cosmos3WanVAE | None = None,
         avae: Cosmos3AVAESoundDecoder | None = None,
         device: torch.device | str | None = None,
-        flow_shift: float = 1.0,
+        flow_shift: float = 10.0,
+        use_karras_sigmas: bool = False,
         torch_compile: bool = False,
         compile_kwargs: dict | None = None,
     ) -> None:
@@ -152,6 +113,7 @@ class Cosmos3T2VScheduler(Scheduler):
         self.dtype = next(transformer.parameters()).dtype
         self.latent_channel = transformer.latent_channel_size
         self._flow_shift = flow_shift
+        self._use_karras_sigmas = bool(use_karras_sigmas)
         # Owns the dense per-branch UND condition cache (no KVCachePool); see
         # Cosmos3T2VRunner. Keeps the modeling stateless and avoids recomputing the
         # timestep-independent UND tower every denoise step. ``torch_compile`` opts
@@ -178,13 +140,15 @@ class Cosmos3T2VScheduler(Scheduler):
         self.unipc: UniPCMultistepSampler | None = None
 
     def setup(self) -> None:
-        """Build the native UniPC sampler (no graph capture; plain Python loop)."""
+        """Build the UniPC sampler (no graph capture; plain Python loop)."""
         self.runner.setup()
         if self.vae_runner is not None:
             self.vae_runner.setup()
         if self.sound_runner is not None:
             self.sound_runner.setup()
-        self.unipc = UniPCMultistepSampler(flow_shift=self._flow_shift)
+        self.unipc = UniPCMultistepSampler(
+            flow_shift=self._flow_shift, use_karras_sigmas=self._use_karras_sigmas
+        )
         this_rank_log(
             logger, logging.INFO, "Cosmos3 video scheduler ready (UniPC, ws=1)."
         )
@@ -208,27 +172,34 @@ class Cosmos3T2VScheduler(Scheduler):
         t_lat, h_lat, w_lat = request.video_shape
         with_sound = request.sound_frames is not None
 
-        # Initial latents: video noise (or the supplied override) drawn first, then
-        # the (always-noised) sound from the same generator — preserving the seeding
-        # order of the prior separate video / video+sound paths.
-        gen = torch.Generator(device="cpu").manual_seed(int(request.seed))
+        # Initial latents: cosmos-framework native draws each modality's noise with a
+        # fresh ``np.random.RandomState(seed)`` (``arch_invariant_rand``), so phyai
+        # matches it modality-by-modality (both reseeded with the same seed). Video is
+        # channel-major ``[1, C, t, h, w]`` (native draws ``[C,T,H,W]``; the batch-1
+        # axis is trivial). The sound latent is token-major ``[1, T_sound, sound_dim]``
+        # here, but native draws it channel-major ``[sound_dim, T_sound]`` — transpose.
+        seed = int(request.seed)
         if request.noise is not None:
             video = request.noise.to(dev, dt)
         else:
-            video = torch.randn(
-                (1, self.latent_channel, t_lat, h_lat, w_lat),
-                generator=gen,
-                dtype=torch.float32,
+            video = torch.from_numpy(
+                np.random.RandomState(seed)
+                .standard_normal((1, self.latent_channel, t_lat, h_lat, w_lat))
+                .astype("float32")
             ).to(dev, dt)
         sound = None
         if with_sound:
-            # Token-major sound latent [1, T_sound, sound_dim] for the transformer;
-            # the AVAE wants channel-major, so transpose only at the end.
-            sound = torch.randn(
-                (1, request.sound_frames, request.sound_dim),
-                generator=gen,
-                dtype=torch.float32,
-            ).to(dev, dt)
+            sound = (
+                torch.from_numpy(
+                    np.random.RandomState(seed)
+                    .standard_normal((request.sound_dim, request.sound_frames))
+                    .astype("float32")
+                )
+                .to(dev, dt)
+                .transpose(0, 1)
+                .unsqueeze(0)
+                .contiguous()
+            )
 
         # I2V/V2V: seed clean condition frames into the initial latent and build a
         # per-frame mask so the transformer skips the timestep on those frames. The
@@ -253,7 +224,9 @@ class Cosmos3T2VScheduler(Scheduler):
         self.unipc.set_timesteps(request.num_inference_steps, device=dev)
         uni_s = None
         if with_sound:
-            uni_s = UniPCMultistepSampler(flow_shift=self._flow_shift)
+            uni_s = UniPCMultistepSampler(
+                flow_shift=self._flow_shift, use_karras_sigmas=self._use_karras_sigmas
+            )
             uni_s.set_timesteps(request.num_inference_steps, device=dev)
 
         # The runner encodes the UND condition once per branch and reuses it across
@@ -307,118 +280,6 @@ class Cosmos3T2VScheduler(Scheduler):
         return video
 
     @torch.no_grad()
-    def step_action(self, request: Cosmos3ActionRequest) -> dict[str, torch.Tensor]:
-        """Joint video+action denoising for the three action modes.
-
-        Returns ``{"video": [1, C, t, h, w], "action": [1, chunk, raw_action_dim]}``.
-        Video and action share the timestep; each is stepped by its own (elementwise)
-        UniPC solver and its clean frames are re-imposed every step.
-        """
-        if self.unipc is None:
-            raise RuntimeError("call setup() before step_action().")
-        if request.mode not in _ACTION_MODES:
-            raise ValueError(
-                f"mode must be one of {_ACTION_MODES}, got {request.mode!r}."
-            )
-        dev, dt = self.device, self.dtype
-        t_lat, h_lat, w_lat = request.video_shape
-        chunk, ad, raw = (
-            request.action_chunk,
-            request.action_dim,
-            request.raw_action_dim,
-        )
-        domain = torch.tensor([request.domain_id], device=dev, dtype=torch.long)
-
-        # Clean (conditioned) vs noised (generated) per mode.
-        video_clean = list(range(t_lat)) if request.mode == "inverse_dynamics" else [0]
-        action_clean = request.mode == "forward_dynamics"
-
-        gen = torch.Generator(device="cpu").manual_seed(int(request.seed))
-        video = torch.randn(
-            (1, self.latent_channel, t_lat, h_lat, w_lat),
-            generator=gen,
-            dtype=torch.float32,
-        ).to(dev, dt)
-        action = torch.randn((1, chunk, ad), generator=gen, dtype=torch.float32).to(
-            dev, dt
-        )
-        action[:, :, raw:] = 0.0  # zero the pad tail beyond the embodiment's dim
-
-        cond_video = (
-            request.cond_video_latents.to(dev, dt)
-            if request.cond_video_latents is not None
-            else None
-        )
-        if cond_video is not None:
-            video[:, :, video_clean] = cond_video[:, :, video_clean]
-        cond_action = (
-            request.cond_action.to(dev, dt) if request.cond_action is not None else None
-        )
-        if action_clean and cond_action is not None:
-            action = cond_action.clone()
-            action[:, :, raw:] = 0.0
-
-        video_mask = torch.ones(1, t_lat, dtype=torch.bool, device=dev)
-        video_mask[:, video_clean] = False
-        action_mask = (
-            torch.zeros(1, chunk, dtype=torch.bool, device=dev)
-            if action_clean
-            else torch.ones(1, chunk, dtype=torch.bool, device=dev)
-        )
-
-        text_ids, text_mask = request.text_ids.to(dev), request.text_mask.to(dev)
-        neg_ids, neg_mask = request.neg_text_ids.to(dev), request.neg_text_mask.to(dev)
-        do_cfg = request.guidance_scale > 1.0
-
-        uni_v = UniPCMultistepSampler(flow_shift=self._flow_shift)
-        uni_v.set_timesteps(request.num_inference_steps, device=dev)
-        uni_a = UniPCMultistepSampler(flow_shift=self._flow_shift)
-        uni_a.set_timesteps(request.num_inference_steps, device=dev)
-
-        self.runner.reset()
-        with event_scope("cosmos3.action_denoise_loop"):
-            for timestep in uni_v.timesteps:
-                tval = timestep.to(dev).reshape(1).to(dt)
-                v_vel, a_vel = self.runner.forward(
-                    "cond",
-                    video,
-                    tval,
-                    text_ids=text_ids,
-                    text_mask=text_mask,
-                    video_shape=request.video_shape,
-                    fps=request.fps,
-                    noisy_frame_mask=video_mask,
-                    action_latents=action,
-                    action_domain_id=domain,
-                    action_noisy_mask=action_mask,
-                )
-                if do_cfg:
-                    vu, au = self.runner.forward(
-                        "uncond",
-                        video,
-                        tval,
-                        text_ids=neg_ids,
-                        text_mask=neg_mask,
-                        video_shape=request.video_shape,
-                        fps=request.fps,
-                        noisy_frame_mask=video_mask,
-                        action_latents=action,
-                        action_domain_id=domain,
-                        action_noisy_mask=action_mask,
-                    )
-                    v_vel = vu + request.guidance_scale * (v_vel - vu)
-                    a_vel = au + request.guidance_scale * (a_vel - au)
-                a_vel[:, :, raw:] = 0.0
-                video = uni_v.step(v_vel, timestep, video)
-                action = uni_a.step(a_vel, timestep, action)
-                if cond_video is not None:
-                    video[:, :, video_clean] = cond_video[:, :, video_clean]
-                if action_clean and cond_action is not None:
-                    action = cond_action.to(action.dtype).clone()
-                    action[:, :, raw:] = 0.0
-        return {"video": video, "action": action[:, :, :raw]}
-
-    @torch.no_grad()
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         """Latents -> pixels ``[B, 3, T, H, W]`` in ``[0, 1]`` (needs a VAE)."""
         if self.vae_runner is None:
@@ -455,6 +316,5 @@ class Cosmos3T2VScheduler(Scheduler):
 __all__ = [
     "Cosmos3T2VScheduler",
     "Cosmos3T2VRequest",
-    "Cosmos3ActionRequest",
     "pixel_to_latent_shape",
 ]
