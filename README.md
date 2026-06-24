@@ -6,11 +6,13 @@
   </picture>
 </p>
 
-[![Docs](https://img.shields.io/badge/docs-phyai-2563EB)](https://phyai.mintlify.app/)
-[![GitHub](https://img.shields.io/badge/github-MEmbodied%2Fphyai-181717?logo=github)](https://github.com/MEmbodied/phyai)
-[![License](https://img.shields.io/github/license/MEmbodied/phyai.svg)](LICENSE)
-[![open issues](https://img.shields.io/github/issues-raw/MEmbodied/phyai)](https://github.com/MEmbodied/phyai/issues)
-[![Nightly](https://img.shields.io/badge/nightly-packages-60A5FA)](https://membodied.github.io/phyai/simple/)
+<p align="center">
+  <a href="https://phyai.mintlify.app/"><img alt="Docs" src="https://img.shields.io/badge/docs-phyai-2563EB"></a>
+  <a href="https://github.com/MEmbodied/phyai"><img alt="GitHub" src="https://img.shields.io/badge/github-MEmbodied%2Fphyai-181717?logo=github"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/MEmbodied/phyai.svg"></a>
+  <a href="https://github.com/MEmbodied/phyai/issues"><img alt="open issues" src="https://img.shields.io/github/issues-raw/MEmbodied/phyai"></a>
+  <a href="https://membodied.github.io/phyai/simple/"><img alt="Nightly" src="https://img.shields.io/badge/nightly-packages-60A5FA"></a>
+</p>
 
 ----
 
