@@ -95,11 +95,11 @@ class TorchKernel:
         # per-channel shape (N,); broadcast it as (1, N).
         w_scale = layer.weight_scale
         if w_scale.ndim == 1:
-            w_scale = w_scale.reshape(1, -1)
-        # Static per-tensor input scale is scalar (1,).
+            w_scale = w_scale.reshape(1, -1).contiguous()
+        # Static per-tensor input scale with shape (M, 1).
         a_scale = layer.input_scale
         if a_scale.ndim == 1 and a_scale.numel() == 1:
-            a_scale = a_scale.reshape(1, 1)
+            a_scale = a_scale.view(1, 1).expand(x_2d.shape[0], 1).contiguous()
         out = torch._scaled_mm(
             x_2d,
             layer.weight.t(),
