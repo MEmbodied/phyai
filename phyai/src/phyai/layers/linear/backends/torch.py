@@ -99,7 +99,7 @@ class TorchKernel:
         # Static per-tensor input scale with shape (M, 1).
         a_scale = layer.input_scale
         if a_scale.ndim == 1 and a_scale.numel() == 1:
-            a_scale = a_scale.reshape(-1, 1)
+            a_scale = a_scale.view(1, 1).expand(x_2d.shape[0], 1).contiguous()
         out = torch._scaled_mm(
             x_2d,
             layer.weight.t(),
