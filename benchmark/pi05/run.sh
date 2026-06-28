@@ -96,13 +96,31 @@ echo "   LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
 echo "============================================================"
 
 # --- GPU busy check. A contended card skews the roofline microbench and the
-# latencies, so refuse by default (override with --skip-check). ---
+# latencies, so refuse by default (override with --skip-check).
+#
+# Single-card boxes need different handling: there is no "other GPU" to move to,
+# and integrated / unified-memory cards (e.g. Jetson Thor) report the whole
+# system's memory as "used" and may report utilization as [N/A]. So on one card
+# we drop the memory gate entirely and judge contention by live utilization
+# alone; on a multi-card box a loaded target just means "pick another one". ---
 if [[ "${SKIP_CHECK}" -eq 0 ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  N_GPUS="$(nvidia-smi --list-gpus 2>/dev/null | wc -l)"
+  [[ "${N_GPUS}" -eq 1 ]] && GPU_WORD="GPU" || GPU_WORD="GPUs"
   read -r USED UTIL < <(nvidia-smi --id="${GPU}" \
     --query-gpu=memory.used,utilization.gpu --format=csv,noheader,nounits 2>/dev/null \
     | tr -d ',' | awk '{print $1, $2}')
-  echo "[check] GPU ${GPU}: ${USED} MiB used, ${UTIL}% util"
-  if [[ "${USED:-0}" -gt 1024 || "${UTIL:-0}" -gt 10 ]]; then
+  # Non-numeric readings (e.g. utilization "[N/A]" on integrated GPUs) -> unknown.
+  [[ "${USED:-}" =~ ^[0-9]+$ ]] || USED=""
+  [[ "${UTIL:-}" =~ ^[0-9]+$ ]] || UTIL=""
+  echo "[check] GPU ${GPU}: ${USED:-?} MiB used, ${UTIL:-?}% util (${N_GPUS} ${GPU_WORD} visible)"
+  if [[ "${N_GPUS}" -le 1 ]]; then
+    # Single card: only live utilization signals contention; ignore baseline memory.
+    if [[ "${UTIL:-0}" -gt 10 ]]; then
+      echo "ERROR: the only GPU looks busy (${UTIL}% util). Benchmark numbers" >&2
+      echo "       would be skewed. Wait for it to free up, or pass --skip-check." >&2
+      exit 1
+    fi
+  elif [[ "${USED:-0}" -gt 1024 || "${UTIL:-0}" -gt 10 ]]; then
     echo "ERROR: GPU ${GPU} looks busy (${USED} MiB / ${UTIL}%). Benchmark numbers" >&2
     echo "       would be skewed. Pick an idle GPU or pass --skip-check." >&2
     exit 1
