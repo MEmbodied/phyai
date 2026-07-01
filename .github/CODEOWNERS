@@ -1,0 +1,20 @@
+# Repository configuration and automation
+/CODEOWNERS @chenghuaWang
+/.github/ @chenghuaWang
+/.devcontainer/ @chenghuaWang
+/pyproject.toml @chenghuaWang
+
+# Workspace packages
+/phyai/ @chenghuaWang
+/phyai-kernel/ @chenghuaWang
+/phyai-ext/ @chenghuaWang
+/phyai-model-optimizer/ @chenghuaWang
+/phyai-utils-tools/ @chenghuaWang
+
+# Documentation, examples, benchmarks, and tooling
+/docs/ @chenghuaWang
+/examples/ @chenghuaWang
+/benchmark/ @chenghuaWang
+/scripts/ @chenghuaWang
+/docker/ @chenghuaWang
+/third_party/ @chenghuaWang
