@@ -18,7 +18,7 @@ from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
 )
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
 from phyai.runtime.schedule import Scheduler
-from phyai.utils import report_progress, this_rank_log
+from phyai.utils import this_rank_log
 from phyai.utils.profile import event_scope
 
 
@@ -219,8 +219,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
             else:
                 br_ids, br_mask, branch = neg_ids, neg_mask, "uncond"
             with event_scope("cosmos3.policy_denoise_loop"):
-                total_steps = len(uni_v.timesteps)
-                for i, timestep in enumerate(uni_v.timesteps):
+                for timestep in uni_v.timesteps:
                     tval = timestep.to(dev).reshape(1).to(dt)
                     v_local, a_local = self.runner.forward(
                         branch,
@@ -248,11 +247,9 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                     if action_clean and cond_action is not None:
                         action = cond_action.to(action.dtype).clone()
                         action[:, :, raw:] = 0.0
-                    report_progress(i + 1, total_steps, phase="policy_denoise")
         else:
             with event_scope("cosmos3.policy_denoise_loop"):
-                total_steps = len(uni_v.timesteps)
-                for i, timestep in enumerate(uni_v.timesteps):
+                for timestep in uni_v.timesteps:
                     tval = timestep.to(dev).reshape(1).to(dt)
                     v_vel, a_vel = self.runner.forward(
                         "cond",
@@ -291,7 +288,6 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                     if action_clean and cond_action is not None:
                         action = cond_action.to(action.dtype).clone()
                         action[:, :, raw:] = 0.0
-                    report_progress(i + 1, total_steps, phase="policy_denoise")
 
         out = {"video": video, "action": action[:, :, :raw]}
         if decode_video:

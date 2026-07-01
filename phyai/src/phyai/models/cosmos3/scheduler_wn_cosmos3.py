@@ -22,7 +22,7 @@ from phyai.models.cosmos3.scheduler_ws1_cosmos3 import (
 )
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
 from phyai.runtime.schedule import Scheduler
-from phyai.utils import report_progress, this_rank_log
+from phyai.utils import this_rank_log
 from phyai.utils.profile import event_scope
 
 
@@ -208,8 +208,7 @@ class Cosmos3T2VWNScheduler(Scheduler):
             else:
                 br_ids, br_mask, branch = neg_ids, neg_mask, "uncond"
             with event_scope(scope):
-                total_steps = len(self.unipc.timesteps)
-                for i, timestep in enumerate(self.unipc.timesteps):
+                for timestep in self.unipc.timesteps:
                     tval = timestep.to(dev).reshape(1).to(dt)
                     out = self.runner.forward(
                         branch,
@@ -237,15 +236,13 @@ class Cosmos3T2VWNScheduler(Scheduler):
                         sound = uni_s.step(s_vel, timestep, sound)
                     if cond_latents is not None:
                         video[:, :, cond_idx] = cond_latents[:, :, cond_idx]
-                    report_progress(i + 1, total_steps, phase="denoise")
             if with_sound:
                 return {"video": video, "sound": sound.transpose(1, 2).contiguous()}
             return video
 
         # No cfg parallel below:
         with event_scope(scope):
-            total_steps = len(self.unipc.timesteps)
-            for i, timestep in enumerate(self.unipc.timesteps):
+            for timestep in self.unipc.timesteps:
                 tval = timestep.to(dev).reshape(1).to(dt)
                 out_c = self.runner.forward(
                     "cond",
@@ -285,7 +282,6 @@ class Cosmos3T2VWNScheduler(Scheduler):
                     sound = uni_s.step(s_vel, timestep, sound)
                 if cond_latents is not None:
                     video[:, :, cond_idx] = cond_latents[:, :, cond_idx]
-                report_progress(i + 1, total_steps, phase="denoise")
 
         if with_sound:
             return {"video": video, "sound": sound.transpose(1, 2).contiguous()}
