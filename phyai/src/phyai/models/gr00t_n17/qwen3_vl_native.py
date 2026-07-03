@@ -49,7 +49,7 @@ def _attach_replicated_hf_key(param: nn.Parameter, hf_key: str) -> None:
 
 
 def _replicated_linear(linear: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
-    out, bias = ReplicatedLinear.forward(linear, x)
+    out, bias = linear(x)
     if bias is not None:
         return out + bias
     return out
@@ -122,7 +122,10 @@ class GR00TN17QwenLinear(ReplicatedLinear):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _replicated_linear(self, x)
+        out, bias = super().forward(x)
+        if bias is not None:
+            return out + bias
+        return out
 
 
 class GR00TN17QwenRMSNorm(nn.Module):
@@ -660,7 +663,7 @@ class GR00TN17QwenVisionModel(nn.Module):
 
     def _vision_preamble(
         self, grid_thw: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
         """Grid-only vision preamble — NOT CUDA-graph-capturable.
 
         Depends solely on ``grid_thw`` (constant for a fixed image size), so it
@@ -1494,6 +1497,16 @@ class GR00TN17NativeQwen3VLModel(nn.Module):
         image_index = (input_ids.reshape(-1) == self.config.image_token_id).nonzero(
             as_tuple=True
         )[0]
+        expected_image_tokens = int(
+            (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2)
+            .sum()
+            .item()
+        )
+        if int(image_index.numel()) != expected_image_tokens:
+            raise ValueError(
+                "Image features and image tokens do not match: "
+                f"tokens={int(image_index.numel())}, features={expected_image_tokens}."
+            )
         buffers = {
             "pixel_values": pixel_values,
             "pos_embed": pos_embed,

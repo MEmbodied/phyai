@@ -522,7 +522,7 @@ def _is_cuda_graph_capturing(x: torch.Tensor) -> bool:
 
 
 def _replicated_linear(linear: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
-    out, bias = ReplicatedLinear.forward(linear, x)
+    out, bias = linear(x)
     if bias is not None:
         return out + bias
     return out
@@ -544,7 +544,10 @@ class GR00TN17Linear(ReplicatedLinear):
         _init_uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _replicated_linear(self, x)
+        out, bias = super().forward(x)
+        if bias is not None:
+            return out + bias
+        return out
 
 
 def _gr00t_n17_action_head_hf_key(local_name: str, prefix: str) -> str:
@@ -1146,7 +1149,7 @@ class GR00TN17DiT(nn.Module):
         all_hidden_states = [hidden_states]
         for idx, block in enumerate(self.transformer_blocks):
             encoder_kv = encoder_kv_cache[idx] if encoder_kv_cache is not None else None
-            if idx % 2 == 1 and self.config.interleave_self_attention:
+            if not block.is_cross_attention:
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=None,
@@ -1210,9 +1213,10 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
         image_attention_mask = image_mask.bool() & backbone_attention_mask.bool()
         non_image_attention_mask = (~image_mask.bool()) & backbone_attention_mask.bool()
         all_hidden_states = [hidden_states]
+        cross_idx = 0
         for idx, block in enumerate(self.transformer_blocks):
             encoder_kv = encoder_kv_cache[idx] if encoder_kv_cache is not None else None
-            if idx % 2 == 1:
+            if not block.is_cross_attention:
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=None,
@@ -1220,10 +1224,11 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
                     temb=temb,
                 )
             else:
-                if idx % (2 * self.attend_text_every_n_blocks) == 0:
+                if cross_idx % self.attend_text_every_n_blocks == 0:
                     curr_mask = non_image_attention_mask
                 else:
                     curr_mask = image_attention_mask
+                cross_idx += 1
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,

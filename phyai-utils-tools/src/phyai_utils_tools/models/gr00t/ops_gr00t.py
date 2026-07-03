@@ -408,7 +408,7 @@ def normalize_values_minmax(
     """Min-max normalize to ``[-1, 1]`` (degenerate dims map to 0)."""
     min_vals = params["min"]
     max_vals = params["max"]
-    normalized = np.zeros_like(values)
+    normalized = np.zeros(values.shape, dtype=np.result_type(values.dtype, np.float32))
     mask = ~np.isclose(max_vals, min_vals)
     normalized[..., mask] = (values[..., mask] - min_vals[..., mask]) / (
         max_vals[..., mask] - min_vals[..., mask]
@@ -434,7 +434,7 @@ def normalize_values_meanstd(
     """Mean-std normalize (zero-std dims pass through unchanged)."""
     mean_vals = params["mean"]
     std_vals = params["std"]
-    normalized = np.zeros_like(values)
+    normalized = np.zeros(values.shape, dtype=np.result_type(values.dtype, np.float32))
     mask = std_vals != 0
     normalized[..., mask] = (values[..., mask] - mean_vals[..., mask]) / std_vals[
         ..., mask
@@ -449,7 +449,9 @@ def unnormalize_values_meanstd(
     """Invert :func:`normalize_values_meanstd`."""
     mean_vals = params["mean"]
     std_vals = params["std"]
-    unnormalized = np.zeros_like(normalized_values)
+    unnormalized = np.zeros(
+        normalized_values.shape, dtype=np.result_type(normalized_values.dtype, np.float32)
+    )
     mask = std_vals != 0
     unnormalized[..., mask] = (
         normalized_values[..., mask] * std_vals[..., mask] + mean_vals[..., mask]
@@ -467,6 +469,16 @@ def relative_non_eef_to_absolute(
     state = reference_state
     if state.ndim == 2:
         state = state[None]
+    if rel.ndim != 3 or state.ndim != 3:
+        raise ValueError(
+            "relative action/state must have shapes (B,T,D)/(B,S,D) "
+            f"or (T,D)/(S,D), got {relative_action.shape} and {reference_state.shape}."
+        )
+    if rel.shape[0] != state.shape[0]:
+        raise ValueError(
+            f"Batch dimension mismatch: relative_action has batch size {rel.shape[0]}, "
+            f"but reference_state has batch size {state.shape[0]}."
+        )
     refs = state[:, -1, :]
     absolute = rel + refs[:, None, :]
     return absolute if is_batched else absolute[0]
@@ -546,6 +558,11 @@ def relative_eef_to_absolute(
         raise ValueError(
             "relative EEF action/state must have shapes (B,T,D)/(B,S,D) "
             f"or (T,D)/(S,D), got {relative_action.shape} and {reference_state.shape}."
+        )
+    if rel.shape[0] != state.shape[0]:
+        raise ValueError(
+            f"Batch dimension mismatch: relative_action has batch size {rel.shape[0]}, "
+            f"but reference_state has batch size {state.shape[0]}."
         )
     if rel.shape[-1] != 9 or state.shape[-1] != 9:
         raise ValueError(

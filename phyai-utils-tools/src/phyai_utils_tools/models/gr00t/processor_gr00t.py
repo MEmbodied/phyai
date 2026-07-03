@@ -295,6 +295,8 @@ class GR00TProcessor:
         self.use_albumentations = bool(use_albumentations)
         self.transformers_loading_kwargs = dict(transformers_loading_kwargs or {})
         self._tokenizer = tokenizer
+        if self._tokenizer is not None:
+            self._tokenizer.padding_side = "left"
         self.vlm_processor = vlm_processor
         if self.vlm_processor is not None and hasattr(self.vlm_processor, "tokenizer"):
             self.vlm_processor.tokenizer.padding_side = "left"
@@ -345,7 +347,7 @@ class GR00TProcessor:
         kwargs.setdefault("clip_outliers", True)
         kwargs["statistics"] = statistics
         kwargs["embodiment_id_mapping"] = embodiment_id_mapping
-        kwargs.update({k: v for k, v in overrides.items() if v is not None})
+        kwargs.update(overrides)
         modality_configs = parse_modality_configs(kwargs.pop("modality_configs"))
         keep = {
             "max_state_dim",
@@ -452,17 +454,21 @@ class GR00TProcessor:
             action = np.asarray(normalized_action)
         cfg = self.modality_config["action"]
         action_horizon = len(cfg.delta_indices)
+        total_dim = sum(
+            int(self.norm_params[self.embodiment_tag]["action"][key]["dim"])
+            for key in cfg.modality_keys
+        )
+        if action.shape[-1] < total_dim:
+            raise ValueError(
+                f"normalized_action last dimension {action.shape[-1]} is smaller "
+                f"than required action dim {total_dim}."
+            )
         out_dict: dict[str, np.ndarray] = {}
         start_idx = 0
         for key in cfg.modality_keys:
             dim = int(self.norm_params[self.embodiment_tag]["action"][key]["dim"])
             out_dict[key] = action[..., :action_horizon, start_idx : start_idx + dim]
             start_idx += dim
-        if action.shape[-1] < start_idx:
-            raise ValueError(
-                f"normalized_action last dimension {action.shape[-1]} is smaller "
-                f"than required action dim {start_idx}."
-            )
         state = None
         if raw_state is not None:
             state = {k.replace("state.", ""): v for k, v in raw_state.items()}
@@ -516,7 +522,7 @@ class GR00TProcessor:
             values = state[key]
             if key in sin_cos_keys:
                 normalized = apply_sin_cos_encoding(values)
-            elif key in mean_std_keys:
+            elif self.use_mean_std or key in mean_std_keys:
                 normalized = normalize_values_meanstd(
                     values, self.norm_params[self.embodiment_tag]["state"][key]
                 )
@@ -544,7 +550,7 @@ class GR00TProcessor:
                     f"Action key {key!r} missing for embodiment {self.embodiment_tag!r}."
                 )
             params = self.norm_params[self.embodiment_tag]["action"][key]
-            if key in mean_std_keys:
+            if self.use_mean_std or key in mean_std_keys:
                 value = unnormalize_values_meanstd(action[key], params)
             else:
                 value = unnormalize_values_minmax(action[key], params)
@@ -740,6 +746,11 @@ class GR00TProcessor:
         expanded: list[str] = []
         for text in texts:
             while image_token in text:
+                if grid_index >= len(grid_list):
+                    raise ValueError(
+                        f"Found more {image_token!r} tokens in the formatted text "
+                        f"than processed images ({len(grid_list)})."
+                    )
                 num = int(np.prod(grid_list[grid_index])) // merge_length
                 text = text.replace(image_token, "<|placeholder|>" * num, 1)
                 grid_index += 1
