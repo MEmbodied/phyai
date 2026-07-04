@@ -165,11 +165,7 @@ class GR00TN17LayerNorm(PhyAILayerNorm):
         bias: torch.Tensor | None,
         eps: float,
     ) -> torch.Tensor:
-        x_float = x.float()
-        mean = x_float.mean(dim=-1, keepdim=True)
-        var = (x_float - mean).square().mean(dim=-1, keepdim=True)
-        out = (x_float - mean) * torch.rsqrt(var + eps)
-        out = out.to(dtype=x.dtype)
+        out = F.layer_norm(x.float(), (x.shape[-1],), None, None, eps).to(dtype=x.dtype)
         if weight is not None:
             out = out * weight.to(device=x.device, dtype=x.dtype)
         if bias is not None:

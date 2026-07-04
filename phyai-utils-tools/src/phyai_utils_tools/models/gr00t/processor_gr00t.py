@@ -212,12 +212,21 @@ def _build_norm_params(
                 )
             action_dim = norm_params[embodiment_tag]["action"][key]["dim"]
             relative = stats_for_tag["relative_action"][key]
-            norm_params[embodiment_tag]["action"][key] = {
-                k: np.asarray(v, dtype=np.float32)
-                for k, v in relative.items()
-                if k in ("min", "max", "mean", "std", "q01", "q99")
+            relative_min_key = "q01" if use_percentiles and "q01" in relative else "min"
+            relative_max_key = "q99" if use_percentiles and "q99" in relative else "max"
+            relative_params = {
+                "min": np.asarray(relative[relative_min_key], dtype=np.float32),
+                "max": np.asarray(relative[relative_max_key], dtype=np.float32),
+                "mean": np.asarray(relative["mean"], dtype=np.float32),
+                "std": np.asarray(relative["std"], dtype=np.float32),
             }
-            norm_params[embodiment_tag]["action"][key]["dim"] = action_dim
+            for optional_key in ("q01", "q99"):
+                if optional_key in relative:
+                    relative_params[optional_key] = np.asarray(
+                        relative[optional_key], dtype=np.float32
+                    )
+            relative_params["dim"] = action_dim
+            norm_params[embodiment_tag]["action"][key] = relative_params
     return norm_params
 
 
@@ -643,8 +652,8 @@ class GR00TProcessor:
     def _process_vlm(self, observation: GR00TObservation) -> dict[str, torch.Tensor]:
         cfg = self.modality_config
         image_keys = cfg["video"].modality_keys
-        images = [torch.from_numpy(observation.video[key]) for key in image_keys]
-        stacked = torch.stack(images, dim=2)
+        images = [observation.video[key] for key in image_keys]
+        stacked = np.stack(images, axis=2)
         if stacked.ndim != 6:
             raise ValueError("stacked video must have shape (B,T,V,H,W,C).")
         batch, time, views, height, width, channels = stacked.shape
@@ -655,7 +664,7 @@ class GR00TProcessor:
             for frame in images_flat[b]:
                 transformed_frames.append(
                     eval_transform_image(
-                        frame.numpy(),
+                        frame,
                         shortest_image_edge=self.shortest_image_edge,
                         image_target_size=self.image_target_size,
                         image_crop_size=self.image_crop_size,
@@ -675,7 +684,7 @@ class GR00TProcessor:
         """Path used by tests that inject a processor-like ``vlm_processor``."""
         processor = self.vlm_processor
         texts: list[str] = []
-        all_images: list[Image.Image] = []
+        all_images: list[list[Image.Image]] = []
         for images_for_item, language in zip(transformed_images, languages):
             pil_images = [
                 Image.fromarray(np.transpose(v, (1, 2, 0))) for v in images_for_item
@@ -693,7 +702,7 @@ class GR00TProcessor:
                 conversation, tokenize=False, add_generation_prompt=False
             )
             texts.append(text)
-            all_images.extend(pil_images)
+            all_images.append(pil_images)
         tokenized = processor(
             text=texts,
             images=all_images,
