@@ -135,7 +135,6 @@ class GR00TN17Entry(Entry):
         )
 
         if args.checkpoint_dir is not None:
-            self.model.backbone._load_qwen3vl_model()
             load_pretrained(
                 self.model,
                 args.checkpoint_dir,
