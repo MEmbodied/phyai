@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """FlashRT PI0.5 latency benchmark using the PhyAI bench runner.
 
-This is a thin adapter around FlashRT's public ``flash_rt.load_model(...).predict``
-path. It mirrors ``benchmark/bench_n_batch_ws1_pi05.py``: framework-specific
-setup lives here, while warmup, timed iterations, JSONL output, and optional
-profiling are handled by ``benchmark/bench_n_batch.py``.
+This is a thin adapter around FlashRT's direct ``Pi05TorchFrontendRtx`` path.
+The direct frontend is used because action chunk size is a frontend constructor
+argument; ``flash_rt.load_model(..., num_steps=...)`` controls denoise steps,
+not action chunk size. It mirrors ``benchmark/bench_n_batch_ws1_pi05.py``:
+framework-specific setup lives here, while warmup, timed iterations, JSONL
+output, and optional profiling are handled by ``benchmark/bench_n_batch.py``.
 
 Run::
 
@@ -14,7 +16,7 @@ Run::
         --batch-sizes 1 --n-warmup 100 --n-timed 100 \
         --result-file results/flashrt_pi05.jsonl
 
-Only batch size 1 is supported because the FlashRT PI0.5 public predict path
+Only batch size 1 is supported because the FlashRT PI0.5 direct frontend path
 used here takes one robot request at a time.
 """
 
@@ -77,25 +79,34 @@ def summarize(values: list[float]) -> dict[str, float] | None:
     }
 
 
-def make_images(num_views: int, seed: int) -> list[np.ndarray]:
-    """Deterministic synthetic HWC uint8 images for latency-only runs."""
+def make_observation(num_views: int, seed: int, prompt: str) -> dict[str, Any]:
+    """Deterministic synthetic observation for latency-only runs."""
     rng = np.random.default_rng(seed)
-    return [
-        rng.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
-        for _ in range(num_views)
-    ]
+    obs: dict[str, Any] = {
+        "image": rng.integers(0, 256, size=(224, 224, 3), dtype=np.uint8),
+        "state": rng.standard_normal(8).astype(np.float32),
+        "task": prompt,
+        "prompt": prompt,
+    }
+    if num_views >= 2:
+        obs["wrist_image"] = rng.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
+    if num_views >= 3:
+        obs["wrist_image_right"] = rng.integers(
+            0, 256, size=(224, 224, 3), dtype=np.uint8
+        )
+    return obs
 
 
-def import_flashrt(repo: Path):
+def import_flashrt_frontend(repo: Path):
     # Use the checked-out FlashRT repository directly; installation is optional.
     sys.path.insert(0, str(repo))
-    import flash_rt
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 
-    return flash_rt
+    return Pi05TorchFrontendRtx
 
 
 def make_setup_fn(args: argparse.Namespace):
-    flash_rt = import_flashrt(args.flashrt_root)
+    frontend_cls = import_flashrt_frontend(args.flashrt_root)
 
     def setup_fn(batch_size: int) -> bnb.BenchSpec:
         if batch_size != 1:
@@ -107,30 +118,29 @@ def make_setup_fn(args: argparse.Namespace):
         else:
             os.environ.pop("FVK_PI05_RTX_FORCE_BF16", None)
 
-        model = flash_rt.load_model(
+        model = frontend_cls(
             args.checkpoint,
-            framework="torch",
-            config="pi05",
-            hardware=args.hardware,
             num_views=args.num_views,
-            num_steps=args.chunk_size,
+            chunk_size=args.chunk_size,
             cache_frames=1,
             use_fp8=(args.precision == "fp8_bf16"),
-            use_fp16=(args.precision == "bf16"),
+            hardware=args.hardware,
         )
-        images = make_images(args.num_views, args.seed)
+        obs = make_observation(args.num_views, args.seed, args.prompt)
 
-        # First call sets the prompt and lazily builds/calibrates the runtime graph.
-        model.predict(images, prompt=args.prompt)
+        # set_prompt builds the prompt-specific pipeline; calibration captures the graph.
+        model.set_prompt(args.prompt)
+        model.calibrate_with_real_data([obs])
+        model.infer(obs)
         torch.cuda.synchronize()
 
         call_count = 0
 
         def step() -> None:
             nonlocal call_count
-            if call_count == args.n_warmup and hasattr(model._pipe, "latency_records"):
-                model._pipe.latency_records.clear()
-            model.predict(images)
+            if call_count == args.n_warmup:
+                model.latency_records.clear()
+            model.infer(obs)
             # FlashRT PI0.5 may use an internal CUDA stream, so synchronize inside the
             # step to make the common runner's timing boundary conservative.
             torch.cuda.synchronize()
@@ -142,11 +152,7 @@ def make_setup_fn(args: argparse.Namespace):
             teardown_callable=lambda: None,
         )
         spec.flashrt_internal_latency_ms = LazySummary(
-            lambda: (
-                [float(x) for x in model._pipe.latency_records]
-                if hasattr(model, "_pipe") and hasattr(model._pipe, "latency_records")
-                else []
-            )
+            lambda: [float(x) for x in getattr(model, "latency_records", [])]
         )  # type: ignore[attr-defined]
         return spec
 
@@ -167,7 +173,7 @@ def make_extras_fn(args: argparse.Namespace):
             "prompt": args.prompt,
             "seed": args.seed,
             "internal_latency_ms": getattr(spec, "flashrt_internal_latency_ms", {}),
-            "timing_scope": "FlashRT predict hot path after first graph-building call; common runner uses perf-counter wall time because FlashRT may run work on a non-default CUDA stream",
+            "timing_scope": "FlashRT direct Pi05TorchFrontendRtx.infer hot path after set_prompt and first graph-building infer; common runner uses perf-counter wall time because FlashRT runs work on an internal CUDA stream",
         }
 
     return extras_fn

@@ -6,7 +6,7 @@ These wrappers do **not** call PhyAI's engine. Each wrapper calls the target run
 
 | File | Runtime measured | Main timing scope |
 | --- | --- | --- |
-| `bench_flashrt_pi05.py` | FlashRT | `flash_rt.load_model(...).predict(...)` public hot path after the first graph-building call |
+| `bench_flashrt_pi05.py` | FlashRT | direct `Pi05TorchFrontendRtx.set_prompt(...); infer(...)` hot path after the first graph-building infer |
 | `bench_realtime_vla_pi05.py` | realtime-vla | `Pi05Inference.forward()` hot path |
 | `bench_vlacpp_pi05_client.py` | vla.cpp | ZMQ client request wall time; server phase timings are stored in JSONL `extras` |
 
