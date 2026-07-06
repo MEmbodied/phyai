@@ -44,6 +44,51 @@ The examples below use placeholders rather than host-specific paths:
 | `<TOKENIZER_DIR_OR_ID>` | Local tokenizer directory or HF id used by vla.cpp client |
 | `<LIBERO_STATS_JSON>` | Local LIBERO `meta/stats.json` for PI0.5 state tokenization |
 
+## Environment Setup
+
+These scripts assume the target runtime can already be imported or executed. Keep each official repo at a known commit and record it with your results.
+
+FlashRT:
+
+```bash
+git clone https://github.com/flashrt-project/FlashRT <FLASHRT_REPO>
+cd <FLASHRT_REPO>
+# Install/build FlashRT following its official README for your GPU/CUDA stack.
+export FLASHRT_ROOT=<FLASHRT_REPO>
+```
+
+Notes: on RTX 5090/SM120, make sure the CUDA toolkit used to build extensions supports the GPU. For the BF16 fair row, the wrapper sets `FVK_PI05_RTX_FORCE_BF16=1`. Do not use `load_model(..., num_steps=50)` for chunk size; FlashRT `num_steps` means denoise steps.
+
+realtime-vla:
+
+```bash
+git clone https://github.com/Dexmal/realtime-vla <REALTIME_VLA_REPO>
+cd <REALTIME_VLA_REPO>
+# Install realtime-vla following its official README.
+export REALTIME_VLA_ROOT=<REALTIME_VLA_REPO>
+```
+
+If you pass a PI0.5 `model.safetensors`, also set `FLASHRT_ROOT` because the wrapper reuses FlashRT's checkpoint conversion helper. Loading `.pkl/.pickle` checkpoints requires `--trust-pickle-checkpoint` and should only be used for trusted files.
+
+vla.cpp:
+
+```bash
+git clone https://github.com/VinRobotics/vla.cpp <VLACPP_REPO>
+cd <VLACPP_REPO>
+# Build vla-server following its official README, for example into build_sm120/.
+export VLACPP_ROOT=<VLACPP_REPO>
+```
+
+Prepare the PI0.5 GGUF model, `mmproj` GGUF, tokenizer, and LIBERO `stats.json` before running. Prefer local tokenizer and stats paths to avoid network/auth issues.
+
+Quick smoke test after setup:
+
+```bash
+python benchmark/pi05/bench_flashrt_pi05.py ... --n-warmup 1 --n-timed 1
+python benchmark/pi05/bench_realtime_vla_pi05.py ... --n-warmup 1 --n-timed 1
+python benchmark/pi05/bench_vlacpp_pi05_client.py ... --n-warmup 1 --n-timed 1
+```
+
 ## FlashRT
 
 `--flashrt-root` can be omitted if `FLASHRT_ROOT=<FLASHRT_REPO>` is set.
