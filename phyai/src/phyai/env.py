@@ -172,6 +172,12 @@ class envs:
         "PHYAI_FLASHINFER_PREFILL_BACKEND", None, str
     )
     PHYAI_FORCE_LINEAR_KERNEL = EnvField("PHYAI_FORCE_LINEAR_KERNEL", None, str)
+    # Backend preference for quantized dense Linear: "auto" | "humming" |
+    # "flashinfer" | "torch". Resolved at materialize time (weight layout is
+    # fixed at load, so the backend can't be a per-forward dispatch choice).
+    # "auto" leans humming for every format humming can run; nvfp4 always uses
+    # flashinfer and bf16 is unquantized regardless.
+    PHYAI_LINEAR_QUANT_BACKEND = EnvField("PHYAI_LINEAR_QUANT_BACKEND", "auto", str)
 
     # ---------- debug / tensor dump ---------- #
     # When the dump dir is set the engine runs eager (cuda graph forced

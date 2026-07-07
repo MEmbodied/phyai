@@ -21,6 +21,7 @@ from phyai.layers.quant.base import AllocationRequest, WeightSpec
 from phyai.layers.quant.bf16 import Bf16Spec
 from phyai.layers.quant.fp8 import Fp8Spec
 from phyai.layers.quant.granularity import Granularity
+from phyai.layers.quant.humming import HummingWeightSpec
 from phyai.layers.quant.linear import ActivationView, LinearActivationQuant
 from phyai.layers.quant.nvfp4 import Nvfp4Spec
 
@@ -31,6 +32,7 @@ __all__ = [
     "Bf16Spec",
     "Fp8Spec",
     "Nvfp4Spec",
+    "HummingWeightSpec",
     "ActivationView",
     "LinearActivationQuant",
 ]

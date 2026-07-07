@@ -102,6 +102,7 @@ Thumbs.db
 # claude & codex
 .claude/settings.local.json
 .agents/
+.mimocode/
 skills-lock.json
 
 # profile

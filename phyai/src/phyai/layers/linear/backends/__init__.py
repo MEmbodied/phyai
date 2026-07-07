@@ -11,6 +11,7 @@ gathered declarations.
 from __future__ import annotations
 
 from phyai.layers.linear.backends.flashinfer import FlashInferKernel
+from phyai.layers.linear.backends.humming import HummingKernel
 from phyai.layers.linear.backends.torch import TorchKernel
 
-__all__ = ["FlashInferKernel", "TorchKernel"]
+__all__ = ["FlashInferKernel", "HummingKernel", "TorchKernel"]

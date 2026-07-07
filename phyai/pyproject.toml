@@ -14,11 +14,16 @@ dependencies = [
     "transformers==5.8.1",
     "huggingface-hub",
     "tqdm",
+    "humming-kernels[cu13]==0.1.10",
+    "rich"
 ]
 
 [project.optional-dependencies]
 ext = ["phyai-ext"]
 fastokenizer = ["fastokens>=0.2.0"]
+
+[project.scripts]
+phyai = "phyai.cli:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

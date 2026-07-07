@@ -12,7 +12,7 @@ _STRATEGY_TO_GRAN = {
     "channel": Granularity.PER_CHANNEL,
     "block": Granularity.BLOCK,
     "token": Granularity.PER_CHANNEL,  # per-token rowwise activation
-    "group": Granularity.PER_CHANNEL,  # no group granularity in the enum yet
+    "group": Granularity.PER_CHANNEL,  # group size carried on TensorQuant.group_size
 }
 
 
@@ -39,12 +39,15 @@ def _to_tensorquant(args: dict) -> TensorQuant:
     block_shape = (
         (int(block[0]), int(block[1])) if strategy == "block" and block else None
     )
+    # ``group`` strategy carries its K-group size; keep 0 for channel/tensor.
+    group_size = int(args.get("group_size", 0) or 0) if strategy == "group" else 0
     return TensorQuant(
         dtype=_dtype_of(args.get("type", "int"), int(args.get("num_bits", 8))),
         granularity=gran,
         symmetric=bool(args.get("symmetric", True)),
         dynamic=bool(args.get("dynamic", False)),
         block_shape=block_shape,
+        group_size=group_size,
     )
 
 

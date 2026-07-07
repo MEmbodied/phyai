@@ -534,7 +534,11 @@ def test_init_force_env_overrides(fake_mesh, monkeypatch):
         ),
     ],
 )
-def test_supported_specs_for_sm(sm, expected):
+def test_supported_specs_for_sm(sm, expected, monkeypatch):
+    # Pin humming off so this asserts the base (bf16/fp8/nvfp4) tiers regardless
+    # of whether humming-kernels is installed in the env; humming-on coverage is
+    # in tests/layers/quant/test_humming.py::test_supported_specs_humming_guarded.
+    monkeypatch.setattr("phyai.layers.linear.has_humming", lambda: False)
     assert L.supported_specs_for_sm(sm) == expected
 
 

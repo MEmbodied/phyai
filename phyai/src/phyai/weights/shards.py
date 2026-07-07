@@ -89,6 +89,98 @@ def fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
     return load
 
 
+def scale_sharded(
+    *,
+    extra_attrs: dict,
+    axis: str = "tp",
+    mesh: Mesh,
+    replicate: int = 1,
+    row_parallel: bool = False,
+) -> WeightLoader:
+    """Shard a scale / zero-point param to match its weight's TP split.
+
+    ``extra_attrs`` is the humming param metadata (``output_dim`` / ``input_dim``
+    / ``packed_dim`` / ``packed_factor`` / ``scale_type``) attached by
+    ``HummingWeightSpec.allocate``. The rule mirrors the weight:
+
+    * Column-family (``row_parallel=False``): shard the N/output dim when the
+      param indexes it (``output_dim`` present); otherwise replicate. K is not
+      sharded on column-parallel, so a group/block scale only moves along N.
+    * Row-family (``row_parallel=True``): shard the K/input dim when the param
+      indexes it (``input_dim`` present); a per-channel scale (``output_dim``
+      only) is replicated because row-parallel does not shard N.
+
+    A param with neither axis (per-tensor ``global_scale``) is replicated.
+    A packed int32 dim is narrowed like any other; the per-rank extent must be a
+    multiple of ``packed_factor`` (enforced by the divisibility check).
+    """
+    out_dim = extra_attrs.get("output_dim")
+    in_dim = extra_attrs.get("input_dim")
+
+    def load(param: torch.nn.Parameter, loaded: torch.Tensor, _shard_id=None) -> None:
+        dim = in_dim if row_parallel else out_dim
+        if dim is None:
+            param.data.copy_(loaded)
+            return
+        rank = mesh.axis_local_rank(axis) // replicate
+        world = mesh.axis_size(axis) // replicate
+        full = loaded.shape[dim]
+        if full % world != 0:
+            raise ValueError(
+                f"scale_sharded: dim {dim} size {full} not divisible by world {world}"
+            )
+        size = full // world
+        param.data.copy_(loaded.narrow(dim, rank * size, size))
+
+    return load
+
+
+@dataclass(frozen=True)
+class _ScaleLeg:
+    """One leg of a fused scale/zero-point load, in *weight* coordinates.
+
+    ``weight_offset`` / ``weight_size`` are the post-shard local N sizes of the
+    leg's weight; ``total_weight`` is their sum across legs. The fused scale's
+    N-extent is a constant factor of the weight's N (1 for channel/group,
+    ``1/group_size_n`` for block, ``num_bits/32`` for packed zero-point), so the
+    scale's per-leg slot is derived proportionally from the param's own shape.
+    """
+
+    weight_offset: int
+    weight_size: int
+    total_weight: int
+    axis: str = "tp"
+    replicate: int = 1
+
+
+def scale_fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
+    """Fused scale/zero-point loader for Merged / QKV linears (column-family).
+
+    Each leg loads from its own disk key, is TP-sharded along ``fuse_dim``
+    (N/output) with GQA ``replicate`` for K/V, and written into the fused
+    param's proportional N-slot. K (dim 1) is never sharded here — column-family
+    linears split N only.
+    """
+
+    def load(param: torch.nn.Parameter, loaded: torch.Tensor, shard_id) -> None:
+        leg = legs[shard_id]
+        d = param.shape[fuse_dim]
+        if (d * leg.weight_size) % leg.total_weight != 0:
+            raise ValueError(
+                f"scale_fused: scale dim {d} not divisible proportionally for leg "
+                f"{leg.weight_size}/{leg.total_weight} (check group/pack alignment)"
+            )
+        dest_size = d * leg.weight_size // leg.total_weight
+        dest_off = d * leg.weight_offset // leg.total_weight
+        rank = mesh.axis_local_rank(leg.axis) // leg.replicate
+        world = mesh.axis_size(leg.axis) // leg.replicate
+        src_size = loaded.shape[fuse_dim] // world
+        src = loaded.narrow(fuse_dim, rank * src_size, src_size)
+        param.data.narrow(fuse_dim, dest_off, dest_size).copy_(src)
+
+    return load
+
+
 def weight_norm_fold(*, eps: float = 1e-12) -> WeightLoader:
     """Fold a legacy ``weight_norm`` (``weight_g`` / ``weight_v``) pair into a dense weight.
 
@@ -150,8 +242,11 @@ def vocab(*, axis: str = "tp", mesh: Mesh) -> WeightLoader:
 __all__ = [
     "WeightLoader",
     "_Leg",
+    "_ScaleLeg",
     "fused",
     "replicated",
+    "scale_fused",
+    "scale_sharded",
     "sharded",
     "vocab",
     "weight_norm_fold",
