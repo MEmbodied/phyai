@@ -1,9 +1,7 @@
-"""GR00T-N1.7 processor — checkpoint-agnostic state/action/vision preprocessing.
+"""GR00T-N1.7 state/action/vision processor.
 
-Relocated out of the phyai engine (``phyai.models.gr00t_n17``) so the engine owns
-only modeling/runner/scheduler and consumes already-prepared tensors. The package
-is a workspace leaf: it depends only on numpy / torch / PIL and an injected (or
-``phyai_utils_tools``-loaded) tokenizer — **no ``phyai`` import**.
+The engine owns modeling, runners, and scheduling. This package prepares tensors
+and decodes normalized actions without importing ``phyai``.
 
 GR00T ships its own structured checkpoint contract:
 
@@ -12,9 +10,8 @@ GR00T ships its own structured checkpoint contract:
 * ``statistics.json`` — min/max, percentile, mean, std for state/action norm.
 * ``embodiment_id.json`` — checkpoint embodiment tag -> action-head slot.
 
-Image/token processing follows the official deterministic eval transform, then a
-native Qwen3-VL preprocessor (patchify + chat-template image-token expansion);
-the pure transforms / normalization math live in :mod:`.ops_gr00t`.
+Image/token processing follows GR00T's deterministic eval transform, then the
+native Qwen3-VL patchify and image-token expansion path.
 """
 
 from __future__ import annotations
@@ -31,7 +28,6 @@ import torch
 
 from phyai_utils_tools.models.gr00t.ops_gr00t import (
     DEFAULT_EMBODIMENT_ID_MAPPING,
-    apply_sin_cos_encoding,
     enum_value,
     eval_transform_image,
     load_json,
@@ -75,7 +71,6 @@ class GR00TModalityConfig:
     delta_indices: list[int]
     modality_keys: list[str]
     action_configs: list[GR00TActionConfig] | None = None
-    sin_cos_embedding_keys: list[str] | None = None
     mean_std_embedding_keys: list[str] | None = None
 
     @classmethod
@@ -90,7 +85,6 @@ class GR00TModalityConfig:
             delta_indices=[int(v) for v in data["delta_indices"]],
             modality_keys=[str(v) for v in data["modality_keys"]],
             action_configs=action_configs,
-            sin_cos_embedding_keys=data.get("sin_cos_embedding_keys"),
             mean_std_embedding_keys=data.get("mean_std_embedding_keys"),
         )
 
@@ -261,18 +255,15 @@ class GR00TProcessor:
         max_action_horizon: int = 40,
         use_percentiles: bool = True,
         clip_outliers: bool = True,
-        apply_sincos_state_encoding: bool = False,
         use_relative_action: bool = False,
         use_mean_std: bool = False,
         exclude_state: bool = False,
         formalize_language: bool = True,
         model_name: str = "nvidia/Cosmos-Reason2-2B",
-        model_type: str = "qwen",
         image_crop_size: list[int] | tuple[int, int] | None = (230, 230),
         image_target_size: list[int] | tuple[int, int] | None = (256, 256),
         shortest_image_edge: int | None = 256,
         crop_fraction: float | None = 0.95,
-        use_albumentations: bool = True,
         transformers_loading_kwargs: dict[str, Any] | None = None,
         tokenizer: Any | None = None,
         vlm_processor: Any | None = None,
@@ -291,17 +282,14 @@ class GR00TProcessor:
         self.use_percentiles = bool(use_percentiles)
         self.use_mean_std = bool(use_mean_std)
         self.clip_outliers = bool(clip_outliers)
-        self.apply_sincos_state_encoding = bool(apply_sincos_state_encoding)
         self.use_relative_action = bool(use_relative_action)
         self.exclude_state = bool(exclude_state)
         self.formalize_language = bool(formalize_language)
         self.model_name = model_name
-        self.model_type = model_type
         self.image_crop_size = tuple2(image_crop_size)
         self.image_target_size = tuple2(image_target_size)
         self.shortest_image_edge = shortest_image_edge
         self.crop_fraction = crop_fraction
-        self.use_albumentations = bool(use_albumentations)
         self.transformers_loading_kwargs = dict(transformers_loading_kwargs or {})
         self._tokenizer = tokenizer
         if self._tokenizer is not None:
@@ -352,7 +340,6 @@ class GR00TProcessor:
             if local_model_dir is not None
             else "nvidia/Cosmos-Reason2-2B",
         )
-        kwargs.setdefault("model_type", "qwen")
         kwargs.setdefault("clip_outliers", True)
         kwargs["statistics"] = statistics
         kwargs["embodiment_id_mapping"] = embodiment_id_mapping
@@ -364,18 +351,15 @@ class GR00TProcessor:
             "max_action_horizon",
             "use_percentiles",
             "clip_outliers",
-            "apply_sincos_state_encoding",
             "use_relative_action",
             "use_mean_std",
             "exclude_state",
             "formalize_language",
             "model_name",
-            "model_type",
             "image_crop_size",
             "image_target_size",
             "shortest_image_edge",
             "crop_fraction",
-            "use_albumentations",
             "transformers_loading_kwargs",
             "tokenizer",
             "vlm_processor",
@@ -517,11 +501,6 @@ class GR00TProcessor:
     def apply_state(self, state: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         normalized_values: dict[str, np.ndarray] = {}
         state_cfg = self.modality_config["state"]
-        sin_cos_keys = (
-            set(state_cfg.sin_cos_embedding_keys or [])
-            if self.apply_sincos_state_encoding
-            else set()
-        )
         mean_std_keys = set(state_cfg.mean_std_embedding_keys or [])
         for key in state_cfg.modality_keys:
             if key not in state:
@@ -529,9 +508,7 @@ class GR00TProcessor:
                     f"State key {key!r} missing for embodiment {self.embodiment_tag!r}."
                 )
             values = state[key]
-            if key in sin_cos_keys:
-                normalized = apply_sin_cos_encoding(values)
-            elif self.use_mean_std or key in mean_std_keys:
+            if self.use_mean_std or key in mean_std_keys:
                 normalized = normalize_values_meanstd(
                     values, self.norm_params[self.embodiment_tag]["state"][key]
                 )
@@ -681,7 +658,7 @@ class GR00TProcessor:
     def _process_vlm_injected(
         self, transformed_images: list[np.ndarray], languages: list[str]
     ) -> dict[str, torch.Tensor]:
-        """Path used by tests that inject a processor-like ``vlm_processor``."""
+        """Use an injected processor-like ``vlm_processor``."""
         processor = self.vlm_processor
         texts: list[str] = []
         all_images: list[list[Image.Image]] = []
@@ -714,12 +691,11 @@ class GR00TProcessor:
     def _process_vlm_native(
         self, transformed_images: list[np.ndarray], languages: list[str]
     ) -> dict[str, torch.Tensor]:
-        """Native Qwen3-VL preprocessing — no ``transformers`` processor.
+        """Native Qwen3-VL preprocessing without a transformers processor.
 
-        Replicates ``Qwen3VLProcessor.__call__``: the Qwen2-VL image processor
-        (``smart_resize`` -> rescale/normalize -> patchify -> ``pixel_values`` +
-        ``image_grid_thw``), the tokenizer's own chat template, and the per-image
-        ``<|image_pad|>`` expansion by ``grid_thw.prod() // merge_size**2``.
+        Uses Qwen-VL image preprocessing, the tokenizer's chat template, and
+        per-image ``<|image_pad|>`` expansion by
+        ``grid_thw.prod() // merge_size**2``.
         """
         tokenizer = self._native_tokenizer()
         params = self._image_params()
@@ -771,7 +747,7 @@ class GR00TProcessor:
         }
         outputs["pixel_values"] = torch.cat(pixel_chunks, dim=0)
         outputs["image_grid_thw"] = torch.tensor(grid_list, dtype=torch.long)
-        # mm_token_type_ids: 1 at image tokens, 0 elsewhere.
+        # mm_token_type_ids is 1 at expanded image tokens and 0 elsewhere.
         input_ids = outputs.get("input_ids")
         if input_ids is not None:
             image_id = tokenizer.convert_tokens_to_ids(image_token)

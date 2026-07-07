@@ -1,13 +1,8 @@
-"""GR00T-N1.7 processor ops — pure, dependency-light transforms.
+"""GR00T-N1.7 processor ops.
 
-Verbatim port of the deterministic eval image transform, the native Qwen3-VL
-image preprocessing (``smart_resize`` + patchify), and the state/action
-normalization math from phyai's in-engine ``processor_gr00t_n17``. These are
-plain functions over numpy / torch / PIL with **no ``phyai`` dependency**, so the
-package stays a workspace leaf.
-
-The image-transform helpers take explicit size/crop primitives instead of a
-processor object, so they are reusable and trivially testable.
+Pure helpers for deterministic eval image transform, Qwen3-VL image
+preprocessing, and GR00T state/action normalization. This package has no
+``phyai`` dependency.
 """
 
 from __future__ import annotations
@@ -303,7 +298,7 @@ def _fractional_center_crop(image: Image.Image, crop_fraction: float) -> Image.I
 def qwen3vl_smart_resize(
     height: int, width: int, *, factor: int, min_pixels: int, max_pixels: int
 ) -> tuple[int, int]:
-    """Qwen2/3-VL ``smart_resize`` — verbatim from the transformers source.
+    """Match Qwen2/3-VL ``smart_resize`` semantics.
 
     Rounds H/W to multiples of ``factor`` while keeping the pixel count in
     ``[min_pixels, max_pixels]`` and the aspect ratio as close as possible.
@@ -329,13 +324,10 @@ def qwen3vl_smart_resize(
 def qwen3vl_process_image(
     image_chw: np.ndarray, params: dict[str, Any]
 ) -> tuple[torch.Tensor, tuple[int, int, int]]:
-    """Native Qwen2-VL image processor for one CHW ``uint8`` image.
+    """Qwen-VL image preprocessing for one CHW ``uint8`` image.
 
-    Reproduces ``Qwen2VLImageProcessor._preprocess`` for a single image
-    (``grid_t = 1``, temporal axis filled by repeating the frame): resize to a
-    ``smart_resize`` grid (BICUBIC, no-op when already aligned), rescale to
-    ``[0, 1]``, normalize with ``image_mean``/``image_std``, then reshape /
-    permute into flattened patches.
+    For a single frame, resize to a ``smart_resize`` grid, rescale/normalize,
+    then reshape into flattened temporal patches.
 
     Returns ``(pixel_values, (grid_t, grid_h, grid_w))`` where ``pixel_values``
     is ``(grid_t*grid_h*grid_w, C*temporal*patch*patch)``.
@@ -395,11 +387,6 @@ def qwen3vl_process_image(
 # --------------------------------------------------------------------------- #
 # State / action normalization math                                          #
 # --------------------------------------------------------------------------- #
-
-
-def apply_sin_cos_encoding(values: np.ndarray) -> np.ndarray:
-    """Concatenate ``[sin(values), cos(values)]`` along the last axis."""
-    return np.concatenate([np.sin(values), np.cos(values)], axis=-1)
 
 
 def normalize_values_minmax(
@@ -586,7 +573,6 @@ def relative_eef_to_absolute(
 __all__ = [
     "DEFAULT_EMBODIMENT_ID_MAPPING",
     "EMBODIMENT_NAME_TO_VALUE",
-    "apply_sin_cos_encoding",
     "enum_value",
     "eval_transform_image",
     "load_json",

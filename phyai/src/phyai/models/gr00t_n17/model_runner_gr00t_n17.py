@@ -20,7 +20,6 @@ from phyai.models.gr00t_n17.modeling_gr00t_n17 import (
     GR00TN17ActionInput,
     GR00TN17BackboneOutput,
     GR00TN17Model,
-    GR00TN17NativeImplementationError,
 )
 from phyai.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb_vision,
@@ -66,19 +65,7 @@ def _right_pad_position_ids(
 
 
 class GR00TN17BackboneRunner(ModelRunner):
-    """Runs the Qwen3-VL backbone and owns its CUDA graph.
-
-    When ``use_cuda_graph=True``, the whole ViT -> multimodal-fuse -> LLM
-    decoder is captured/replayed **here** as one shape-keyed graph. Host-sync
-    preamble work (position ids, visual indices, grid metadata) is planned before
-    capture; the graph itself is pure tensor work.
-
-    Lifecycle: no per-request mutable state, hence no ``reset()`` (the base
-    :class:`ModelRunner` defines only ``setup``/``forward``; ``reset`` is not part
-    of the contract and no runner here implements one). The only cross-call state
-    is the shape-keyed graph registry, intentionally reused across requests and
-    released in :meth:`close`.
-    """
+    """Runs the Qwen3-VL backbone and owns shape-keyed CUDA graphs."""
 
     def __init__(
         self,
@@ -373,13 +360,7 @@ class GR00TN17BackboneRunner(ModelRunner):
 
 
 class GR00TN17ActionHeadRunner(ModelRunner):
-    """Runs the state/action encoders and DiT denoising loop.
-
-    Lifecycle: like the backbone runner, it keeps no per-request mutable state
-    (the constructor flags and the shape-keyed graph registry are the only state,
-    reused across requests and released in :meth:`close`), so it needs no
-    ``reset()`` — which the base :class:`ModelRunner` contract does not define.
-    """
+    """Runs action denoising and owns shape/category-keyed CUDA graphs."""
 
     @staticmethod
     def _supports_cuda_graph_attention(model: GR00TN17Model) -> bool:
@@ -493,6 +474,8 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         if backbone_output.image_mask is not None:
             return backbone_output.image_mask
         attention_mask = backbone_output.backbone_attention_mask
+        if attention_mask is None:
+            raise ValueError("image_mask is required when backbone mask is compacted.")
         key = (
             tuple(attention_mask.shape),
             attention_mask.device.type,
@@ -528,6 +511,8 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         state: torch.Tensor,
         embodiment_id: torch.Tensor,
         noise: torch.Tensor,
+        image_token_indices: torch.Tensor | None = None,
+        non_image_token_indices: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
         static_cat_ids: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
@@ -548,10 +533,33 @@ class GR00TN17ActionHeadRunner(ModelRunner):
             action_input,
             static_cat_ids=static_cat_ids,
         )
+        effective_backbone_attention_mask = (
+            None if backbone_attention_mask.numel() == 0 else backbone_attention_mask
+        )
+        backbone_output = GR00TN17BackboneOutput(
+            backbone_features=backbone_features,
+            backbone_attention_mask=effective_backbone_attention_mask,
+            image_mask=image_mask,
+        )
         actions = action_head.prepare_initial_actions(backbone_features, noise=noise)
         if self.use_cuda_graph:
             actions = actions.clone()
-        encoder_kv_cache = action_head.model.precompute_encoder_kv(backbone_features)
+        encoder_kv_cache_is_masked = False
+        if (
+            action_head.config.use_alternate_vl_dit
+            and image_token_indices is not None
+            and non_image_token_indices is not None
+        ):
+            encoder_kv_cache = action_head.model.precompute_masked_encoder_kv(
+                backbone_features,
+                image_token_indices=image_token_indices,
+                non_image_token_indices=non_image_token_indices,
+            )
+            encoder_kv_cache_is_masked = True
+        else:
+            encoder_kv_cache = action_head.model.precompute_encoder_kv(
+                backbone_features
+            )
         batch_size = actions.shape[0]
         for step in range(action_head.num_inference_timesteps):
             actions = action_head.denoise_step(
@@ -563,6 +571,7 @@ class GR00TN17ActionHeadRunner(ModelRunner):
                 backbone_output=backbone_output,
                 action_input=action_input,
                 encoder_kv_cache=encoder_kv_cache,
+                encoder_kv_cache_is_masked=encoder_kv_cache_is_masked,
                 static_cat_ids=static_cat_ids,
                 timesteps=self._step_timesteps[step, :batch_size],
                 action_position_ids=self._action_position_ids,
@@ -588,6 +597,8 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         state: torch.Tensor,
         embodiment_id: torch.Tensor,
         noise: torch.Tensor,
+        image_token_indices: torch.Tensor | None = None,
+        non_image_token_indices: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self._fwd_loop(
@@ -599,9 +610,21 @@ class GR00TN17ActionHeadRunner(ModelRunner):
             state=state,
             embodiment_id=embodiment_id,
             noise=noise,
+            image_token_indices=image_token_indices,
+            non_image_token_indices=non_image_token_indices,
             action_mask=action_mask,
             static_cat_ids=category_key,
         )
+
+    @staticmethod
+    def _require_shared_mask(mask: torch.Tensor, name: str) -> None:
+        if mask.ndim != 2:
+            raise ValueError(f"{name} must be 2-D, got {tuple(mask.shape)}.")
+        if mask.shape[0] > 1 and not torch.equal(mask, mask[:1].expand_as(mask)):
+            raise ValueError(
+                "GR00T-N1.7 CUDA graph compacted mask path requires identical "
+                f"{name} rows across the batch."
+            )
 
     def _graph_inputs(
         self,
@@ -610,6 +633,48 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         noise: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         image_mask = self._image_mask_tensor(backbone_output)
+        if self.use_cuda_graph:
+            if backbone_output.backbone_attention_mask is None:
+                raise ValueError("CUDA graph path requires a backbone attention mask.")
+            backbone_mask = backbone_output.backbone_attention_mask.bool()
+            image_mask = image_mask.bool()
+            self._require_shared_mask(backbone_mask, "backbone_attention_mask")
+            self._require_shared_mask(image_mask, "image_mask")
+            valid_indices = backbone_mask[0].nonzero(as_tuple=True)[0]
+            if valid_indices.numel() == 0:
+                raise ValueError("backbone_attention_mask has no valid tokens.")
+            backbone_features = backbone_output.backbone_features.index_select(
+                1, valid_indices
+            )
+            compact_image_mask = image_mask.index_select(1, valid_indices)
+            compact_backbone_mask = backbone_mask.new_empty((backbone_mask.shape[0], 0))
+            compact_valid_mask = torch.ones_like(compact_image_mask, dtype=torch.bool)
+            image_attention_mask, non_image_attention_mask = (
+                self._alternate_vl_attention_masks(
+                    compact_valid_mask,
+                    compact_image_mask,
+                )
+            )
+            inputs = {
+                "backbone_features": backbone_features,
+                "backbone_attention_mask": compact_backbone_mask,
+                "image_mask": compact_image_mask,
+                "image_attention_mask": image_attention_mask,
+                "non_image_attention_mask": non_image_attention_mask,
+                "state": action_input.state,
+                "embodiment_id": action_input.embodiment_id,
+                "noise": noise,
+            }
+            if self.model.action_head.config.use_alternate_vl_dit:
+                inputs["image_token_indices"] = compact_image_mask[0].nonzero(
+                    as_tuple=True
+                )[0]
+                inputs["non_image_token_indices"] = (~compact_image_mask[0]).nonzero(
+                    as_tuple=True
+                )[0]
+            if action_input.action_mask is not None:
+                inputs["action_mask"] = action_input.action_mask
+            return inputs
         image_attention_mask, non_image_attention_mask = (
             self._alternate_vl_attention_masks(
                 backbone_output.backbone_attention_mask,
@@ -637,11 +702,6 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         *,
         noise=None,
     ):
-        if action_input.action is not None:
-            raise GR00TN17NativeImplementationError(
-                "RTC/inpainting action inputs are not implemented in the native "
-                "GR00T-N1.7 action runner path yet."
-            )
         action_head = self.model.action_head
         action_head.validate_embodiment_id(action_input.embodiment_id)
         if backbone_output.backbone_features.shape[0] > self.max_batch_size:

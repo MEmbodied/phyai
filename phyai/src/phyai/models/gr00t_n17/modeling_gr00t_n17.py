@@ -21,8 +21,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from phyai.layers.attention import Attention
-from phyai.layers.layer_norm import LayerNorm as PhyAILayerNorm
+from phyai.layers.layer_norm import LayerNorm
 from phyai.layers.linear.layers import ReplicatedLinear
+from phyai.layers.vocab_embedding import VocabParallelEmbedding
 from phyai.models.gr00t_n17.configuration_gr00t_n17 import (
     GR00TN17Config,
     GR00TN17DiTConfig,
@@ -35,7 +36,7 @@ from phyai.weights.shards import replicated
 
 
 # ============================================================================ #
-# Shared primitives / PhyAI wrappers                                            #
+# Shared primitives                                                            #
 # ============================================================================ #
 
 
@@ -69,10 +70,6 @@ def _resolve_backbone_config_dir(
     )
 
 
-class GR00TN17NativeImplementationError(NotImplementedError):
-    """Raised when a GR00T-N1.7 native submodule has not been ported yet."""
-
-
 @dataclass(frozen=True)
 class GR00TN17BackboneOutput:
     """Backbone output consumed by the action head.
@@ -82,7 +79,7 @@ class GR00TN17BackboneOutput:
     """
 
     backbone_features: torch.Tensor
-    backbone_attention_mask: torch.Tensor
+    backbone_attention_mask: torch.Tensor | None
     image_mask: torch.Tensor | None = None
 
 
@@ -99,119 +96,6 @@ class GR00TN17ActionInput:
     state: torch.Tensor
     embodiment_id: torch.Tensor
     action_mask: torch.Tensor | None = None
-    action: torch.Tensor | None = None
-
-
-class GR00TN17Identity(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-
-class GR00TN17Dropout(nn.Module):
-    def __init__(self, p: float = 0.0) -> None:
-        super().__init__()
-        self.p = float(p)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.p == 0.0 or not self.training:
-            return x
-        keep_prob = 1.0 - self.p
-        mask = torch.empty_like(x).bernoulli_(keep_prob)
-        return x * mask / keep_prob
-
-
-class GR00TN17LayerNorm(PhyAILayerNorm):
-    def __init__(
-        self,
-        normalized_shape: int,
-        *,
-        eps: float = 1e-5,
-        elementwise_affine: bool = True,
-    ) -> None:
-        if elementwise_affine:
-            super().__init__(
-                int(normalized_shape),
-                eps=eps,
-                backend="phyai-kernel",
-                bias=True,
-                prefix="",
-            )
-            self.elementwise_affine = True
-            return
-
-        nn.Module.__init__(self)
-        self.elementwise_affine = False
-        self.backend = "phyai-kernel"
-        self.hidden_size = int(normalized_shape)
-        self.variance_epsilon = float(eps)
-        self.has_bias = False
-        self.prefix = ""
-        self.register_buffer("weight", torch.ones(self.hidden_size), persistent=False)
-        self.register_buffer("_zero_beta", None, persistent=False)
-        self._layernorm = self._load_kernel(self.backend)
-
-    def _apply(self, fn):
-        super()._apply(fn)
-        if not self.elementwise_affine:
-            weight = self._buffers.get("weight")
-            if weight is not None and weight.dtype != torch.float32:
-                self._buffers["weight"] = weight.float()
-        return self
-
-    @staticmethod
-    def _torch_layer_norm(
-        x: torch.Tensor,
-        weight: torch.Tensor | None,
-        bias: torch.Tensor | None,
-        eps: float,
-    ) -> torch.Tensor:
-        out = F.layer_norm(x.float(), (x.shape[-1],), None, None, eps).to(dtype=x.dtype)
-        if weight is not None:
-            out = out * weight.to(device=x.device, dtype=x.dtype)
-        if bias is not None:
-            out = out + bias.to(device=x.device, dtype=x.dtype)
-        return out
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_cuda:
-            weight = self.weight if self.elementwise_affine else None
-            bias = self.bias if self.elementwise_affine else None
-            return self._torch_layer_norm(x, weight, bias, self.variance_epsilon)
-
-        if self.elementwise_affine:
-            return super().forward(x)
-
-        needs_reshape = x.dim() != 2
-        if needs_reshape:
-            orig_shape = x.shape
-            x = x.contiguous().reshape(-1, orig_shape[-1])
-        if self.weight.device != x.device or self.weight.dtype != torch.float32:
-            raise RuntimeError(
-                "non-affine GR00TN17LayerNorm weight must be moved to the input "
-                "device and kept in fp32 before forward."
-            )
-        out = self._layernorm(
-            x,
-            self.weight,
-            None,
-            self.variance_epsilon,
-        )
-        if needs_reshape:
-            out = out.reshape(orig_shape)
-        return out
-
-
-class GR00TN17ReplicatedEmbedding(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
-        super().__init__()
-        self.num_embeddings = int(num_embeddings)
-        self.embedding_dim = int(embedding_dim)
-        self.weight = nn.Parameter(torch.empty(self.num_embeddings, self.embedding_dim))
-        self.weight.hf_keys = []
-        self.weight.weight_loader = replicated()
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.weight[input_ids]
 
 
 # ============================================================================ #
@@ -288,12 +172,7 @@ class GR00TN17Backbone(nn.Module):
         ).eval()
 
     def _load_qwen3vl_model(self) -> nn.Module:
-        """Return the already-built Qwen3-VL backbone.
-
-        Kept for existing callers that need to force construction before weight
-        loading; construction now happens in ``__init__`` so this method has no
-        forward-time side effects.
-        """
+        """Return the already-built Qwen3-VL backbone."""
         return self.qwen3vl_model
 
     def prepare_position_ids(
@@ -399,10 +278,6 @@ class GR00TN17Backbone(nn.Module):
             image_mask=visual_mask,
         )
 
-    def backbone_graph_plan(self, inputs: dict[str, torch.Tensor]):
-        del inputs
-        return None
-
     def build_graph_output(
         self,
         backbone_features: torch.Tensor,
@@ -414,9 +289,8 @@ class GR00TN17Backbone(nn.Module):
     def forward(self, inputs: dict[str, torch.Tensor]) -> GR00TN17BackboneOutput:
         model_inputs = self._prepare_model_inputs(inputs)
         outputs = self._load_qwen3vl_model()(**model_inputs)
-        # Native Qwen3-VL returns the pre-final-norm tensor directly when the
-        # GR00T adapter requests it. Keep the object fallback for injected test
-        # doubles and older backbone wrappers.
+        # Native Qwen3-VL returns the pre-final-norm tensor directly. Accept
+        # structured outputs too so injected backbone modules stay usable.
         if torch.is_tensor(outputs):
             backbone_features = outputs
         else:
@@ -429,21 +303,6 @@ class GR00TN17Backbone(nn.Module):
 # ============================================================================ #
 # Action head: encoders + DiT + decoder                                         #
 # ============================================================================ #
-
-
-def _swish(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.sigmoid(x)
-
-
-def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
-    return (
-        0.5
-        * x
-        * (
-            1.0
-            + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3)))
-        )
-    )
 
 
 def _pad_last_dim(x: torch.Tensor, pad_right: int) -> torch.Tensor:
@@ -520,6 +379,14 @@ def _replicated_linear(linear: ReplicatedLinear, x: torch.Tensor) -> torch.Tenso
     if bias is not None:
         return out + bias
     return out
+
+
+def _non_affine_layer_norm(hidden_size: int, *, eps: float) -> LayerNorm:
+    norm = LayerNorm(
+        hidden_size, eps=eps, backend="phyai-kernel", bias=False, prefix=""
+    )
+    norm._gr00t_skip_hf_keys = True
+    return norm
 
 
 class GR00TN17Linear(ReplicatedLinear):
@@ -802,7 +669,7 @@ class GR00TN17MultiEmbodimentActionEncoder(nn.Module):
         tau = timesteps[:, None].expand(batch, horizon)
         tau_emb = self.pos_encoding(tau).to(dtype=a_emb.dtype)
         x = torch.cat((a_emb, tau_emb), dim=-1)
-        x = _swish(self.W2(x, cat_ids, static_cat_ids=static_cat_ids))
+        x = F.silu(self.W2(x, cat_ids, static_cat_ids=static_cat_ids))
         return self.W3(x, cat_ids, static_cat_ids=static_cat_ids)
 
 
@@ -817,7 +684,7 @@ class GR00TN17TimestepEncoder(nn.Module):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         dtype = self.linear_1.weight.dtype
         emb = _timestep_embedding(timesteps, 256).to(dtype=dtype)
-        return self.linear_2(_swish(self.linear_1(emb)))
+        return self.linear_2(F.silu(self.linear_1(emb)))
 
 
 class GR00TN17AdaLayerNorm(nn.Module):
@@ -826,12 +693,10 @@ class GR00TN17AdaLayerNorm(nn.Module):
     def __init__(self, embedding_dim: int, norm_eps: float = 1e-5) -> None:
         super().__init__()
         self.linear = GR00TN17Linear(embedding_dim, 2 * embedding_dim)
-        self.norm = GR00TN17LayerNorm(
-            embedding_dim, eps=norm_eps, elementwise_affine=False
-        )
+        self.norm = _non_affine_layer_norm(embedding_dim, eps=norm_eps)
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
-        scale, shift = self.linear(_swish(temb)).chunk(2, dim=1)
+        scale, shift = self.linear(F.silu(temb)).chunk(2, dim=1)
         return self.norm(x) * (1 + scale[:, None]) + shift[:, None]
 
 
@@ -839,15 +704,13 @@ class GR00TN17Attention(nn.Module):
     """Small backend-selectable attention module for DiT self/cross attention.
 
     The default backend is ``"sdpa"`` (phyai's recommended path, CUDA-graph
-    captureable). ``"eager"`` is an opt-in fp32-softmax path reached **only** when
-    that backend is selected explicitly; it is kept solely because it is the
-    tightest match to the Isaac-GR00T reference numerics (parity validation).
-    ``"flashinfer"`` covers the unmasked self-attention path and falls back to the
-    ``"sdpa"`` masked path for cross-attention (GR00T's cross-attention uses
-    key-only masks, which flashinfer's prefill kernel does not take).
+    captureable).
+    Masked cross-attention compacts K/V by the key mask before calling the
+    shared PhyAI attention layer, so the local module does not own a separate
+    SDPA implementation.
     """
 
-    _SUPPORTED_BACKENDS = frozenset({"eager", "sdpa", "flashinfer"})
+    _SUPPORTED_BACKENDS = frozenset({"sdpa", "flashinfer"})
 
     def __init__(
         self,
@@ -856,7 +719,6 @@ class GR00TN17Attention(nn.Module):
         num_heads: int,
         head_dim: int,
         cross_attention_dim: int | None = None,
-        dropout: float = 0.0,
         bias: bool = True,
         backend: str = "sdpa",
     ) -> None:
@@ -864,7 +726,6 @@ class GR00TN17Attention(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = int(head_dim)
         self.inner_dim = self.num_heads * self.head_dim
-        self.scale = 1.0 / math.sqrt(self.head_dim)
         self.attention_backend = str(backend).lower().replace("_", "-")
         if self.attention_backend not in self._SUPPORTED_BACKENDS:
             supported = ", ".join(sorted(self._SUPPORTED_BACKENDS))
@@ -877,11 +738,10 @@ class GR00TN17Attention(nn.Module):
         self.to_k = GR00TN17Linear(kv_dim, self.inner_dim, bias=bias)
         self.to_v = GR00TN17Linear(kv_dim, self.inner_dim, bias=bias)
         self.to_out = GR00TN17Linear(self.inner_dim, query_dim, bias=True)
-        self.dropout = float(dropout)
         backend_kwargs = (
             {"compile": False} if self.attention_backend == "sdpa" else None
         )
-        self.prefill_attention = Attention(
+        self.attn = Attention(
             self.num_heads,
             self.head_dim,
             causal=False,
@@ -889,54 +749,41 @@ class GR00TN17Attention(nn.Module):
             backend_kwargs=backend_kwargs,
         )
 
-    @staticmethod
-    def _expand_key_mask(
-        attention_mask: torch.Tensor | None,
-        *,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if attention_mask is None:
-            return None
-        attn_mask = attention_mask.to(device=device, dtype=torch.bool)
-        return attn_mask[:, None, None, :]
-
-    def _eager_attention(
+    def masked_attention(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *,
-        attention_mask: torch.Tensor | None,
+        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        if attention_mask is not None:
-            scores = scores.masked_fill(~attention_mask, torch.finfo(scores.dtype).min)
-        attn = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
-        if attention_mask is not None:
-            attn = attn * attention_mask.to(dtype=attn.dtype)
-        if self.dropout > 0.0 and self.training:
-            keep_prob = 1.0 - self.dropout
-            attn = attn * torch.empty_like(attn).bernoulli_(keep_prob) / keep_prob
-        return torch.matmul(attn, v)
-
-    def _sdpa_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        dropout_p = self.dropout if self.training else 0.0
-        return F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask,
-            dropout_p=dropout_p,
-            is_causal=False,
-            scale=self.scale,
-        )
+        if attention_mask.ndim != 2:
+            raise ValueError(
+                "GR00TN17Attention attention_mask must be 2-D "
+                f"(batch, source_len), got {tuple(attention_mask.shape)}."
+            )
+        batch, target_len, _, _ = q.shape
+        if attention_mask.shape != (batch, k.shape[1]):
+            raise ValueError(
+                f"attention_mask shape {tuple(attention_mask.shape)} does not "
+                f"match K/V batch/source shape {(batch, k.shape[1])}."
+            )
+        mask = attention_mask.to(device=q.device, dtype=torch.bool)
+        outputs: list[torch.Tensor] = []
+        for batch_idx in range(batch):
+            valid = mask[batch_idx]
+            if not torch.any(valid):
+                outputs.append(
+                    q.new_zeros(1, target_len, self.num_heads, self.head_dim)
+                )
+                continue
+            outputs.append(
+                self.attn(
+                    q[batch_idx : batch_idx + 1],
+                    k[batch_idx : batch_idx + 1, valid],
+                    v[batch_idx : batch_idx + 1, valid],
+                )
+            )
+        return torch.cat(outputs, dim=0)
 
     def _backend_attention(
         self,
@@ -947,29 +794,9 @@ class GR00TN17Attention(nn.Module):
         encoder_hidden_states: torch.Tensor | None,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        use_prefill = (
-            encoder_hidden_states is None
-            and attention_mask is None
-            and (not self.training or self.dropout == 0.0)
-            and self.attention_backend != "eager"
-            and (self.attention_backend != "flashinfer" or q.is_cuda)
-        )
-        if use_prefill:
-            return self.prefill_attention(q, k, v)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        if self.attention_backend == "eager":
-            out = self._eager_attention(q, k, v, attention_mask=attention_mask)
-            return out.transpose(1, 2)
-        # "sdpa" and the "flashinfer" masked cross-attn fallback both land
-        # here: flashinfer's prefill kernel only covers the unmasked
-        # self-attention path, so its masked cross-attention falls back to
-        # SDPA rather than the fp32 eager path (which is reserved for the
-        # explicit "eager" parity-validation backend).
-        out = self._sdpa_attention(q, k, v, attention_mask=attention_mask)
-        return out.transpose(1, 2)
+        if attention_mask is None:
+            return self.attn(q, k, v)
+        return self.masked_attention(q, k, v, attention_mask)
 
     def forward(
         self,
@@ -990,13 +817,12 @@ class GR00TN17Attention(nn.Module):
             k, v = self.project_kv(key_value_states)
         else:
             k, v = encoder_kv
-        attn_mask = self._expand_key_mask(attention_mask, device=hidden_states.device)
         out = self._backend_attention(
             q,
             k,
             v,
             encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attn_mask,
+            attention_mask=attention_mask,
         )
         out = out.contiguous().view(batch, target_len, self.inner_dim)
         return self.to_out(out)
@@ -1015,20 +841,14 @@ class GR00TN17Attention(nn.Module):
 class GR00TN17FeedForward(nn.Module):
     """DiT feed-forward block."""
 
-    def __init__(self, dim: int, *, dropout: float, final_dropout: bool) -> None:
+    def __init__(self, dim: int) -> None:
         super().__init__()
         self.fc1 = GR00TN17Linear(dim, 4 * dim)
         self.fc2 = GR00TN17Linear(4 * dim, dim)
-        self.dropout = GR00TN17Dropout(dropout)
-        self.final_dropout = (
-            GR00TN17Dropout(dropout) if final_dropout else GR00TN17Identity()
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = _gelu_tanh(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return self.final_dropout(x)
+        x = F.gelu(self.fc1(x), approximate="tanh")
+        return self.fc2(x)
 
 
 class GR00TN17BasicTransformerBlock(nn.Module):
@@ -1047,24 +867,25 @@ class GR00TN17BasicTransformerBlock(nn.Module):
         if config.norm_type == "ada_norm":
             self.norm1 = GR00TN17AdaLayerNorm(dim)
         else:
-            self.norm1 = GR00TN17LayerNorm(
-                dim, eps=1e-5, elementwise_affine=config.norm_elementwise_affine
+            self.norm1 = (
+                LayerNorm(dim, eps=1e-5, backend="phyai-kernel", bias=True, prefix="")
+                if config.norm_elementwise_affine
+                else _non_affine_layer_norm(dim, eps=1e-5)
             )
         self.attn1 = GR00TN17Attention(
             dim,
             num_heads=config.num_attention_heads,
             head_dim=config.attention_head_dim,
             cross_attention_dim=cross_attention_dim,
-            dropout=config.dropout,
             bias=True,
             backend=config.attention_backend,
         )
-        self.norm3 = GR00TN17LayerNorm(
-            dim, eps=1e-5, elementwise_affine=config.norm_elementwise_affine
+        self.norm3 = (
+            LayerNorm(dim, eps=1e-5, backend="phyai-kernel", bias=True, prefix="")
+            if config.norm_elementwise_affine
+            else _non_affine_layer_norm(dim, eps=1e-5)
         )
-        self.ff = GR00TN17FeedForward(
-            dim, dropout=config.dropout, final_dropout=config.final_dropout
-        )
+        self.ff = GR00TN17FeedForward(dim)
 
     def forward(
         self,
@@ -1097,11 +918,12 @@ class GR00TN17DiT(nn.Module):
         config: GR00TN17DiTConfig,
         *,
         cross_attention_dim: int,
+        output_dim: int,
     ) -> None:
         super().__init__()
         self.config = config
         self.inner_dim = config.num_attention_heads * config.attention_head_dim
-        self.output_dim = config.output_dim
+        self.output_dim = int(output_dim)
         self.timestep_encoder = GR00TN17TimestepEncoder(self.inner_dim)
         blocks = []
         for idx in range(config.num_layers):
@@ -1114,9 +936,7 @@ class GR00TN17DiT(nn.Module):
                 )
             )
         self.transformer_blocks = nn.ModuleList(blocks)
-        self.norm_out = GR00TN17LayerNorm(
-            self.inner_dim, eps=1e-6, elementwise_affine=False
-        )
+        self.norm_out = _non_affine_layer_norm(self.inner_dim, eps=1e-6)
         self.proj_out_1 = GR00TN17Linear(self.inner_dim, 2 * self.inner_dim)
         self.proj_out_2 = GR00TN17Linear(self.inner_dim, self.output_dim)
 
@@ -1141,15 +961,14 @@ class GR00TN17DiT(nn.Module):
         timestep: torch.Tensor,
         encoder_attention_mask: torch.Tensor | None = None,
         encoder_kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
-        return_all_hidden_states: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        encoder_kv_cache_is_masked: bool = False,
+    ) -> torch.Tensor:
         if hidden_states.shape[-1] != self.inner_dim:
             raise ValueError(
                 "hidden_states last dim must match DiT inner_dim "
                 f"{self.inner_dim}, got {hidden_states.shape[-1]}."
             )
         temb = self.timestep_encoder(timestep)
-        all_hidden_states = [hidden_states]
         for idx, block in enumerate(self.transformer_blocks):
             encoder_kv = encoder_kv_cache[idx] if encoder_kv_cache is not None else None
             if not block.is_cross_attention:
@@ -1163,19 +982,18 @@ class GR00TN17DiT(nn.Module):
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
+                    encoder_attention_mask=(
+                        None if encoder_kv_cache_is_masked else encoder_attention_mask
+                    ),
                     encoder_kv=encoder_kv,
                     temb=temb,
                 )
-            all_hidden_states.append(hidden_states)
 
-        shift, scale = self.proj_out_1(_swish(temb)).chunk(2, dim=1)
+        shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
         hidden_states = (
             self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
         )
         output = self.proj_out_2(hidden_states)
-        if return_all_hidden_states:
-            return output, all_hidden_states
         return output
 
 
@@ -1187,9 +1005,14 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
         config: GR00TN17DiTConfig,
         *,
         cross_attention_dim: int,
+        output_dim: int,
         attend_text_every_n_blocks: int,
     ) -> None:
-        super().__init__(config, cross_attention_dim=cross_attention_dim)
+        super().__init__(
+            config,
+            cross_attention_dim=cross_attention_dim,
+            output_dim=output_dim,
+        )
         self.attend_text_every_n_blocks = int(attend_text_every_n_blocks)
 
     def forward(
@@ -1200,12 +1023,12 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
         timestep: torch.Tensor,
         encoder_attention_mask: torch.Tensor | None = None,
         encoder_kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
-        return_all_hidden_states: bool = False,
+        encoder_kv_cache_is_masked: bool = False,
         image_mask: torch.Tensor | None = None,
         backbone_attention_mask: torch.Tensor | None = None,
         image_attention_mask: torch.Tensor | None = None,
         non_image_attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> torch.Tensor:
         temb = self.timestep_encoder(timestep)
         if image_attention_mask is None or non_image_attention_mask is None:
             if image_mask is None:
@@ -1224,7 +1047,6 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
             non_image_attention_mask = (
                 ~image_mask.bool()
             ) & backbone_attention_mask.bool()
-        all_hidden_states = [hidden_states]
         cross_idx = 0
         for idx, block in enumerate(self.transformer_blocks):
             encoder_kv = encoder_kv_cache[idx] if encoder_kv_cache is not None else None
@@ -1241,6 +1063,8 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
                 else:
                     curr_mask = image_attention_mask
                 cross_idx += 1
+                if encoder_kv_cache_is_masked:
+                    curr_mask = None
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
@@ -1248,16 +1072,37 @@ class GR00TN17AlternateVLDiT(GR00TN17DiT):
                     encoder_kv=encoder_kv,
                     temb=temb,
                 )
-            all_hidden_states.append(hidden_states)
 
-        shift, scale = self.proj_out_1(_swish(temb)).chunk(2, dim=1)
+        shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
         hidden_states = (
             self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
         )
         output = self.proj_out_2(hidden_states)
-        if return_all_hidden_states:
-            return output, all_hidden_states
         return output
+
+    def precompute_masked_encoder_kv(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        *,
+        image_token_indices: torch.Tensor,
+        non_image_token_indices: torch.Tensor,
+    ) -> list[tuple[torch.Tensor, torch.Tensor] | None]:
+        image_states = encoder_hidden_states.index_select(1, image_token_indices)
+        non_image_states = encoder_hidden_states.index_select(
+            1, non_image_token_indices
+        )
+        cache: list[tuple[torch.Tensor, torch.Tensor] | None] = []
+        cross_idx = 0
+        for block in self.transformer_blocks:
+            if not block.is_cross_attention:
+                cache.append(None)
+                continue
+            if cross_idx % self.attend_text_every_n_blocks == 0:
+                cache.append(block.attn1.project_kv(non_image_states))
+            else:
+                cache.append(block.attn1.project_kv(image_states))
+            cross_idx += 1
+        return cache
 
 
 class GR00TN17SelfAttentionTransformer(nn.Module):
@@ -1267,19 +1112,12 @@ class GR00TN17SelfAttentionTransformer(nn.Module):
         super().__init__()
         self.config = config
         self.inner_dim = config.num_attention_heads * config.attention_head_dim
-        if config.positional_embeddings is not None:
-            raise GR00TN17NativeImplementationError(
-                "GR00T-N1.7 VL self-attention positional embeddings are not "
-                "implemented yet."
-            )
         self.transformer_blocks = nn.ModuleList(
             [
                 GR00TN17SelfAttentionBlock(
                     self.inner_dim,
                     num_heads=config.num_attention_heads,
                     head_dim=config.attention_head_dim,
-                    dropout=config.dropout,
-                    final_dropout=config.final_dropout,
                     attention_backend=config.attention_backend,
                 )
                 for _ in range(config.num_layers)
@@ -1305,23 +1143,24 @@ class GR00TN17SelfAttentionBlock(nn.Module):
         *,
         num_heads: int,
         head_dim: int,
-        dropout: float,
-        final_dropout: bool,
         attention_backend: str,
     ) -> None:
         super().__init__()
-        self.norm1 = GR00TN17LayerNorm(dim, eps=1e-5, elementwise_affine=True)
+        self.norm1 = LayerNorm(
+            dim, eps=1e-5, backend="phyai-kernel", bias=True, prefix=""
+        )
         self.attn1 = GR00TN17Attention(
             dim,
             num_heads=num_heads,
             head_dim=head_dim,
             cross_attention_dim=None,
-            dropout=dropout,
             bias=True,
             backend=attention_backend,
         )
-        self.norm3 = GR00TN17LayerNorm(dim, eps=1e-5, elementwise_affine=True)
-        self.ff = GR00TN17FeedForward(dim, dropout=dropout, final_dropout=final_dropout)
+        self.norm3 = LayerNorm(
+            dim, eps=1e-5, backend="phyai-kernel", bias=True, prefix=""
+        )
+        self.ff = GR00TN17FeedForward(dim)
 
     def forward(
         self,
@@ -1362,12 +1201,14 @@ class GR00TN17ActionHead(nn.Module):
             self.model = GR00TN17AlternateVLDiT(
                 self.config.dit,
                 cross_attention_dim=self.backbone_config.backbone_embedding_dim,
+                output_dim=self.hidden_size,
                 attend_text_every_n_blocks=self.config.attend_text_every_n_blocks,
             )
         else:
             self.model = GR00TN17DiT(
                 self.config.dit,
                 cross_attention_dim=self.backbone_config.backbone_embedding_dim,
+                output_dim=self.hidden_size,
             )
         self.state_encoder = GR00TN17CategorySpecificMLP(
             num_categories=self.config.max_num_embodiments,
@@ -1387,9 +1228,15 @@ class GR00TN17ActionHead(nn.Module):
             output_dim=self.action_dim,
         )
         self.vlln = (
-            GR00TN17LayerNorm(self.backbone_config.backbone_embedding_dim)
+            LayerNorm(
+                self.backbone_config.backbone_embedding_dim,
+                eps=1e-5,
+                backend="phyai-kernel",
+                bias=True,
+                prefix="",
+            )
             if self.config.use_vlln
-            else GR00TN17Identity()
+            else None
         )
         if (
             self.config.vl_self_attention is not None
@@ -1399,9 +1246,9 @@ class GR00TN17ActionHead(nn.Module):
                 self.config.vl_self_attention
             )
         else:
-            self.vl_self_attention = GR00TN17Identity()
+            self.vl_self_attention = None
         if self.config.add_pos_embed:
-            self.position_embedding = GR00TN17ReplicatedEmbedding(
+            self.position_embedding = VocabParallelEmbedding(
                 self.config.max_seq_len, self.input_embedding_dim
             )
             _init_normal_(self.position_embedding.weight, mean=0.0, std=0.02)
@@ -1409,12 +1256,15 @@ class GR00TN17ActionHead(nn.Module):
     def attach_hf_keys(self, prefix: str = "action_head") -> None:
         """Attach Isaac-GR00T safetensors keys to every action-head parameter."""
         category_param_ids: set[int] = set()
+        skip_param_ids: set[int] = set()
         for local_name, module in self.named_modules():
             if isinstance(module, GR00TN17CategorySpecificLinear):
                 module.attach_hf_keys(_gr00t_n17_action_head_hf_key(local_name, prefix))
                 category_param_ids.update(id(param) for param in module.parameters())
+            if getattr(module, "_gr00t_skip_hf_keys", False):
+                skip_param_ids.update(id(param) for param in module.parameters())
         for local_name, param in self.named_parameters():
-            if id(param) in category_param_ids:
+            if id(param) in category_param_ids or id(param) in skip_param_ids:
                 continue
             _attach_replicated_hf_key(
                 param, _gr00t_n17_action_head_hf_key(local_name, prefix)
@@ -1423,17 +1273,20 @@ class GR00TN17ActionHead(nn.Module):
     def process_backbone_output(
         self, backbone_output: GR00TN17BackboneOutput
     ) -> GR00TN17BackboneOutput:
-        backbone_features = self.vlln(backbone_output.backbone_features)
-        if isinstance(self.vl_self_attention, GR00TN17SelfAttentionTransformer):
+        backbone_features = backbone_output.backbone_features
+        if self.vlln is not None:
+            backbone_features = self.vlln(backbone_features)
+        backbone_attention_mask = backbone_output.backbone_attention_mask
+        if backbone_attention_mask is not None and backbone_attention_mask.numel() == 0:
+            backbone_attention_mask = None
+        if self.vl_self_attention is not None:
             backbone_features = self.vl_self_attention(
                 backbone_features,
-                attention_mask=backbone_output.backbone_attention_mask,
+                attention_mask=backbone_attention_mask,
             )
-        else:
-            backbone_features = self.vl_self_attention(backbone_features)
         return GR00TN17BackboneOutput(
             backbone_features=backbone_features,
-            backbone_attention_mask=backbone_output.backbone_attention_mask,
+            backbone_attention_mask=backbone_attention_mask,
             image_mask=backbone_output.image_mask,
         )
 
@@ -1589,17 +1442,12 @@ class GR00TN17ActionHead(nn.Module):
         dt: float,
         action_position_ids: torch.Tensor,
         encoder_kv_cache: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+        encoder_kv_cache_is_masked: bool = False,
         static_cat_ids: tuple[int, ...] | None = None,
         image_mask: torch.Tensor | None = None,
         image_attention_mask: torch.Tensor | None = None,
         non_image_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if action_input.action is not None:
-            raise GR00TN17NativeImplementationError(
-                "RTC/inpainting action inputs are not implemented in the native "
-                "GR00T-N1.7 action-head path yet."
-            )
-
         action_features = self.action_encoder(
             actions,
             timesteps,
@@ -1622,6 +1470,7 @@ class GR00TN17ActionHead(nn.Module):
                 backbone_features,
                 timestep=timesteps,
                 encoder_kv_cache=encoder_kv_cache,
+                encoder_kv_cache_is_masked=encoder_kv_cache_is_masked,
                 image_mask=image_mask,
                 backbone_attention_mask=backbone_output.backbone_attention_mask,
                 image_attention_mask=image_attention_mask,
@@ -1634,6 +1483,7 @@ class GR00TN17ActionHead(nn.Module):
                 timestep=timesteps,
                 encoder_attention_mask=backbone_output.backbone_attention_mask,
                 encoder_kv_cache=encoder_kv_cache,
+                encoder_kv_cache_is_masked=encoder_kv_cache_is_masked,
             )
         pred = self.action_decoder(
             model_output,
@@ -1669,6 +1519,15 @@ class GR00TN17Model(nn.Module):
         super().__init__()
         self.config = config
         self.params_dtype = params_dtype or torch.get_default_dtype()
+        self.action_dtype = self.params_dtype
+        self.backbone_dtype = (
+            torch.bfloat16 if config.backbone.load_bf16 else self.params_dtype
+        )
+        self.register_buffer(
+            "_device_anchor",
+            torch.empty(0, device=torch.device(device) if device is not None else None),
+            persistent=False,
+        )
         self.action_head = GR00TN17ActionHead(config)
         self.action_head.attach_hf_keys("action_head")
         if device is not None or params_dtype is not None:
@@ -1700,7 +1559,6 @@ class GR00TN17Model(nn.Module):
             state=batch["state"],
             embodiment_id=batch["embodiment_id"],
             action_mask=batch.get("action_mask"),
-            action=batch.get("action"),
         )
 
     def prepare_input(
@@ -1710,16 +1568,14 @@ class GR00TN17Model(nn.Module):
         device: torch.device | str | None = None,
     ) -> tuple[dict[str, torch.Tensor], GR00TN17ActionInput]:
         explicit_device = torch.device(device) if device is not None else None
-        backbone_device = explicit_device or self.backbone_device
-        action_device = explicit_device or self.action_device
-        backbone_dtype = self.backbone_dtype
-        action_dtype = self.action_dtype
-        action_keys = {"state", "action", "action_mask", "embodiment_id"}
+        target_device = explicit_device or self._device_anchor.device
+        action_keys = {"state", "action_mask", "embodiment_id"}
 
         def move(key: str, value: torch.Tensor) -> torch.Tensor:
-            target_device = action_device if key in action_keys else backbone_device
             if torch.is_floating_point(value):
-                target_dtype = action_dtype if key in action_keys else backbone_dtype
+                target_dtype = (
+                    self.action_dtype if key in action_keys else self.backbone_dtype
+                )
                 return value.to(device=target_device, dtype=target_dtype)
             return value.to(device=target_device)
 
@@ -1729,50 +1585,6 @@ class GR00TN17Model(nn.Module):
         }
         return self.prepare_backbone_input(moved), self.prepare_action_input(moved)
 
-    @staticmethod
-    def _module_device(module: nn.Module) -> torch.device:
-        for tensor in module.parameters():
-            return tensor.device
-        for tensor in module.buffers():
-            return tensor.device
-        return torch.device("cpu")
-
-    @staticmethod
-    def _module_dtype(module: nn.Module) -> torch.dtype:
-        for tensor in module.parameters():
-            if torch.is_floating_point(tensor):
-                return tensor.dtype
-        for tensor in module.buffers():
-            if torch.is_floating_point(tensor):
-                return tensor.dtype
-        return torch.get_default_dtype()
-
-    @property
-    def backbone_device(self) -> torch.device:
-        return self._module_device(self.backbone)
-
-    @property
-    def backbone_dtype(self) -> torch.dtype:
-        if self.config.backbone.load_bf16:
-            return torch.bfloat16
-        return self._module_dtype(self.backbone)
-
-    @property
-    def action_device(self) -> torch.device:
-        return self._module_device(self.action_head)
-
-    @property
-    def action_dtype(self) -> torch.dtype:
-        return self._module_dtype(self.action_head)
-
-    @property
-    def device(self) -> torch.device:
-        return self.action_device
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.action_dtype
-
 
 __all__ = [
     "GR00TN17ActionHead",
@@ -1780,5 +1592,4 @@ __all__ = [
     "GR00TN17Backbone",
     "GR00TN17BackboneOutput",
     "GR00TN17Model",
-    "GR00TN17NativeImplementationError",
 ]

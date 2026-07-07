@@ -1,16 +1,15 @@
 """Configs for GR00T-N1.7.
 
 The public Isaac-GR00T N1.7 checkpoint stores a mostly flat
-``config.json``. PhyAI keeps the same defaults but groups them by the
-runtime boundary we implement:
+``config.json``. PhyAI keeps the same model defaults but groups them by
+runtime boundary:
 
-* processor: observation/action interpretation and preprocessing knobs;
 * backbone: Cosmos-Reason2 / Qwen3-VL feature extractor knobs;
 * action head: state/action encoders, optional VL self-attention, and DiT.
 
 Checkpoint-specific choices such as LIBERO vs DROID do not live in the
-modeling classes. They are selected by ``embodiment_tag`` and checkpoint
-processor metadata at runtime.
+modeling classes. They are selected by ``embodiment_tag`` and processor
+metadata in ``phyai_utils_tools.models.gr00t``.
 """
 
 from __future__ import annotations
@@ -73,16 +72,6 @@ def _default_gr00t_qwen3vl_config() -> Qwen3VLConfig:
     )
 
 
-def _tuple2(v: object) -> tuple[int, int] | None:
-    if v is None:
-        return None
-    if isinstance(v, tuple) and len(v) == 2:
-        return (int(v[0]), int(v[1]))
-    if isinstance(v, list) and len(v) == 2:
-        return (int(v[0]), int(v[1]))
-    raise ValueError(f"expected a 2-item tuple/list or None, got {v!r}.")
-
-
 def _tuple_ints(v: object) -> tuple[int, ...]:
     if isinstance(v, tuple):
         return tuple(int(x) for x in v)
@@ -92,56 +81,16 @@ def _tuple_ints(v: object) -> tuple[int, ...]:
 
 
 @dataclass(frozen=True)
-class GR00TN17ProcessorConfig(PretrainedConfig):
-    """Processor and state/action normalization knobs."""
-
-    image_crop_size: tuple[int, int] | None = (230, 230)
-    image_target_size: tuple[int, int] | None = (256, 256)
-    shortest_image_edge: int | None = None
-    crop_fraction: float | None = None
-    random_rotation_angle: int | None = None
-    color_jitter_params: dict[str, float] | None = None
-    use_albumentations_transforms: bool = True
-    extra_augmentation_config: dict[str, Any] | None = None
-    formalize_language: bool = True
-    apply_sincos_state_encoding: bool = False
-    use_percentiles: bool = True
-    use_relative_action: bool = False
-    use_mean_std: bool = False
-    state_dropout_prob: float = 0.8
-    exclude_state: bool = False
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "image_crop_size", _tuple2(self.image_crop_size))
-        object.__setattr__(self, "image_target_size", _tuple2(self.image_target_size))
-        if self.shortest_image_edge is not None and self.shortest_image_edge <= 0:
-            raise ValueError("shortest_image_edge must be positive when set.")
-        if self.crop_fraction is not None and self.crop_fraction <= 0:
-            raise ValueError("crop_fraction must be positive when set.")
-        if not 0 <= self.state_dropout_prob <= 1:
-            raise ValueError("state_dropout_prob must be in [0, 1].")
-
-
-@dataclass(frozen=True)
 class GR00TN17BackboneConfig(PretrainedConfig):
     """Cosmos-Reason2 / Qwen3-VL backbone knobs."""
 
     model_name: str = "nvidia/Cosmos-Reason2-2B"
     qwen3vl: Qwen3VLConfig | None = field(default_factory=_default_gr00t_qwen3vl_config)
-    backbone_model_type: str = "qwen"
     model_revision: str | None = None
     backbone_embedding_dim: int = 2048
-    tune_top_llm_layers: int = 0
-    tune_llm: bool = False
-    tune_visual: bool = False
     select_layer: int = 12
-    reproject_vision: bool = False
-    use_flash_attention: bool = True
     load_bf16: bool = False
-    backbone_trainable_params_fp32: bool = True
-    use_native_qwen3vl: bool = True
-    # Native Qwen3-VL no-cache attention backend. "sdpa" preserves the
-    # previous PyTorch SDPA numerics; "eager"/"flashinfer" are opt-in.
+    # Native Qwen3-VL no-cache attention backend.
     attention_backend: str = "sdpa"
     # CUDA-graph sequence buckets for the native Qwen3-VL text side. The
     # official GR00T config caps VL/action sequence handling at max_seq_len=1024.
@@ -167,11 +116,9 @@ class GR00TN17BackboneConfig(PretrainedConfig):
             raise ValueError("model_name must be non-empty.")
         if self.backbone_embedding_dim <= 0:
             raise ValueError("backbone_embedding_dim must be positive.")
-        if self.tune_top_llm_layers < 0:
-            raise ValueError("tune_top_llm_layers must be non-negative.")
-        if self.attention_backend not in {"eager", "sdpa", "flashinfer"}:
+        if self.attention_backend not in {"sdpa", "flashinfer"}:
             raise ValueError(
-                "backbone.attention_backend must be one of: eager, sdpa, flashinfer."
+                "backbone.attention_backend must be one of: sdpa, flashinfer."
             )
         if not self.graph_seq_len_buckets:
             raise ValueError("backbone.graph_seq_len_buckets must not be empty.")
@@ -187,22 +134,14 @@ class GR00TN17BackboneConfig(PretrainedConfig):
 class GR00TN17DiTConfig(PretrainedConfig):
     """Diffusion transformer config inside the GR00T action head."""
 
-    positional_embeddings: str | None = None
     num_layers: int = 16
     num_attention_heads: int = 32
     attention_head_dim: int = 48
     norm_type: str = "ada_norm"
     norm_elementwise_affine: bool = False
-    dropout: float = 0.2
-    final_dropout: bool = True
-    output_dim: int = 1024
     interleave_self_attention: bool = True
-    # Dense no-cache attention backend used inside GR00T's action head.
-    # Default "sdpa" uses PyTorch's normal SDPA dispatch and is CUDA-graph
-    # captureable. With the shared Qwen3-VL backbone path, end-to-end official
-    # parity is ~0.0095. "eager" keeps an fp32 softmax path for debugging.
-    # "flashinfer" is supported for unmasked self-attention; masked cross-attn
-    # falls back to the sdpa path (GR00T uses key-only masks).
+    # Dense no-cache attention backend used inside GR00T's action head. Masked
+    # cross-attention compacts K/V by key mask before calling PhyAI Attention.
     attention_backend: str = "sdpa"
 
     def __post_init__(self) -> None:
@@ -212,14 +151,8 @@ class GR00TN17DiTConfig(PretrainedConfig):
             raise ValueError("num_attention_heads must be positive.")
         if self.attention_head_dim <= 0:
             raise ValueError("attention_head_dim must be positive.")
-        if self.output_dim <= 0:
-            raise ValueError("output_dim must be positive.")
-        if not 0 <= self.dropout < 1:
-            raise ValueError("dropout must be in [0, 1).")
-        if self.attention_backend not in {"eager", "sdpa", "flashinfer"}:
-            raise ValueError(
-                "attention_backend must be one of: eager, sdpa, flashinfer."
-            )
+        if self.attention_backend not in {"sdpa", "flashinfer"}:
+            raise ValueError("attention_backend must be one of: sdpa, flashinfer.")
 
 
 @dataclass(frozen=True)
@@ -229,10 +162,6 @@ class GR00TN17VLSelfAttentionConfig(PretrainedConfig):
     num_layers: int = 0
     num_attention_heads: int = 32
     attention_head_dim: int = 64
-    dropout: float = 0.2
-    final_dropout: bool = True
-    positional_embeddings: str | None = None
-    output_dim: int | None = None
     # Same backend policy as GR00TN17DiTConfig.attention_backend.
     attention_backend: str = "sdpa"
 
@@ -247,12 +176,8 @@ class GR00TN17VLSelfAttentionConfig(PretrainedConfig):
             raise ValueError("num_attention_heads must be positive.")
         if self.attention_head_dim <= 0:
             raise ValueError("attention_head_dim must be positive.")
-        if not 0 <= self.dropout < 1:
-            raise ValueError("dropout must be in [0, 1).")
-        if self.attention_backend not in {"eager", "sdpa", "flashinfer"}:
-            raise ValueError(
-                "attention_backend must be one of: eager, sdpa, flashinfer."
-            )
+        if self.attention_backend not in {"sdpa", "flashinfer"}:
+            raise ValueError("attention_backend must be one of: sdpa, flashinfer.")
 
 
 @dataclass(frozen=True)
@@ -266,20 +191,13 @@ class GR00TN17ActionHeadConfig(PretrainedConfig):
     input_embedding_dim: int = 1536
     state_history_length: int = 1
     add_pos_embed: bool = True
-    attn_dropout: float = 0.2
     use_vlln: bool = True
     max_seq_len: int = 1024
     use_alternate_vl_dit: bool = True
     attend_text_every_n_blocks: int = 2
     max_num_embodiments: int = 32
     num_inference_timesteps: int = 4
-    noise_beta_alpha: float = 1.5
-    noise_beta_beta: float = 1.0
-    noise_s: float = 0.999
     num_timestep_buckets: int = 1000
-    tune_projector: bool = True
-    tune_diffusion_model: bool = True
-    tune_vlln: bool = True
     dit: GR00TN17DiTConfig = field(default_factory=GR00TN17DiTConfig)
     vl_self_attention: GR00TN17VLSelfAttentionConfig | None = None
 
@@ -307,8 +225,6 @@ class GR00TN17ActionHeadConfig(PretrainedConfig):
             raise ValueError("input_embedding_dim must be positive.")
         if self.state_history_length <= 0:
             raise ValueError("state_history_length must be positive.")
-        if not 0 <= self.attn_dropout < 1:
-            raise ValueError("attn_dropout must be in [0, 1).")
         if self.max_seq_len <= 0:
             raise ValueError("max_seq_len must be positive.")
         if self.attend_text_every_n_blocks <= 0:
@@ -326,8 +242,6 @@ class GR00TN17Config(PretrainedConfig):
     """Top-level GR00T-N1.7 inference config."""
 
     model_type: str = "Gr00tN1d7"
-    model_dtype: str = "bfloat16"
-    processor: GR00TN17ProcessorConfig = field(default_factory=GR00TN17ProcessorConfig)
     backbone: GR00TN17BackboneConfig = field(default_factory=GR00TN17BackboneConfig)
     action_head: GR00TN17ActionHeadConfig = field(
         default_factory=GR00TN17ActionHeadConfig
@@ -336,21 +250,17 @@ class GR00TN17Config(PretrainedConfig):
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "GR00TN17Config":
         """Load either PhyAI nested configs or upstream flat GR00T JSON."""
-        if any(k in data for k in ("processor", "backbone", "action_head")):
-            processor = GR00TN17ProcessorConfig.from_dict(data.get("processor", {}))
+        if any(k in data for k in ("backbone", "action_head")):
             backbone = GR00TN17BackboneConfig.from_dict(data.get("backbone", {}))
             action_head = GR00TN17ActionHeadConfig.from_dict(
                 data.get("action_head", {})
             )
             return cls(
                 model_type=data.get("model_type", "Gr00tN1d7"),
-                model_dtype=data.get("model_dtype", "bfloat16"),
-                processor=processor,
                 backbone=backbone,
                 action_head=action_head,
             )
 
-        processor = GR00TN17ProcessorConfig.from_dict(data)
         backbone = GR00TN17BackboneConfig.from_dict(data)
         dit = GR00TN17DiTConfig.from_dict(data.get("diffusion_model_cfg", {}))
         vl_self_attention = None
@@ -364,8 +274,6 @@ class GR00TN17Config(PretrainedConfig):
         action_head = GR00TN17ActionHeadConfig.from_dict(action_payload)
         return cls(
             model_type=data.get("model_type", "Gr00tN1d7"),
-            model_dtype=data.get("model_dtype", "bfloat16"),
-            processor=processor,
             backbone=backbone,
             action_head=action_head,
         )
@@ -375,12 +283,6 @@ class GR00TN17Config(PretrainedConfig):
             raise ValueError(
                 f"expected model_type='Gr00tN1d7', got {self.model_type!r}."
             )
-        if not self.model_dtype:
-            raise ValueError("model_dtype must be non-empty.")
-        if self.action_head.dit.output_dim != self.action_head.hidden_size:
-            raise ValueError(
-                "action_head.dit.output_dim must equal action_head.hidden_size."
-            )
 
 
 __all__ = [
@@ -388,6 +290,5 @@ __all__ = [
     "GR00TN17BackboneConfig",
     "GR00TN17Config",
     "GR00TN17DiTConfig",
-    "GR00TN17ProcessorConfig",
     "GR00TN17VLSelfAttentionConfig",
 ]

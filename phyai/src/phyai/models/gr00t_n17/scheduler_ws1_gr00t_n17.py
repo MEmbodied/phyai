@@ -1,12 +1,8 @@
 """GR00T-N1.7 single-GPU scheduler boundary.
 
-The engine is strict about inputs: image transform, Qwen3-VL
-patchify, tokenization, and state/action normalization are the **caller's**
-responsibility (see ``phyai_utils_tools.models.gr00t.GR00TProcessor``). The
-scheduler consumes the already-prepared model-input tensors and returns the
-normalized action chunk after applying any request ``action_mask``; the caller
-decodes it back to physical units. This keeps the engine free of any processor /
-tokenizer dependency.
+The scheduler consumes prepared tensors from
+``phyai_utils_tools.models.gr00t.GR00TProcessor`` and returns the normalized
+action chunk. Image transform, tokenization, and decode stay outside the engine.
 """
 
 from __future__ import annotations
@@ -46,8 +42,8 @@ class GR00TN17WS1Scheduler(Scheduler):
     """Single-rank GR00T-N1.7 inference scheduler.
 
     The scheduler owns runner order and the denoising request lifecycle. It does
-    not own preprocessing: it receives prepared tensors and emits the normalized
-    masked normalized action chunk.
+    not own preprocessing: it receives prepared tensors and emits the masked
+    normalized action chunk.
     """
 
     def __init__(
