@@ -43,6 +43,8 @@
                 "pages": [
                   "models/cosmos/ws1",
                   "models/cosmos/ws1_policy",
+                  "models/cosmos/wn",
+                  "models/cosmos/wn_policy",
                   "models/cosmos/processors"
                 ]
               }
@@ -52,6 +54,12 @@
             "group": "Tools",
             "pages": [
               "tools/tensor-dump"
+            ]
+          },
+          {
+            "group": "Developer guide",
+            "pages": [
+              "developer_guide/code-of-conduct"
             ]
           }
         ]
@@ -88,6 +96,8 @@
                 "pages": [
                   "zh/models/cosmos/ws1",
                   "zh/models/cosmos/ws1_policy",
+                  "zh/models/cosmos/wn",
+                  "zh/models/cosmos/wn_policy",
                   "zh/models/cosmos/processors"
                 ]
               }
@@ -97,6 +107,12 @@
             "group": "工具",
             "pages": [
               "zh/tools/tensor-dump"
+            ]
+          },
+          {
+            "group": "开发者指南",
+            "pages": [
+              "zh/developer_guide/code-of-conduct"
             ]
           }
         ]
