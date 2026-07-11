@@ -118,11 +118,23 @@ def _resolve_engine_defaults(
 
 
 def _engine_to_paged_backend(attn_backend: str) -> str:
-    """Map EngineConfig attention backend names to paged backend names."""
+    """Map :class:`EngineConfig`'s ``attn_backend`` onto the AR / Diffusion
+    paged backend name.
+
+    The AR and Diffusion paged stacks are flashinfer-only (GPU):
+    ``"flashinfer"`` is the only backend registered in either
+    subpackage. ``"sdpa"`` / ``"eager"`` have no paged backend (SDPA
+    cannot read paged KV; there is no CPU reference path), so any
+    non-flashinfer name is rejected here rather than silently coerced.
+    """
 
     canonical = attn_backend.lower().replace("_", "-")
-    if canonical == "sdpa":
-        return "eager"
+    if canonical != "flashinfer":
+        raise ValueError(
+            f"AR / Diffusion paged stacks are flashinfer-only (GPU); got "
+            f"attn_backend={attn_backend!r}. pi0 inference requires "
+            f"backend='flashinfer'."
+        )
     return canonical
 
 
