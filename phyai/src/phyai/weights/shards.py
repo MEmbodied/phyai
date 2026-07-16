@@ -20,6 +20,19 @@ from phyai.parallel.mesh import Mesh
 WeightLoader = Callable[[torch.nn.Parameter, torch.Tensor, "int | str | None"], None]
 
 
+def _copy_compatible(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy a scale tensor while accepting equivalent singleton dimensions."""
+    if destination.shape != source.shape:
+        destination_core = tuple(size for size in destination.shape if size != 1)
+        source_core = tuple(size for size in source.shape if size != 1)
+        if destination_core != source_core:
+            raise ValueError(
+                f"cannot load shape {tuple(source.shape)} into {tuple(destination.shape)}"
+            )
+        source = source.reshape(destination.shape)
+    destination.copy_(source)
+
+
 def replicated() -> WeightLoader:
     """Full-tensor copy. Handles 0-D HF scalars expanding into 1-element params."""
 
@@ -27,7 +40,26 @@ def replicated() -> WeightLoader:
         if loaded.dim() == 0 and param.numel() == 1:
             param.data.fill_(loaded.item())
             return
-        param.data.copy_(loaded)
+        _copy_compatible(param.data, loaded)
+
+    return load
+
+
+def stacked_replicated(*, slots: dict[object, int]) -> WeightLoader:
+    """Load one scalar checkpoint tensor into its slot in a fused parameter."""
+
+    def load(param: torch.nn.Parameter, loaded: torch.Tensor, shard_id=None) -> None:
+        if shard_id not in slots:
+            raise ValueError(
+                f"stacked_replicated: unknown shard_id {shard_id!r}; "
+                f"expected one of {tuple(slots)!r}"
+            )
+        if loaded.numel() != 1:
+            raise ValueError(
+                "stacked_replicated expects one scalar per fused leg, got "
+                f"shape {tuple(loaded.shape)!r}"
+            )
+        param.data.reshape(-1)[slots[shard_id]].copy_(loaded.reshape(()))
 
     return load
 
@@ -99,9 +131,9 @@ def scale_sharded(
 ) -> WeightLoader:
     """Shard a scale / zero-point param to match its weight's TP split.
 
-    ``extra_attrs`` is the humming param metadata (``output_dim`` / ``input_dim``
-    / ``packed_dim`` / ``packed_factor`` / ``scale_type``) attached by
-    ``HummingWeightSpec.allocate``. The rule mirrors the weight:
+    ``extra_attrs`` is backend-neutral quantized parameter metadata
+    (``output_dim`` / ``input_dim`` / ``packed_dim`` / ``packed_factor`` /
+    ``scale_type``). The rule mirrors the weight:
 
     * Column-family (``row_parallel=False``): shard the N/output dim when the
       param indexes it (``output_dim`` present); otherwise replicate. K is not
@@ -120,7 +152,7 @@ def scale_sharded(
     def load(param: torch.nn.Parameter, loaded: torch.Tensor, _shard_id=None) -> None:
         dim = in_dim if row_parallel else out_dim
         if dim is None:
-            param.data.copy_(loaded)
+            _copy_compatible(param.data, loaded)
             return
         rank = mesh.axis_local_rank(axis) // replicate
         world = mesh.axis_size(axis) // replicate
@@ -130,7 +162,7 @@ def scale_sharded(
                 f"scale_sharded: dim {dim} size {full} not divisible by world {world}"
             )
         size = full // world
-        param.data.copy_(loaded.narrow(dim, rank * size, size))
+        _copy_compatible(param.data, loaded.narrow(dim, rank * size, size))
 
     return load
 
@@ -165,7 +197,9 @@ def scale_fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
     def load(param: torch.nn.Parameter, loaded: torch.Tensor, shard_id) -> None:
         leg = legs[shard_id]
         d = param.shape[fuse_dim]
-        if (d * leg.weight_size) % leg.total_weight != 0:
+        if (d * leg.weight_size) % leg.total_weight != 0 or (
+            d * leg.weight_offset
+        ) % leg.total_weight != 0:
             raise ValueError(
                 f"scale_fused: scale dim {d} not divisible proportionally for leg "
                 f"{leg.weight_size}/{leg.total_weight} (check group/pack alignment)"
@@ -174,9 +208,17 @@ def scale_fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
         dest_off = d * leg.weight_offset // leg.total_weight
         rank = mesh.axis_local_rank(leg.axis) // leg.replicate
         world = mesh.axis_size(leg.axis) // leg.replicate
-        src_size = loaded.shape[fuse_dim] // world
+        full = loaded.shape[fuse_dim]
+        if full % world != 0:
+            raise ValueError(
+                f"scale_fused: dim {fuse_dim} size {full} not divisible by world {world}"
+            )
+        src_size = full // world
         src = loaded.narrow(fuse_dim, rank * src_size, src_size)
-        param.data.narrow(fuse_dim, dest_off, dest_size).copy_(src)
+        _copy_compatible(
+            param.data.narrow(fuse_dim, dest_off, dest_size),
+            src,
+        )
 
     return load
 
@@ -248,6 +290,7 @@ __all__ = [
     "scale_fused",
     "scale_sharded",
     "sharded",
+    "stacked_replicated",
     "vocab",
     "weight_norm_fold",
 ]

@@ -8,6 +8,7 @@ dependencies = [
     "compressed-tensors>=0.17",
     "safetensors",
     "numpy",
+    "rich",
 ]
 
 # note(chenghua): phyai (calibration) and humming (pack_format="humming") are only

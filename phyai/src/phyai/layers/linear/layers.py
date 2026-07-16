@@ -37,6 +37,7 @@ from phyai.weights.shards import (
     scale_fused,
     scale_sharded,
     sharded,
+    stacked_replicated,
 )
 
 
@@ -74,10 +75,13 @@ class LinearBase(nn.Module):
         self.out_features = out_features
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.skip_bias_add = skip_bias_add
+        self.device = (
+            device if device is not None else get_engine_config().device.target
+        )
         if spec is not None:
             self.spec = spec
         elif scheme is not None:
-            self.spec = materialize(scheme, sm_arch())
+            self.spec = materialize(scheme, sm_arch(self.device))
         else:
             plan = get_active_plan()
             resolved = (
@@ -86,16 +90,15 @@ class LinearBase(nn.Module):
                 else None
             )
             self.spec = (
-                materialize(resolved, sm_arch()) if resolved is not None else Bf16Spec()
+                materialize(resolved, sm_arch(self.device))
+                if resolved is not None
+                else Bf16Spec()
             )
-        self.device = (
-            device if device is not None else get_engine_config().device.target
-        )
         self.prefix = prefix
         self._bias_requested = bias
 
     def post_load(self) -> None:
-        """Spec-driven post-load fixup (e.g. fp8 per-tensor -> per-channel)."""
+        """Run spec-driven validation and physical layout preparation."""
         proc = getattr(self.spec, "process_after_loading", None)
         if callable(proc):
             proc(self)
@@ -116,40 +119,74 @@ class LinearBase(nn.Module):
         Quant specs create scale params (``weight_scale`` / ``input_scale`` /
         ``weight_global_scale`` / ``zero_point``). They are absent in non-quant
         checkpoints, so they're marked optional. The loader is chosen to shard
-        the scale to match the weight's TP split, driven by the humming
-        ``_humming_attrs`` metadata the spec attaches to each param:
+        the scale to match the weight's TP split, driven by the backend-neutral
+        ``_quant_attrs`` metadata the spec attaches to each param:
 
         * ``kind="column"`` / ``"row"`` — single-leg :func:`scale_sharded`.
         * ``kind="merged"`` / ``"qkv"`` — per-leg :func:`scale_fused`.
-        * ``kind="replicated"`` (or any scale with no ``_humming_attrs``, e.g.
-          fp8/nvfp4 scales) — :func:`replicated`, preserving prior behavior.
+        * ``kind="replicated"`` (or any scale with no ``_quant_attrs``) —
+          :func:`replicated`, preserving prior behavior.
 
         Per-tensor scales (``input_scale`` / ``weight_global_scale`` / any
         ``scale_type == "tensor"``) are always replicated.
         """
-        for name in (
-            "weight_scale",
-            "input_scale",
-            "weight_global_scale",
-            "zero_point",
-        ):
-            p = getattr(layer, name, None)
+        quant_params = [
+            (name, param)
+            for name, param in layer.named_parameters(recurse=False)
+            if name not in ("weight", "bias")
+            and (
+                hasattr(param, "_quant_source_name")
+                or name
+                in (
+                    "weight_scale",
+                    "input_scale",
+                    "input_global_scale",
+                    "input_zero_point",
+                    "weight_scale_2",
+                    "weight_global_scale",
+                    "global_scale",
+                    "zero_point",
+                    "weight_shape",
+                )
+            )
+        ]
+        for name, p in quant_params:
             if not isinstance(p, nn.Parameter):
                 continue
-            p.optional = True
-            extra = getattr(p, "_humming_attrs", {})
+            spec = getattr(layer, "spec", None)
+            source_name = getattr(p, "_quant_source_name", name)
+            p.optional = (
+                bool(
+                    getattr(spec, "online", False)
+                    and not source_name.startswith("input")
+                )
+                or bool(getattr(p, "_quant_optional", False))
+                or not (
+                    getattr(spec, "raw_config", None) is not None
+                    or getattr(spec, "native_storage", False)
+                )
+            )
+            extra = getattr(p, "_quant_attrs", {})
             if fused_legs is not None:
                 p.hf_keys = [
-                    (f"{base}.{name}", sid) for sid, (base, _leg) in fused_legs.items()
+                    (f"{base}.{source_name}", sid)
+                    for sid, (base, _leg) in fused_legs.items()
                 ]
             else:
-                p.hf_keys = [(f"{hf_base}.{name}", None)]
+                p.hf_keys = [(f"{hf_base}.{source_name}", None)]
 
-            # Per-tensor / activation scales, and any non-humming scale (no
-            # metadata, e.g. fp8/nvfp4 init-to-ones), replicate unchanged.
+            if fused_legs is not None and extra.get("stacked_scalar"):
+                p.weight_loader = stacked_replicated(
+                    slots={sid: i for i, sid in enumerate(fused_legs)}
+                )
+                continue
+
+            # note(chenghua): metadata-free and tensor scales must follow the
+            # checkpoint scalar unchanged on every tensor-parallel rank.
             if (
-                name in ("input_scale", "weight_global_scale")
-                or extra.get("scale_type") == "tensor"
+                source_name.startswith("input")
+                or name in ("weight_global_scale", "global_scale")
+                or extra.get("scale_type") in ("tensor", "input_scale")
                 or not extra
             ):
                 p.weight_loader = replicated()
@@ -188,6 +225,11 @@ class LinearBase(nn.Module):
             )
         else:
             layer.weight.weight_loader = loader
+
+    @staticmethod
+    def _weight_hf_key(layer: nn.Module, base: str) -> str:
+        source_name = getattr(layer.weight, "_quant_source_name", "weight")
+        return f"{base}.{source_name}"
 
 
 class ReplicatedLinear(LinearBase):
@@ -241,7 +283,7 @@ class ReplicatedLinear(LinearBase):
 
         if prefix:
             weight_loader = replicated()
-            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.hf_keys = [(self._weight_hf_key(self, prefix), None)]
             self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 self.bias.hf_keys = [(f"{prefix}.bias", None)]
@@ -259,6 +301,7 @@ class ReplicatedLinear(LinearBase):
             K=self.in_features,
             in_dtype=x.dtype,
             out_dtype=self.params_dtype,
+            device=x.device,
         )
         bias = self.bias if not self.skip_bias_add else None
         y = kernel.apply(self, x, bias)
@@ -354,7 +397,7 @@ class ColumnParallelLinear(LinearBase):
         # by re-attaching after super().__init__ returns.
         if prefix and len(per_rank_sizes) == 1:
             weight_loader = sharded(dim=0, axis=axis, mesh=mesh_obj)
-            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.hf_keys = [(self._weight_hf_key(self, prefix), None)]
             self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 self.bias.hf_keys = [(f"{prefix}.bias", None)]
@@ -377,6 +420,7 @@ class ColumnParallelLinear(LinearBase):
             K=self.input_size_per_partition,
             in_dtype=x.dtype,
             out_dtype=self.params_dtype,
+            device=x.device,
         )
         bias = self.bias if not self.skip_bias_add else None
         y = kernel.apply(self, x, bias)
@@ -448,7 +492,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     offset=offset, size=per_rank, dim=0, axis=axis, replicate=1
                 )
                 scale_legs[i] = (hf_base, leg_dict[i])
-                keys.append((f"{hf_base}.weight", i))
+                keys.append((self._weight_hf_key(self, hf_base), i))
                 if self.bias is not None:
                     bias_keys.append((f"{hf_base}.bias", i))
                 offset += per_rank
@@ -579,7 +623,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             for kind in ("q", "k", "v"):
                 hf_name = legs[kind]
                 hf_base = f"{parent}.{hf_name}" if parent else hf_name
-                keys.append((f"{hf_base}.weight", kind))
+                keys.append((self._weight_hf_key(self, hf_base), kind))
                 scale_legs[kind] = (hf_base, leg_dict[kind])
                 if self.bias is not None:
                     bias_keys.append((f"{hf_base}.bias", kind))
@@ -678,7 +722,7 @@ class RowParallelLinear(LinearBase):
 
         if prefix:
             weight_loader = sharded(dim=1, axis=axis, mesh=mesh_obj)
-            self.weight.hf_keys = [(f"{prefix}.weight", None)]
+            self.weight.hf_keys = [(self._weight_hf_key(self, prefix), None)]
             self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 # Bias is replicated for row-parallel — full copy, no slice.
@@ -703,6 +747,7 @@ class RowParallelLinear(LinearBase):
             K=self.input_size_per_partition,
             in_dtype=x.dtype,
             out_dtype=self.params_dtype,
+            device=x.device,
         )
         # Only rank 0 adds the bias to avoid double counting post-reduce.
         add_bias = (

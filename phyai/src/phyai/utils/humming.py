@@ -64,7 +64,7 @@ def require_humming_supports_sm(sm: int) -> None:
         raise RuntimeError(
             f"the installed humming-kernels build has no kernels for sm_{sm} "
             f"(e.g. Jetson Thor sm_110 is unsupported) and would KeyError inside "
-            f"humming's tuning. Set PHYAI_LINEAR_QUANT_BACKEND=flashinfer or torch "
+            f"humming's tuning. Set PHYAI_LINEAR_QUANT_BACKEND=flashinfer "
             f"where the format allows, or install a humming build supporting sm_{sm}."
         )
 

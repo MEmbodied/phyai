@@ -157,6 +157,7 @@ class LinearKernelRegistry:
                         out_dtype=torch.bfloat16,
                         sm=sm,
                         mode=mode,
+                        M=1 if M_bucket == 1 else 512,
                     )
                     if not self.has(probe):
                         raise NoBackendError(

@@ -111,3 +111,6 @@ skills-lock.json
 
 # For some OpenCode agents
 docs/compose/
+
+# Auto Tune and Auto Research Agent
+.auto_research/

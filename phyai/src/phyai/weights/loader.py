@@ -17,8 +17,8 @@ The whole load chain in one place:
    :class:`LoadReport`. Strict mode raises if anything required is
    missing or any HF key was unexpected.
 5. Walk ``model.modules()``; call ``module.post_load()`` where defined
-   so quant specs can do scale fixups (e.g. fp8 per-tensor ->
-   per-channel fan-out).
+   so quant specs can validate and canonicalise scales (e.g. verify fused
+   FP8 tensorwise scales agree and collapse them to one scalar).
 """
 
 from __future__ import annotations
@@ -270,7 +270,15 @@ def load_pretrained(
                     continue
                 param, shard_id, loader = hit
                 tensor = f.get_tensor(raw)
-                if tensor.dtype != param.dtype:
+                accepted_source_dtypes = getattr(
+                    param,
+                    "_accepted_source_dtypes",
+                    (),
+                )
+                if (
+                    tensor.dtype != param.dtype
+                    and tensor.dtype not in accepted_source_dtypes
+                ):
                     report.casts.append((hf, tensor.dtype, param.dtype))
                 loader(param, tensor, shard_id)
                 seen.add(hf)

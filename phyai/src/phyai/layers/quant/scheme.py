@@ -48,8 +48,8 @@ class TensorQuant:
     block-microscaled formats (NVFP4/MXFP4: an in-block low-precision
     scale plus an outer global scale). ``block_shape`` is set for
     block-granularity weights. ``group_size`` is the K-direction group
-    size for group-quantized weights (0 = per-channel / per-tensor), as
-    used by AWQ/GPTQ and llm-compressor ``group`` strategy.
+    size for group-quantized weights or activations (0 = per-channel /
+    per-tensor), as used by AWQ/GPTQ and llm-compressor ``group`` strategy.
     """
 
     dtype: QDType
@@ -68,6 +68,9 @@ class QuantScheme:
     weight: TensorQuant
     input: TensorQuant | None = None
     online: bool = False
+    raw_config: dict | None = None
+    input_raw_config: dict | None = None
+    pack_format: str | None = None
 
     @property
     def weight_only(self) -> bool:

@@ -17,7 +17,7 @@ Quick start::
     o_proj = L.RowParallelLinear(
         in_features=4096, out_features=4096,
         axis="tp", sp_axis="sp",
-        spec=L.Fp8Spec(granularity=L.Granularity.PER_CHANNEL),
+        spec=L.Fp8Spec(granularity=L.Granularity.PER_TENSOR),
     )
 """
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from phyai.layers.linear.backend import Granularity, KernelProbe, LinearKernel
 from phyai.layers.linear.backends import FlashInferKernel, HummingKernel, TorchKernel
+from phyai.layers.linear.backends.flashinfer import flashinfer_supported_specs_for_sm
 from phyai.layers.linear.dispatch import (
     KernelDispatcher,
     _set_linear_dispatcher,
@@ -49,35 +50,28 @@ from phyai.layers.linear.registry import (
 from phyai.layers.linear.spec import ActivationView, Bf16Spec, Fp8Spec, Nvfp4Spec
 from phyai.layers.quant import AllocationRequest, WeightSpec
 from phyai.utils.cuda import sm_arch
-from phyai.utils.humming import has_humming
+from phyai.utils.humming import has_humming, humming_supports_sm
 
 
 def supported_specs_for_sm(sm: int) -> list[str]:
-    """Specs ``validate()`` should *require* a kernel for on this hardware.
+    """Return physical spec families available for compute capability ``sm``.
 
-    ``validate()`` is a startup sanity check, not a feature gate: it should
-    only assert coverage for specs the current GPU can actually run. fp8 has
-    no backend below sm_89 (``torch._scaled_mm`` needs sm89+; flashinfer's
-    block-fp8 GEMM is sm100+), so demanding fp8 coverage on Ampere (sm_86)
-    or CPU (sm_arch → 0) would kill engine init for a pure-bf16 model that
-    never touches fp8. bf16 is universal (it also covers the CPU fallback).
-
-    A model that *does* request an fp8 spec on unsupported hardware still
-    gets a clear, lazily-raised
-    :class:`~phyai.parallel.exceptions.NoBackendError` at dispatch time
-    (see :meth:`KernelDispatcher.select`) — the failure surfaces at the
-    offending matmul, not at startup for everyone.
+    This is a capability report, not the default startup requirement list.
+    Tensorwise FP8 is available on Ada/Hopper through cuBLAS and on Blackwell
+    through CUTLASS; block FP8 uses architecture-specific FlashInfer kernels.
+    Humming specs are reported only when the installed build has heuristics for
+    this SM. bf16 is universal.
     """
     specs = ["bf16"]
-    if sm >= 89:
-        # torch._scaled_mm per-tensor / per-channel fp8.
-        specs += ["fp8_per_tensor", "fp8_per_channel"]
-    if sm >= 100:
-        # flashinfer gemm_fp8_nt_groupwise (DeepSeek-V3 block-fp8).
-        specs.append("fp8_block_128_128")
-        # flashinfer mm_fp4 (Blackwell NVFP4) with 128x4 scale layout.
-        specs.append("nvfp4_block_16_128x4")
-    if has_humming():
+    flashinfer_specs = flashinfer_supported_specs_for_sm(sm)
+    for spec_id in (
+        "fp8_per_tensor",
+        "fp8_block_128_128",
+        "nvfp4_block_16_128x4",
+    ):
+        if spec_id in flashinfer_specs:
+            specs.append(spec_id)
+    if has_humming() and humming_supports_sm(sm):
         # humming dense GEMM for sub-8-bit weights. Only required when humming is
         # importable, so humming-less hosts (CPU/CI) still start cleanly. The SM
         # gate is set by the ACTIVATION dtype (humming check_dtype), so ids are
@@ -97,8 +91,12 @@ def supported_specs_for_sm(sm: int) -> list[str]:
                 "humming_wfloat8e5m2_abfloat16_channel",
                 "humming_wfloat4e2m1_abfloat16_channel",
             ]
-        if sm >= 89:  # fp8 activation (W8A8 fp8)
-            specs.append("humming_wfloat8e4m3_afloat8e4m3_channel")
+        if sm >= 89:
+            # note(chenghua): validate both FP8-weight and MXFP4-weight A8 paths.
+            specs += [
+                "humming_wfloat8e4m3_afloat8e4m3_channel",
+                "humming_wfloat4e2m1_afloat8e4m3_group_g32",
+            ]
         if sm >= 120:  # fp4 activation (W4A4 mxfp4)
             specs.append("humming_wfloat4e2m1_afloat4e2m1_channel")
     return specs
@@ -119,10 +117,11 @@ def init(
     CPU-only / flashinfer-unavailable hosts that still want validate to
     pass on torch alone).
 
-    When ``sample_specs`` is left unset, the specs ``validate()`` requires
-    are chosen by hardware capability via :func:`supported_specs_for_sm`
-    so that pure-bf16 deployments on fp8-incapable GPUs (e.g. sm_86) start
-    cleanly; unsupported specs only error if a layer actually requests one.
+    When ``sample_specs`` is left unset, validation requires only ``bf16``.
+    Optional quantization backends are validated when callers pass their
+    model's physical specs explicitly. This keeps bf16-only deployments
+    independent of optional FP8/Humming installations while preserving strict
+    validation for applications that know their required specs.
     """
     reg = LinearKernelRegistry()
 
@@ -134,9 +133,7 @@ def init(
     if validate:
         sm = sm_arch()
         reg.validate(
-            sample_specs=(
-                sample_specs if sample_specs is not None else supported_specs_for_sm(sm)
-            ),
+            sample_specs=sample_specs if sample_specs is not None else ["bf16"],
             sm=sm,
         )
 

@@ -18,7 +18,7 @@ from pathlib import Path
 # re-parsing pyproject at runtime. (distribution, import module, expected).
 CORE_DEPS: tuple[tuple[str, str, str], ...] = (
     ("torch", "torch", "2.11"),
-    ("flashinfer-python", "flashinfer", "0.6.12"),
+    ("flashinfer-python", "flashinfer", "0.6.14"),
     ("transformers", "transformers", "5.8.1"),
 )
 

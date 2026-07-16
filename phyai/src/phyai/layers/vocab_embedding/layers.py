@@ -321,6 +321,7 @@ class ParallelLMHead(nn.Module):
             K=self.input_size_per_partition,
             in_dtype=x.dtype,
             out_dtype=self.params_dtype,
+            device=x.device,
         )
         y = kernel.apply(self, x, self.bias)
         if self.gather_output and self.tp_size > 1:

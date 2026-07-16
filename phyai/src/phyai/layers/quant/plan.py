@@ -21,7 +21,9 @@ class Matcher:
         if self.kind == "name":
             return self.pattern == prefix or prefix.split(".")[-1] == self.pattern
         if self.kind == "glob":
-            return fnmatch.fnmatch(prefix, self.pattern)
+            return fnmatch.fnmatch(prefix, self.pattern) or any(
+                fnmatch.fnmatch(part, self.pattern) for part in prefix.split(".")
+            )
         if self.kind == "regex":
             return re.match(self.pattern, prefix) is not None
         if self.kind == "module_cls":
@@ -46,8 +48,8 @@ class QuantPlan:
         from phyai.layers.quant.scheme import QDType, QuantScheme, TensorQuant
 
         fp8 = QuantScheme(
-            weight=TensorQuant(QDType.FP8_E4M3, Granularity.PER_CHANNEL),
-            input=TensorQuant(QDType.FP8_E4M3, Granularity.PER_CHANNEL, dynamic=True),
+            weight=TensorQuant(QDType.FP8_E4M3, Granularity.PER_TENSOR),
+            input=TensorQuant(QDType.FP8_E4M3, Granularity.PER_TENSOR, dynamic=True),
         )
         plan = QuantPlan(
             rules=(

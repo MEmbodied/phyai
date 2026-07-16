@@ -581,6 +581,7 @@ class PaliGemmaDecoderLayer(nn.Module):
                 K=n.shape[-1],
                 in_dtype=n.dtype,
                 out_dtype=self.qkv_proj.params_dtype,
+                device=n.device,
             )
             fused = kernel.apply(projection, n, bias)
         else:

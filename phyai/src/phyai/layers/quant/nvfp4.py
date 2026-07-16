@@ -37,6 +37,18 @@ def _round_up(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
 
+def flashinfer_nvfp4_e4m3_max() -> float:
+    """Return FlashInfer's active NVFP4 E4M3 limit, including 4-over-6."""
+    try:
+        from flashinfer.quantization.nvfp4_quantization_utils import (
+            current_nvfp4_4over6_config,
+            nvfp4_e4m3_max,
+        )
+    except (AttributeError, ImportError):
+        return _FP8_E4M3_AMAX
+    return nvfp4_e4m3_max(current_nvfp4_4over6_config())
+
+
 def _scale_shape(
     out_per_rank: int,
     in_per_rank: int,
@@ -95,6 +107,9 @@ class Nvfp4Spec:
     scale_layout: Literal["linear", "128x4"] = "128x4"
     weight_dtype: torch.dtype = torch.uint8
     block_size: int = _NVFP4_BLOCK_SIZE
+    raw_config: dict | None = None
+    input_raw_config: dict | None = None
+    online: bool = False
 
     def __post_init__(self) -> None:
         if self.block_size != _NVFP4_BLOCK_SIZE:
@@ -104,6 +119,44 @@ class Nvfp4Spec:
                 f"Nvfp4Spec scale_layout must be 'linear' or '128x4', "
                 f"got {self.scale_layout!r}"
             )
+        if self.raw_config is not None:
+            quant_method = str(self.raw_config.get("quant_method", "")).lower()
+            if quant_method == "modelopt":
+                quant_algo = str(self.raw_config.get("quant_algo", "")).upper()
+                if quant_algo not in ("NVFP4", "FP4"):
+                    raise ValueError(
+                        "Nvfp4Spec ModelOpt source requires quant_algo='NVFP4'"
+                    )
+                if int(self.raw_config.get("group_size", 16) or 16) != 16:
+                    raise ValueError("Nvfp4Spec ModelOpt source requires group_size=16")
+            elif quant_method != "compressed-tensors":
+                raise ValueError(
+                    "Nvfp4Spec raw_config only supports compressed-tensors or ModelOpt"
+                )
+            elif self.raw_config.get("format") != "nvfp4-pack-quantized":
+                raise ValueError(
+                    "Nvfp4Spec compressed-tensors source must use "
+                    "format='nvfp4-pack-quantized'"
+                )
+            if quant_method == "compressed-tensors":
+                expected = {
+                    "type": "float",
+                    "num_bits": 4,
+                    "strategy": "tensor_group",
+                    "group_size": 16,
+                    "symmetric": True,
+                }
+                for name, value in expected.items():
+                    if self.raw_config.get(name) != value:
+                        raise ValueError(
+                            "Nvfp4Spec compressed-tensors source requires "
+                            f"{name}={value!r}, got {self.raw_config.get(name)!r}"
+                        )
+            if not self.online and self.scale_layout != "128x4":
+                raise ValueError(
+                    "serialized NVFP4 must be converted to the FlashInfer "
+                    "128x4 scale layout"
+                )
 
     @property
     def spec_id(self) -> str:
@@ -121,6 +174,14 @@ class Nvfp4Spec:
                 f"Nvfp4Spec: in_per_rank={in_per_rank} not divisible by "
                 f"block_size={self.block_size}"
             )
+        if self.scale_layout == "128x4" and (
+            out_per_rank % 32 != 0 or in_per_rank % 32 != 0
+        ):
+            raise ValueError(
+                "Nvfp4Spec(scale_layout='128x4') requires out_features and "
+                "in_features divisible by 32 for FlashInfer FP4 GEMM, got "
+                f"({out_per_rank}, {in_per_rank})"
+            )
         device = request.device
 
         layer.weight = nn.Parameter(
@@ -132,28 +193,187 @@ class Nvfp4Spec:
             ),
             requires_grad=False,
         )
+        source_method = str((self.raw_config or {}).get("quant_method", "")).lower()
+        serialized_source = self.raw_config is not None and not self.online
+        if serialized_source:
+            layer.weight._quant_source_name = (
+                "weight_packed" if source_method == "compressed-tensors" else "weight"
+            )
+            layer.weight._quant_attrs = {"output_dim": 0, "input_dim": 1}
+            scale_shape = (out_per_rank, in_per_rank // self.block_size)
+        else:
+            layer.weight._quant_source_name = "weight"
+            scale_shape = _scale_shape(
+                out_per_rank,
+                in_per_rank,
+                self.scale_layout,
+            )
+        layer.weight._accepted_source_dtypes = (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.uint8,
+        )
         layer.weight_scale = nn.Parameter(
-            torch.ones(
-                _scale_shape(out_per_rank, in_per_rank, self.scale_layout),
+            torch.full(
+                scale_shape,
+                float("nan"),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             ),
             requires_grad=False,
         )
+        layer.weight_scale._quant_source_name = "weight_scale"
+        layer.weight_scale._quant_attrs = {
+            "output_dim": 0,
+            "input_dim": 1,
+            "scale_type": "group",
+        }
+        global_scale_count = len(request.logical_widths) if serialized_source else 1
         layer.weight_global_scale = nn.Parameter(
-            torch.ones(1, dtype=torch.float32, device=device),
+            torch.full(
+                (global_scale_count,),
+                float("nan"),
+                dtype=torch.float32,
+                device=device,
+            ),
             requires_grad=False,
         )
+        layer.weight_global_scale._quant_source_name = (
+            "weight_scale_2" if source_method == "modelopt" else "weight_global_scale"
+        )
+        layer.weight_global_scale._quant_attrs = {
+            "scale_type": "tensor",
+            "stacked_scalar": global_scale_count > 1,
+        }
+        if serialized_source:
+            input_scale_source = (
+                "input_scale" if source_method == "modelopt" else "input_global_scale"
+            )
+            layer.input_global_scale = nn.Parameter(
+                torch.ones(
+                    (len(request.logical_widths),),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                requires_grad=False,
+            )
+            layer.input_global_scale._quant_source_name = input_scale_source
+            layer.input_global_scale._quant_attrs = {
+                "scale_type": "tensor",
+                "stacked_scalar": len(request.logical_widths) > 1,
+            }
+            layer.input_global_scale._quant_optional = True
         layer._nvfp4_pending_weight = None
         layer.logical_widths = list(request.logical_widths)
+        layer._nvfp4_in_per_rank = in_per_rank
+        layer._nvfp4_out_per_rank = out_per_rank
+        layer._nvfp4_source_method = source_method if serialized_source else ""
+        layer._nvfp4_serialized_source = serialized_source
 
     def process_after_loading(self, layer: nn.Module) -> None:
         pending = getattr(layer, "_nvfp4_pending_weight", None)
         if pending is not None:
-            print("Nvfp4Spec: quantizing loaded weight to packed NVFP4")
             self.quantize_loaded_weight(layer, pending)
             layer._nvfp4_pending_weight = None
-        return None
+        elif layer._nvfp4_serialized_source:
+            input_scale = layer.input_global_scale.detach().float().reshape(-1)
+            if not torch.isfinite(input_scale).all() or (input_scale <= 0).any():
+                raise ValueError(
+                    "serialized NVFP4 input scale must be finite and strictly positive"
+                )
+            delattr(layer, "input_global_scale")
+            self.convert_serialized_weight(layer)
+        weight_scale = layer.weight_scale.detach().float()
+        global_scale = layer.weight_global_scale.detach().float()
+        if not torch.isfinite(weight_scale).all() or (weight_scale < 0).any():
+            raise ValueError("NVFP4 weight_scale must be finite and nonnegative")
+        if not torch.isfinite(global_scale).all() or (global_scale <= 0).any():
+            raise ValueError(
+                "NVFP4 weight_global_scale must be finite and strictly positive"
+            )
+
+    def interleave_scale(self, scale: torch.Tensor) -> torch.Tensor:
+        if not scale.is_cuda:
+            raise RuntimeError(
+                "converting compressed-tensors NVFP4 scale factors to FlashInfer "
+                "128x4 layout requires a CUDA tensor on sm_100+"
+            )
+        try:
+            from flashinfer.quantization import block_scale_interleave
+        except Exception as exc:
+            raise RuntimeError(
+                "converting compressed-tensors NVFP4 requires FlashInfer with "
+                "block_scale_interleave support"
+            ) from exc
+        return block_scale_interleave(scale.contiguous().view(torch.uint8))
+
+    def convert_serialized_weight(self, layer: nn.Module) -> None:
+        scale = layer.weight_scale.detach()
+        global_scale = layer.weight_global_scale.detach().float().reshape(-1)
+        if not torch.isfinite(global_scale).all() or (global_scale <= 0).any():
+            raise ValueError(
+                "serialized NVFP4 weight global scale must be finite and "
+                "strictly positive"
+            )
+        if not torch.isfinite(scale.float()).all() or (scale.float() < 0).any():
+            raise ValueError(
+                "serialized NVFP4 weight_scale must be finite and nonnegative"
+            )
+
+        descales = (
+            global_scale
+            if layer._nvfp4_source_method == "modelopt"
+            else global_scale.reciprocal()
+        )
+        common_descale = descales[0]
+        if not torch.equal(descales, common_descale.expand_as(descales)):
+            if len(layer.logical_widths) != descales.numel():
+                raise RuntimeError(
+                    "serialized NVFP4 fused global-scale count does not "
+                    "match the number of logical weight legs"
+                )
+            common_descale = descales.max()
+            rows = []
+            offset = 0
+            for width, descale in zip(layer.logical_widths, descales, strict=True):
+                leg = scale.narrow(0, offset, width).float() * (
+                    descale / common_descale
+                )
+                rows.append(leg.to(torch.float8_e4m3fn))
+                offset += width
+            scale = torch.cat(rows, dim=0)
+
+        interleaved = self.interleave_scale(scale)
+        expected_shape = _scale_shape(
+            layer._nvfp4_out_per_rank,
+            layer._nvfp4_in_per_rank,
+            "128x4",
+        )
+        if interleaved.numel() != expected_shape[0] * expected_shape[1]:
+            raise RuntimeError(
+                "FlashInfer block_scale_interleave returned an unexpected number "
+                f"of scale factors: got {interleaved.numel()}, expected "
+                f"{expected_shape[0] * expected_shape[1]}"
+            )
+        if interleaved.dtype is torch.uint8:
+            interleaved = interleaved.view(torch.float8_e4m3fn)
+        elif interleaved.dtype is not torch.float8_e4m3fn:
+            raise TypeError(
+                "FlashInfer block_scale_interleave must return uint8 or "
+                f"float8_e4m3fn, got {interleaved.dtype}"
+            )
+        layer.weight_scale = nn.Parameter(
+            interleaved.reshape(expected_shape),
+            requires_grad=False,
+        )
+        layer.weight_global_scale = nn.Parameter(
+            common_descale.reshape(1).to(
+                device=layer.weight.device,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
 
     def load_weight(
         self,
@@ -164,6 +384,10 @@ class Nvfp4Spec:
     ) -> None:
         logical_shape = (layer.weight.shape[0], layer.weight.shape[1] * 2)
         if loaded.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            if self.raw_config is not None and not self.online:
+                raise TypeError(
+                    f"serialized NVFP4 expects packed uint8 weight, got {loaded.dtype}"
+                )
             pending = getattr(layer, "_nvfp4_pending_weight", None)
             if pending is None:
                 pending = torch.empty(
@@ -172,15 +396,25 @@ class Nvfp4Spec:
                     device=loaded.device,
                 )
                 layer._nvfp4_pending_weight = pending
+            elif pending.dtype != loaded.dtype:
+                raise TypeError(
+                    "all fused high-precision NVFP4 source weights must share a dtype"
+                )
             default_loader(pending, loaded, shard_id)
             return
 
+        if loaded.dtype is not torch.uint8:
+            raise TypeError(
+                f"serialized NVFP4 weight must use packed uint8, got {loaded.dtype}"
+            )
         default_loader(layer.weight, loaded, shard_id)
 
     def quantize_loaded_weight(self, layer: nn.Module, weight: torch.Tensor) -> None:
         src = weight.detach().to(device=layer.weight.device).contiguous()
         if src.dtype not in (torch.bfloat16, torch.float32, torch.float16):
             src = src.to(torch.bfloat16)
+        if not torch.isfinite(src).all():
+            raise ValueError("online NVFP4 source weight must be finite")
 
         if self.scale_layout == "linear":
             packed, scale, global_scale = _quantize_nvfp4_linear(src, self.block_size)
@@ -194,7 +428,7 @@ class Nvfp4Spec:
                 )
             from flashinfer.quantization import SfLayout, nvfp4_quantize
 
-            flashinfer_global_scale = (_FP8_E4M3_AMAX * _NVFP4_MAX) / (
+            flashinfer_global_scale = (flashinfer_nvfp4_e4m3_max() * _NVFP4_MAX) / (
                 src.float().abs().amax().clamp_min(1e-12)
             )
             flashinfer_global_scale = flashinfer_global_scale.reshape(1)
@@ -222,4 +456,4 @@ class Nvfp4Spec:
         )
 
 
-__all__ = ["Nvfp4Spec"]
+__all__ = ["Nvfp4Spec", "flashinfer_nvfp4_e4m3_max"]

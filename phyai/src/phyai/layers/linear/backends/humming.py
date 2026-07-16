@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import torch
+from phyai_kernel import (
+    fp8_quantize_per_group,
+    fp8_quantize_per_tensor_with_scale,
+    fp8_quantize_per_token,
+)
 
 from phyai.layers.linear.backend import KernelProbe
 from phyai.layers.linear.registry import register_linear_kernel
@@ -85,12 +90,43 @@ class HummingKernel:
     ) -> torch.Tensor:
         K = x.shape[-1]
         x_2d = x.reshape(-1, K)
+        input_scale = getattr(layer, "_humming_static_input_scale", None)
+        if input_scale is not None:
+            if (
+                layer._humming_spec.a_dtype == "float8e4m3"
+                and layer._humming_spec.input_group_size == 0
+            ):
+                x_2d, _ = fp8_quantize_per_tensor_with_scale(x_2d, input_scale)
+                input_scale = (
+                    input_scale.reshape(1, 1).expand(x_2d.shape[0], 1).contiguous()
+                )
+            else:
+                from humming import ops
+
+                group_size = layer._humming_spec.input_group_size or K
+                num_groups = K // group_size
+                expanded_scale = input_scale.reshape(1, -1).expand(
+                    x_2d.shape[0], num_groups
+                )
+                x_2d, input_scale = ops.quant_input(
+                    inputs=x_2d,
+                    dtype=layer._humming_spec.a_dtype,
+                    scales=expanded_scale.contiguous(),
+                    group_size=group_size,
+                )
+        elif layer._humming_spec.a_dtype == "float8e4m3":
+            group_size = layer._humming_spec.input_group_size
+            if group_size == 0:
+                x_2d, input_scale = fp8_quantize_per_token(x_2d)
+            elif group_size == 128:
+                x_2d, input_scale = fp8_quantize_per_group(x_2d, group_size)
         y = HummingMethod.forward_layer(
             layer,
             inputs=x_2d,
+            input_scale=input_scale,
             compute_config=layer._humming_spec._compute_config,
         )
-        if bias is not None:
+        if bias is not None and not getattr(layer, "_humming_bias_fused", False):
             y = y + bias
         return y.reshape(*x.shape[:-1], -1)
 

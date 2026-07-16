@@ -1,8 +1,7 @@
 """KernelDispatcher with hashmap cache.
 
-The cache key includes an ``M_bucket`` so decode (M≤8) and prefill
-(M≥1024) naturally land on different kernels when ``prefer_for`` is
-declared.
+The cache key includes both exact M for capability and ``M_bucket`` for the
+registry's coarse decode/prefill preference.
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ class KernelDispatcher:
         else:
             self.policy = DefaultPolicy()
         self._cache: dict[tuple[Any, ...], LinearKernel] = {}
-        self._sm = sm_arch()
+        self._sm_by_device: dict[torch.device | str | int | None, int] = {}
 
     def select(
         self,
@@ -67,10 +66,15 @@ class KernelDispatcher:
         K: int,
         in_dtype: torch.dtype,
         out_dtype: torch.dtype,
+        device: torch.device | str | int | None = None,
     ) -> LinearKernel:
         mode = current_mode()
         Mb = _M_bucket(M)
-        key = (spec_id, Mb, N, K, in_dtype, out_dtype, self._sm, mode)
+        sm = self._sm_by_device.get(device)
+        if sm is None:
+            sm = sm_arch(device)
+            self._sm_by_device[device] = sm
+        key = (spec_id, M, Mb, N, K, in_dtype, out_dtype, sm, mode)
         k = self._cache.get(key)
         if k is None:
             probe = KernelProbe(
@@ -80,15 +84,16 @@ class KernelDispatcher:
                 K=K,
                 in_dtype=in_dtype,
                 out_dtype=out_dtype,
-                sm=self._sm,
+                sm=sm,
                 mode=mode,
+                M=M,
             )
             cands = self.registry.candidates(probe)
             if not cands:
                 raise NoBackendError(
-                    f"no LinearKernel for spec={spec_id} M_bucket={Mb} "
+                    f"no LinearKernel for spec={spec_id} M={M} M_bucket={Mb} "
                     f"N={N} K={K} in_dtype={in_dtype} out_dtype={out_dtype} "
-                    f"mode={mode.value} sm={self._sm}"
+                    f"mode={mode.value} sm={sm}"
                 )
             k = self.policy.select(cands)
             self._cache[key] = k
@@ -96,6 +101,7 @@ class KernelDispatcher:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+        self._sm_by_device.clear()
 
 
 # Process-level singleton; populated in :func:`phyai.layers.linear.init`.

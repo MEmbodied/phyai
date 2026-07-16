@@ -143,10 +143,10 @@ def stage_flops(
     )
     vision += gemm_flop(image_tokens, dims.l_hidden, dims.v_hidden)
 
-    # --- LLM prefix: n_per_sample tokens, full self-attention, 18 layers. ---
+    # note(chenghua): The final language layer executes only its input norm and K/V projection.
     n_ps = n_per_sample(lang_len, dims, num_images)
     llm_prefix = 0.0
-    for _ in range(dims.l_layers):
+    for _ in range(max(dims.l_layers - 1, 0)):
         llm_prefix += transformer_layer_flop(
             n_ps,
             dims.l_hidden,
@@ -157,6 +157,9 @@ def stage_flops(
             kv_len=n_ps,
             gated_mlp=True,
         )
+    if dims.l_layers:
+        kv_dim = dims.l_kv_heads * dims.l_head_dim
+        llm_prefix += gemm_flop(n_ps, 2 * kv_dim, dims.l_hidden)
 
     # --- Expert one Euler step: chunk_size queries vs (prefix + suffix) kv. ---
     e_kv_len = n_ps + dims.chunk_size
@@ -208,7 +211,7 @@ def analytic_weight_bytes(dims: Pi05Dims, *, dtype_bytes: int = 2) -> dict[str, 
     v_params += dims.v_hidden * (dims.num_channels * dims.patch_size**2)  # patch embed
     v_params += dims.v_hidden * dims.l_hidden  # projector
 
-    l_params = dims.l_layers * attn_mlp_params(
+    l_params = max(dims.l_layers - 1, 0) * attn_mlp_params(
         dims.l_hidden,
         dims.l_heads,
         dims.l_kv_heads,
@@ -216,6 +219,8 @@ def analytic_weight_bytes(dims: Pi05Dims, *, dtype_bytes: int = 2) -> dict[str, 
         dims.l_intermediate,
         gated=True,
     )
+    if dims.l_layers:
+        l_params += dims.l_hidden * (2 * dims.l_kv_heads * dims.l_head_dim)
 
     e_params = dims.e_layers * attn_mlp_params(
         dims.e_hidden,

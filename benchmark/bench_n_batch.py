@@ -78,6 +78,11 @@ class BenchSpec:
     name: str
     step_callable: Callable[[], Any]
     teardown_callable: Callable[[], None]
+    sample_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.sample_count is not None and self.sample_count <= 0:
+            raise ValueError(f"sample_count must be positive, got {self.sample_count}")
 
 
 @dataclass
@@ -201,7 +206,14 @@ class NBatchBenchRunner:
             spec = self.setup_fn(bs)
             try:
                 extras = self.extras_fn(bs, spec) if self.extras_fn else {}
-                result = self._run_one(spec, batch_size=bs, extras=extras)
+                result = self._run_one(
+                    spec,
+                    batch_size=bs,
+                    throughput_batch_size=(
+                        bs if spec.sample_count is None else spec.sample_count
+                    ),
+                    extras=extras,
+                )
                 results.append(result)
                 _print_result(result)
             finally:
@@ -226,6 +238,7 @@ class NBatchBenchRunner:
         spec: BenchSpec,
         *,
         batch_size: int,
+        throughput_batch_size: int,
         extras: dict[str, Any],
     ) -> BenchResult:
         step_callable = spec.step_callable
@@ -272,6 +285,7 @@ class NBatchBenchRunner:
             bench_name=self.bench_name,
             spec_name=spec.name,
             batch_size=batch_size,
+            throughput_batch_size=throughput_batch_size,
             n_warmup=self.n_warmup,
             n_timed=self.n_timed,
             latencies_ms=latencies_ms,
@@ -319,6 +333,7 @@ def _build_result(
     bench_name: str,
     spec_name: str,
     batch_size: int,
+    throughput_batch_size: int,
     n_warmup: int,
     n_timed: int,
     latencies_ms: list[float],
@@ -333,8 +348,8 @@ def _build_result(
     stdev = float(statistics.stdev(latencies_ms)) if len(latencies_ms) > 1 else 0.0
     mn = float(arr.min())
     mx = float(arr.max())
-    # Throughput in samples/s = batch_size / mean_latency_seconds.
-    throughput = batch_size / (mean / 1000.0) if mean > 0 else float("inf")
+    # note(chenghua): Throughput uses the actual request size, which can be below max batch size.
+    throughput = throughput_batch_size / (mean / 1000.0) if mean > 0 else float("inf")
     merged_extras = {**extras, "spec_name": spec_name}
     return BenchResult(
         run_name=run_name,

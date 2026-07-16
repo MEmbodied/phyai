@@ -13,7 +13,7 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
-from phyai.layers.quant.granularity import Granularity
+from phyai.layers.quant.granularity import Granularity  # noqa: F401
 from phyai.parallel.state import Mode
 
 
@@ -38,6 +38,9 @@ class KernelProbe:
     out_dtype: torch.dtype
     sm: int
     mode: Mode
+    # note(chenghua): Keep exact M beside the coarse regime to separate M=16
+    # from M=17 in the capability cache.
+    M: int | None = None
 
 
 @runtime_checkable

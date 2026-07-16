@@ -86,15 +86,26 @@ def stage_weight_bytes(model) -> dict[str, float]:
     """Exact resident weight bytes streamed by each stage, from the loaded model.
 
     * ``vision`` — the whole vision tower + multi-modal projector.
-    * ``llm_prefix`` — PaliGemma decoder layers + final norm. The tied
-      ``embed_tokens`` is a gather (no GEMM read of the 0.5 B-param table), so
-      it is excluded from the prefix's streamed bytes.
+    * ``llm_prefix`` — 17 full PaliGemma decoder layers plus the final layer's
+      input norm and K/V projection. The tied ``embed_tokens`` is a gather (no
+      GEMM read of the 0.5 B-param table), so it is excluded.
     * ``expert_1step`` — the expert decoder stack + action/time heads, read
       once per Euler step. ``expert_loop`` multiplies by ``num_inference_steps``.
     """
     n_steps = model.config.num_inference_steps
     vision_b = _module_bytes(model.vision)
-    llm_b = _module_bytes(model.paligemma_lm, exclude_prefixes=("embed_tokens",))
+    llm_layers = model.paligemma_lm.layers
+    llm_b = sum(_module_bytes(layer) for layer in llm_layers[:-1])
+    if llm_layers:
+        last = llm_layers[-1]
+        llm_b += _module_bytes(last.input_layernorm)
+        q_rows = last.q_heads_local * last.head_dim
+        kv_rows = 2 * last.kv_heads_local * last.head_dim
+        for param in last.qkv_proj.parameters(recurse=False):
+            if param.ndim and param.shape[0] == q_rows + kv_rows:
+                llm_b += param.narrow(0, q_rows, kv_rows).numel() * param.element_size()
+            else:
+                llm_b += param.numel() * param.element_size()
     expert_b = _module_bytes(model.expert_stack) + _module_bytes(model.heads)
     return {
         "vision": float(vision_b),

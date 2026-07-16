@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `phyai-model-optimizer/` | Placeholder, no source yet. |
 | `phyai-utils-tools/` | Placeholder, no source yet. |
 
-Hard pins: `torch==2.11`, `flashinfer-python==v0.6.12`, `transformers==5.8.1`. Don't bump these casually — green-context and flashinfer behaviour is tied to these versions.
+Hard pins: `torch==2.11`, `flashinfer-python==v0.6.14`, `transformers==5.8.1`. Don't bump these casually — green-context and flashinfer behaviour is tied to these versions.
 
 ## Common commands
 

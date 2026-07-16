@@ -1,7 +1,7 @@
 """End-to-end pi0.5 ws1 (single-card) latency benchmark, swept over batch sizes.
 
 Builds the pi0.5 engine via the standard plugin path once per batch
-size, feeds a dummy request (random pixels + one-token "prompt"), and
+size, feeds a deterministic dummy request, and
 hands it to the generic :class:`NBatchBenchRunner` from
 :mod:`bench_n_batch` for timing + optional Nsight Systems / Perfetto
 profile capture.
@@ -49,6 +49,7 @@ as named ranges with no extra wiring.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
@@ -85,8 +86,15 @@ def make_dummy_request(
     plugin_cfg: PI05Config,
     device: torch.device,
     dtype: torch.dtype,
+    lang_len: int = 1,
+    seed: int = 0,
 ) -> PI05Request:
-    """Random pixels + single-token prompt PI05Request for ``batch_size`` robots."""
+    """Deterministic random request for ``batch_size`` robots."""
+    if not 1 <= lang_len <= plugin_cfg.tokenizer_max_length:
+        raise ValueError(
+            f"lang_len must be in [1, {plugin_cfg.tokenizer_max_length}], got {lang_len}"
+        )
+    generator = torch.Generator(device=device).manual_seed(seed)
     pixel_values = torch.rand(
         batch_size,
         num_images,
@@ -95,12 +103,13 @@ def make_dummy_request(
         plugin_cfg.vision.image_size,
         dtype=dtype,
         device=device,
+        generator=generator,
     )
     input_ids = torch.zeros(
         batch_size, plugin_cfg.tokenizer_max_length, dtype=torch.int64, device=device
     )
-    input_ids[:, 0] = 2  # any non-pad token id
-    lang_lens = torch.ones(batch_size, dtype=torch.int64, device=device)
+    input_ids[:, :lang_len] = 2  # any non-pad token id
+    lang_lens = torch.full((batch_size,), lang_len, dtype=torch.int64, device=device)
     return PI05Request(
         pixel_values=pixel_values,
         input_ids=input_ids,
@@ -116,6 +125,9 @@ def make_setup_fn(
     use_cuda_graph: bool,
     num_images: int = 3,
     vision_params_dtype: torch.dtype | None = None,
+    actual_batch_size: int | None = None,
+    lang_len: int = 1,
+    seed: int = 0,
 ):
     """Build the per-batch-size ``setup_fn`` closure for :class:`NBatchBenchRunner`.
 
@@ -131,6 +143,12 @@ def make_setup_fn(
     ]
 
     def setup_fn(batch_size: int) -> bnb.BenchSpec:
+        actual_B = batch_size if actual_batch_size is None else actual_batch_size
+        if not 1 <= actual_B <= batch_size:
+            raise ValueError(
+                f"actual_batch_size must be in [1, max_batch_size={batch_size}], "
+                f"got {actual_B}"
+            )
         engine = Engine(
             EngineArgs(
                 plugin="pi05",
@@ -147,16 +165,19 @@ def make_setup_fn(
             )
         )
         request = make_dummy_request(
-            batch_size=batch_size,
+            batch_size=actual_B,
             num_images=num_images,
             plugin_cfg=plugin_cfg,
             device=device,
             dtype=dtype,
+            lang_len=lang_len,
+            seed=seed,
         )
         return bnb.BenchSpec(
             name="ws1_pi05",
             step_callable=lambda: engine.step(request),
             teardown_callable=engine.close,
+            sample_count=actual_B,
         )
 
     return setup_fn
@@ -167,8 +188,22 @@ def make_extras_fn(
     dtype_name: str,
     device_target: str,
     use_cuda_graph: bool,
+    plugin_cfg: PI05Config,
+    actual_batch_size: int | None,
+    lang_len: int,
+    seed: int,
+    quantization: dict[str, Any],
 ):
     def extras_fn(batch_size: int, spec: bnb.BenchSpec) -> dict[str, Any]:
+        actual_B = batch_size if actual_batch_size is None else actual_batch_size
+        lang_buckets = sorted(
+            {b for b in (16, 48, 112) if b < plugin_cfg.tokenizer_max_length}
+            | {plugin_cfg.tokenizer_max_length}
+        )
+        lang_bucket = next(
+            (bucket for bucket in lang_buckets if bucket >= lang_len),
+            plugin_cfg.tokenizer_max_length,
+        )
         return {
             "model": "pi05",
             "scheduler": "ws1",
@@ -176,9 +211,48 @@ def make_extras_fn(
             "device": device_target,
             "use_cuda_graph": use_cuda_graph,
             "max_batch_size": batch_size,
+            "actual_batch_size": actual_B,
+            "lang_len": lang_len,
+            "lang_bucket": lang_bucket,
+            "chunk_size": plugin_cfg.chunk_size,
+            "seed": seed,
+            "quantization": quantization,
         }
 
     return extras_fn
+
+
+def checkpoint_quantization_metadata(checkpoint: Path) -> dict[str, Any]:
+    """Return portable quantization metadata without recording host paths."""
+    config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    quant = config.get("quantization_config") or {}
+    groups = []
+    for name, group in sorted((quant.get("config_groups") or {}).items()):
+        weight = group.get("weights") or {}
+        activation = group.get("input_activations") or {}
+        groups.append(
+            {
+                "name": name,
+                "targets": len(group.get("targets") or []),
+                "weight_num_bits": weight.get("num_bits"),
+                "weight_type": weight.get("type"),
+                "weight_humming_dtype": weight.get("humming_dtype"),
+                "weight_strategy": weight.get("strategy"),
+                "weight_block_structure": weight.get("block_structure"),
+                "activation_num_bits": activation.get("num_bits"),
+                "activation_type": activation.get("type"),
+                "activation_strategy": activation.get("strategy"),
+                "activation_group_size": activation.get("group_size"),
+                "activation_dynamic": activation.get("dynamic"),
+            }
+        )
+    return {
+        "quant_method": quant.get("quant_method"),
+        "format": quant.get("format"),
+        "pack_format": quant.get("pack_format"),
+        "status": quant.get("quantization_status"),
+        "groups": groups,
+    }
 
 
 def main() -> None:
@@ -220,6 +294,19 @@ def main() -> None:
         help="Number of cameras per robot (default 3, the pi05_base contract).",
     )
     parser.add_argument(
+        "--actual-batch-size",
+        type=int,
+        default=None,
+        help="Request batch size; defaults to each swept max batch size.",
+    )
+    parser.add_argument(
+        "--lang-len",
+        type=int,
+        default=1,
+        help="Real prompt length before scheduler bucket padding (default 1).",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
         "--vision-dtype",
         choices=("bfloat16", "float32"),
         default="bfloat16",
@@ -241,6 +328,8 @@ def main() -> None:
 
     dtype = _DTYPES[args.dtype]
     use_cuda_graph = not args.no_cuda_graph and args.device == "cuda"
+    plugin_cfg = load_config(args.checkpoint, PI05Config)
+    quantization = checkpoint_quantization_metadata(args.checkpoint)
 
     # Install whatever profiler the CLI requested. NoOp is the default
     # when --profile-backend is "none" (or rank is excluded).
@@ -254,11 +343,19 @@ def main() -> None:
         use_cuda_graph=use_cuda_graph,
         num_images=args.num_images,
         vision_params_dtype=(torch.float32 if args.vision_dtype == "float32" else None),
+        actual_batch_size=args.actual_batch_size,
+        lang_len=args.lang_len,
+        seed=args.seed,
     )
     extras_fn = make_extras_fn(
         dtype_name=args.dtype,
         device_target=args.device,
         use_cuda_graph=use_cuda_graph,
+        plugin_cfg=plugin_cfg,
+        actual_batch_size=args.actual_batch_size,
+        lang_len=args.lang_len,
+        seed=args.seed,
+        quantization=quantization,
     )
 
     runner = bnb.NBatchBenchRunner(
