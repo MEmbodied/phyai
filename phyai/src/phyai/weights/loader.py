@@ -1,4 +1,4 @@
-"""Top-level safetensors -> model loader.
+"""Top-level checkpoint -> model loader.
 
 The whole load chain in one place:
 
@@ -6,12 +6,12 @@ The whole load chain in one place:
    ``param.weight_loader`` into a dispatch index keyed by HF tensor
    name. Params without ``hf_keys`` are skipped (tied weights, RoPE
    buffers, etc.).
-2. Resolve ``source`` to a concrete list of safetensors shards: a
+2. Resolve ``source`` to concrete checkpoint files: a
    checkpoint folder is expanded via
    :func:`phyai.utils.checkpoint.find_safetensors` (honouring
-   ``model.safetensors.index.json``); a single file path becomes
-   ``[path]``; an iterable is consumed as-is.
-3. Open every shard lazily; for each key, optionally remap via
+   ``model.safetensors.index.json``); a single safetensors or PyTorch
+   checkpoint file becomes ``[path]``; an iterable is consumed as-is.
+3. Open every checkpoint; for each tensor key, optionally remap via
    ``remap`` (callable or dict), look up in the index, and dispatch.
 4. Track every key seen, every cast, every miss; build a
    :class:`LoadReport`. Strict mode raises if anything required is
@@ -24,6 +24,7 @@ The whole load chain in one place:
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -40,6 +41,9 @@ from phyai.weights.shards import WeightLoader, replicated
 
 
 _logger = logging.getLogger(__name__)
+
+_PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".bin", ".pt", ".pth"})
+_SAFETENSORS_SUFFIX = ".safetensors"
 
 
 @dataclass
@@ -147,12 +151,67 @@ def _source_label(source: str | Path | Iterable[str | Path]) -> str:
 
 
 def _count_keys(paths: list[Path]) -> int:
-    """Sum the tensor-key count across shards (header-only, cheap)."""
+    """Sum tensor keys across safetensors and PyTorch checkpoint files."""
     total = 0
     for path in paths:
-        with safe_open(str(path), framework="pt", device="cpu") as f:
-            total += len(f.keys())
+        if path.suffix == _SAFETENSORS_SUFFIX:
+            with safe_open(str(path), framework="pt", device="cpu") as f:
+                total += len(f.keys())
+        else:
+            total += sum(1 for _name, _tensor in _iter_checkpoint_tensors(path))
     return total
+
+
+def _unwrap_pytorch_state(
+    checkpoint: object,
+    *,
+    path: Path,
+) -> Mapping[object, object]:
+    """Resolve common training-checkpoint wrappers to their tensor mapping."""
+
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError(
+            f"PyTorch checkpoint {path} must contain a mapping, got "
+            f"{type(checkpoint).__name__}."
+        )
+    for key in ("model_state_dict", "state_dict"):
+        nested = checkpoint.get(key)
+        if isinstance(nested, Mapping):
+            return nested
+    return checkpoint
+
+
+def _iter_checkpoint_tensors(path: Path) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield tensors from one supported checkpoint container."""
+
+    if path.suffix == _SAFETENSORS_SUFFIX:
+        with safe_open(str(path), framework="pt", device="cpu") as file:
+            for name in file.keys():
+                yield name, file.get_tensor(name)
+        return
+    if path.suffix not in _PYTORCH_CHECKPOINT_SUFFIXES:
+        supported = ", ".join(
+            sorted({_SAFETENSORS_SUFFIX, *_PYTORCH_CHECKPOINT_SUFFIXES})
+        )
+        raise ValueError(
+            f"Unsupported checkpoint extension {path.suffix!r} for {path}; "
+            f"expected one of: {supported}."
+        )
+
+    checkpoint = torch.load(
+        path,
+        map_location="cpu",
+        mmap=True,
+        weights_only=True,
+    )
+    state = _unwrap_pytorch_state(checkpoint, path=path)
+    found = False
+    for name, tensor in state.items():
+        if isinstance(name, str) and isinstance(tensor, torch.Tensor):
+            found = True
+            yield name, tensor
+    if not found:
+        raise ValueError(f"No model tensors found in PyTorch checkpoint {path}.")
 
 
 def _progress_disable(progress: bool | None) -> bool | None:
@@ -180,7 +239,7 @@ def load_pretrained(
     progress: bool | None = None,
     revision: str | None = None,
 ) -> LoadReport:
-    """Load HF safetensors checkpoints into ``model``.
+    """Load safetensors or PyTorch checkpoints into ``model``.
 
     Parameters
     ----------
@@ -197,8 +256,9 @@ def load_pretrained(
           local path) — the repo is downloaded via
           :func:`huggingface_hub.snapshot_download` and loaded from the
           local cache;
-        * a single safetensors **file** path; or
-        * an iterable of safetensors file paths (advanced / test) —
+        * a single safetensors or PyTorch ``.pth`` / ``.pt`` / ``.bin``
+          **file** path; or
+        * an iterable of supported checkpoint file paths (advanced / test) —
           always treated as already-local (no repo-id download).
 
     remap : optional HF-key rewriter. If callable, called with each
@@ -244,7 +304,7 @@ def load_pretrained(
     report = LoadReport()
     seen: set[str] = set()
 
-    # 2. Stream safetensors; dispatch. A rank-0 progress bar advances once
+    # 2. Stream checkpoint tensors; dispatch. A rank-0 progress bar advances once
     #    per tensor key (total = key count across all shards), so it always
     #    fills to 100% regardless of remap drops / unexpected keys.
     disable = _progress_disable(progress)
@@ -258,23 +318,21 @@ def load_pretrained(
     )
     for path in paths:
         bar.set_postfix_str(path.name, refresh=False)
-        with safe_open(str(path), framework="pt", device="cpu") as f:
-            for raw in f.keys():
-                bar.update(1)
-                hf = remap_fn(raw)
-                if hf is None:
-                    continue
-                hit = index.get(hf)
-                if hit is None:
-                    report.unexpected.append(hf)
-                    continue
-                param, shard_id, loader = hit
-                tensor = f.get_tensor(raw)
-                if tensor.dtype != param.dtype:
-                    report.casts.append((hf, tensor.dtype, param.dtype))
-                loader(param, tensor, shard_id)
-                seen.add(hf)
-                report.loaded.append(hf)
+        for raw, tensor in _iter_checkpoint_tensors(path):
+            bar.update(1)
+            hf = remap_fn(raw)
+            if hf is None:
+                continue
+            hit = index.get(hf)
+            if hit is None:
+                report.unexpected.append(hf)
+                continue
+            param, shard_id, loader = hit
+            if tensor.dtype != param.dtype:
+                report.casts.append((hf, tensor.dtype, param.dtype))
+            loader(param, tensor, shard_id)
+            seen.add(hf)
+            report.loaded.append(hf)
     bar.close()
 
     # 3. Diagnose missing.
