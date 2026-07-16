@@ -22,9 +22,10 @@ import torch.nn as nn
 
 import phyai.parallel as P
 from phyai.engine_config import get_engine_config
+from phyai.layers.linear.backend import PrequantizedLinearKernel
 from phyai.layers.linear.dispatch import get_linear_dispatcher
 from phyai.layers.linear.spec import Bf16Spec
-from phyai.layers.quant import AllocationRequest
+from phyai.layers.quant import ActivationView, AllocationRequest
 from phyai.layers.quant.active import get_active_plan
 from phyai.layers.quant.materialize import materialize
 from phyai.parallel.state import resolve_mesh
@@ -756,6 +757,47 @@ class RowParallelLinear(LinearBase):
             else None
         )
         y = kernel.apply(self, x, add_bias)
+
+        if self.reduce_results and self.tp_size > 1:
+            if self.sp_axis is not None:
+                y = P.reduce_scatter(y, axis=self.sp_axis, dim=0)
+            else:
+                y = P.all_reduce(y, axis=self.axis)
+        return y, (self.bias if self.skip_bias_add else None)
+
+    def forward_prequantized(
+        self,
+        activation: ActivationView,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run a row-parallel linear from an already-quantized activation."""
+        if not self.input_is_parallel and self.tp_size > 1:
+            raise RuntimeError(
+                "prequantized RowParallelLinear input must already be TP-sharded"
+            )
+
+        x = activation.x
+        kernel = get_linear_dispatcher().select(
+            spec_id=self.spec.spec_id,
+            M=_M_of(x),
+            N=self.output_size_per_partition,
+            K=self.input_size_per_partition,
+            # note(chenghua): Dispatch describes the logical BF16 model
+            # contract even though this prequantized tensor is physically FP8.
+            in_dtype=self.params_dtype,
+            out_dtype=self.params_dtype,
+            device=x.device,
+        )
+        if not isinstance(kernel, PrequantizedLinearKernel):
+            raise RuntimeError(
+                f"linear backend {kernel.name!r} cannot consume prequantized activations"
+            )
+
+        add_bias = (
+            self.bias
+            if (self.bias is not None and self.tp_rank == 0 and not self.skip_bias_add)
+            else None
+        )
+        y = kernel.apply_prequantized(self, activation, add_bias)
 
         if self.reduce_results and self.tp_size > 1:
             if self.sp_axis is not None:

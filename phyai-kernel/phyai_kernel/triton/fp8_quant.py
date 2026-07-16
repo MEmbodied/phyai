@@ -21,6 +21,82 @@ FP8_MIN_SCALE_EPS = 1e-12
 _MAX_ROW_WIDTH = 65536
 
 
+@triton.jit
+def _tanh_approx_f32(x):
+    """Match FlashInfer's ``math::tanh`` PTX implementation."""
+    return tl.inline_asm_elementwise(
+        "tanh.approx.f32 $0, $1;",
+        constraints="=f,f",
+        args=[x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"GROUPS_PER_PROGRAM": 1}, num_warps=4),
+        triton.Config({"GROUPS_PER_PROGRAM": 2}, num_warps=4),
+        triton.Config({"GROUPS_PER_PROGRAM": 4}, num_warps=4),
+        triton.Config({"GROUPS_PER_PROGRAM": 4}, num_warps=8),
+        triton.Config({"GROUPS_PER_PROGRAM": 8}, num_warps=8),
+    ],
+    key=["n_groups"],
+)
+@triton.jit
+def _gelu_tanh_and_mul_fp8_group128_kernel(
+    x_ptr,
+    q_ptr,
+    scale_ptr,
+    n_groups,
+    scale_group_stride,
+    COLUMN_MAJOR_SCALES: tl.constexpr,
+    GROUPS_PER_ROW: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr,
+):
+    group_base = tl.program_id(0).to(tl.int64) * GROUPS_PER_PROGRAM
+    group_ids = group_base + tl.arange(0, GROUPS_PER_PROGRAM)
+    group_mask = group_ids < n_groups
+    row = group_ids // GROUPS_PER_ROW
+    group_in_row = group_ids - row * GROUPS_PER_ROW
+
+    hidden_size: tl.constexpr = GROUPS_PER_ROW * 128
+    cols = tl.arange(0, 128)
+    input_offsets = (
+        row[:, None] * (2 * hidden_size) + group_in_row[:, None] * 128 + cols[None, :]
+    )
+    mask = group_mask[:, None]
+
+    gate = tl.load(x_ptr + input_offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(x_ptr + input_offsets + hidden_size, mask=mask, other=0.0).to(
+        tl.float32
+    )
+
+    # note(chenghua): FlashInfer stores the GeGLU result as BF16 before the
+    # separate quantizer reads it, so the fused path preserves that boundary.
+    tanh_arg = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
+    cdf = 0.5 * (1.0 + _tanh_approx_f32(tanh_arg))
+    activated = (gate * cdf * up).to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.max(tl.abs(activated), axis=1)
+    if COLUMN_MAJOR_SCALES:
+        scale_inv = tl.where(amax != 0.0, 448.0 / amax, 1.0)
+        scale = 1.0 / scale_inv
+        q = tl.clamp(activated * scale_inv[:, None], -448.0, 448.0)
+    else:
+        scale = tl.maximum(amax, 1e-12) * (1.0 / 448.0)
+        q = tl.clamp(activated / scale[:, None], -448.0, 448.0)
+
+    output_offsets = group_ids[:, None] * 128 + cols[None, :]
+    tl.store(q_ptr + output_offsets, q, mask=mask)
+    if COLUMN_MAJOR_SCALES:
+        scale_offsets = row + group_in_row * scale_group_stride
+    else:
+        scale_offsets = group_ids
+    tl.store(scale_ptr + scale_offsets, scale, mask=group_mask)
+
+
 @triton.autotune(
     configs=[
         triton.Config({"GROUPS_PER_PROGRAM": 4}, num_warps=1),
@@ -316,6 +392,73 @@ def fp8_quantize_per_group(
     return q, scale
 
 
+def gelu_tanh_and_mul_fp8_group128(
+    x: torch.Tensor,
+    *,
+    column_major_scales: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse BF16 GeGLU-tanh with dynamic group-128 E4M3 quantization.
+
+    ``x`` uses the merged MLP layout ``[..., gate || up]``. The returned
+    activation has shape ``[..., hidden]`` and the FP32 dequantization scales
+    have flattened shape ``(M, hidden // 128)``. By default the scales are
+    contiguous row-major. ``column_major_scales=True`` returns the same logical
+    tensor with physical stride ``(1, align4(M))``, as required by the
+    TensorRT-LLM SM90 prequantized block-FP8 runner.
+
+    The GeGLU result is rounded to BF16 in registers before amax/quantization,
+    matching ``flashinfer.gelu_tanh_and_mul`` followed by
+    :func:`fp8_quantize_per_group` without materializing the BF16 intermediate.
+    """
+    _check_input(x)
+    if x.dtype is not torch.bfloat16:
+        raise TypeError(
+            f"fused GeGLU-tanh FP8 quantization requires bfloat16 input, got {x.dtype}"
+        )
+    if x.ndim == 0 or x.shape[-1] % 2:
+        raise ValueError(
+            "fused GeGLU-tanh FP8 quantization requires an even last dimension"
+        )
+
+    hidden_size = x.shape[-1] // 2
+    if hidden_size % 128:
+        raise ValueError(
+            "fused GeGLU-tanh FP8 quantization requires hidden size divisible "
+            f"by 128, got {hidden_size}"
+        )
+
+    M = x.numel() // x.shape[-1]
+    groups_per_row = hidden_size // 128
+    n_groups = M * groups_per_row
+    output_shape = (*x.shape[:-1], hidden_size)
+    q = torch.empty(output_shape, dtype=torch.float8_e4m3fn, device=x.device)
+    if column_major_scales:
+        scale_leading_dim = (M + 3) // 4 * 4
+        scale_storage = torch.empty(
+            (groups_per_row, scale_leading_dim),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        scale = scale_storage[:, :M].transpose(0, 1)
+    else:
+        scale_leading_dim = 1
+        scale = torch.empty((M, groups_per_row), dtype=torch.float32, device=x.device)
+
+    def grid(meta):
+        return (triton.cdiv(n_groups, meta["GROUPS_PER_PROGRAM"]),)
+
+    _gelu_tanh_and_mul_fp8_group128_kernel[grid](
+        x,
+        q,
+        scale,
+        n_groups,
+        scale_leading_dim,
+        COLUMN_MAJOR_SCALES=column_major_scales,
+        GROUPS_PER_ROW=groups_per_row,
+    )
+    return q, scale
+
+
 def fp8_quantize_weight_per_block(
     weight: torch.Tensor,
     block_shape: tuple[int, int] = (128, 128),
@@ -365,4 +508,5 @@ __all__ = [
     "fp8_quantize_per_tensor_with_scale",
     "fp8_quantize_per_token",
     "fp8_quantize_weight_per_block",
+    "gelu_tanh_and_mul_fp8_group128",
 ]

@@ -23,7 +23,12 @@ Quick start::
 
 from __future__ import annotations
 
-from phyai.layers.linear.backend import Granularity, KernelProbe, LinearKernel
+from phyai.layers.linear.backend import (
+    Granularity,
+    KernelProbe,
+    LinearKernel,
+    PrequantizedLinearKernel,
+)
 from phyai.layers.linear.backends import FlashInferKernel, HummingKernel, TorchKernel
 from phyai.layers.linear.backends.flashinfer import flashinfer_supported_specs_for_sm
 from phyai.layers.linear.dispatch import (
@@ -173,6 +178,7 @@ __all__ = [
     "ForcedPolicy",
     "Policy",
     "LinearKernel",
+    "PrequantizedLinearKernel",
     "KernelProbe",
     "register_linear_kernel",
     "list_registered_linear_kernels",

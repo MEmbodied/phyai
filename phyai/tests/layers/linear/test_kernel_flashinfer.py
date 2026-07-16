@@ -12,8 +12,9 @@ import torch
 import torch.nn.functional as F
 
 from phyai.layers.linear.backend import KernelProbe
+from phyai.layers.linear.backends import flashinfer as flashinfer_backend
 from phyai.layers.linear.backends.flashinfer import FlashInferKernel
-from phyai.layers.quant import Nvfp4Spec
+from phyai.layers.quant import ActivationView, Granularity, Nvfp4Spec
 from phyai.layers.quant.base import AllocationRequest
 from phyai.parallel.state import Mode
 from phyai.weights.shards import replicated
@@ -71,10 +72,71 @@ def test_flashinfer_rejects_nvfp4_unaligned_k():
     assert not k.can_handle(_probe("nvfp4_block_16_128x4", sm=100, K=120))
 
 
+def test_sm90_prequantized_block_fp8_requires_padded_column_major_scale(
+    monkeypatch,
+):
+    m, n, k = 3, 128, 256
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.empty((n, k), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones((n // 128, k // 128), dtype=torch.float32),
+        requires_grad=False,
+    )
+    activation = torch.empty((m, k), dtype=torch.float8_e4m3fn)
+    row_major_scale = torch.ones((m, k // 128), dtype=torch.float32)
+
+    kernel = FlashInferKernel()
+    monkeypatch.setattr(flashinfer_backend, "_runtime_sm", lambda _: 90)
+    with pytest.raises(ValueError, match="scale stride"):
+        kernel._block_fp8_from_activation(
+            layer,
+            ActivationView(activation, row_major_scale, Granularity.BLOCK),
+            None,
+            out_dtype=torch.bfloat16,
+        )
+
+
+def test_sm90_prequantized_block_fp8_accepts_padded_column_major_scale(
+    monkeypatch,
+):
+    m, n, k = 3, 128, 256
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.empty((n, k), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones((n // 128, k // 128), dtype=torch.float32),
+        requires_grad=False,
+    )
+    activation = torch.empty((m, k), dtype=torch.float8_e4m3fn)
+    scale_storage = torch.ones((k // 128, 4), dtype=torch.float32)
+    column_major_scale = scale_storage[:, :m].transpose(0, 1)
+    expected = torch.empty((m, n), dtype=torch.bfloat16)
+
+    kernel = FlashInferKernel()
+    monkeypatch.setattr(flashinfer_backend, "_runtime_sm", lambda _: 90)
+
+    def fake_sm90(layer, x, scale, *, out_dtype):
+        assert scale.stride() == (1, 4)
+        assert out_dtype is torch.bfloat16
+        return expected
+
+    monkeypatch.setattr(kernel, "_block_fp8_sm90", fake_sm90)
+    actual = kernel._block_fp8_from_activation(
+        layer,
+        ActivationView(activation, column_major_scale, Granularity.BLOCK),
+        None,
+        out_dtype=torch.bfloat16,
+    )
+    assert actual is expected
+
+
 @CUDA
 def test_flashinfer_numeric_accuracy():
     if _sm() < 100:
-        pytest.skip(f"NVFP4 requires sm_100+ GPU")
+        pytest.skip("NVFP4 requires sm_100+ GPU")
 
     torch.manual_seed(0)
     k = FlashInferKernel()
@@ -99,7 +161,7 @@ def test_flashinfer_numeric_accuracy():
 
 def test_flashinfer_numeric_accuracy_with_bias():
     if _sm() < 100:
-        pytest.skip(f"NVFP4 requires sm_100+ GPU")
+        pytest.skip("NVFP4 requires sm_100+ GPU")
 
     torch.manual_seed(0)
     k = FlashInferKernel()

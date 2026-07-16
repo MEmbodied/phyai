@@ -8,6 +8,7 @@ from phyai_kernel.triton.fp8_quant import (
     fp8_quantize_per_tensor_with_scale,
     fp8_quantize_per_token,
     fp8_quantize_weight_per_block,
+    gelu_tanh_and_mul_fp8_group128,
 )
 from phyai_kernel.triton.layer_norm import layernorm
 from phyai_kernel.triton.masked_embedding import masked_embedding_lookup
@@ -31,6 +32,7 @@ __all__ = [
     "fp8_quantize_per_tensor_with_scale",
     "fp8_quantize_per_token",
     "fp8_quantize_weight_per_block",
+    "gelu_tanh_and_mul_fp8_group128",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
     "layernorm",

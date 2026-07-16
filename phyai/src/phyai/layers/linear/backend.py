@@ -14,6 +14,7 @@ from typing import Protocol, runtime_checkable
 import torch
 
 from phyai.layers.quant.granularity import Granularity  # noqa: F401
+from phyai.layers.quant.linear import ActivationView
 from phyai.parallel.state import Mode
 
 
@@ -61,5 +62,17 @@ class LinearKernel(Protocol):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor: ...
+
+
+@runtime_checkable
+class PrequantizedLinearKernel(Protocol):
+    """Optional extension for kernels that consume an :class:`ActivationView`."""
+
+    def apply_prequantized(
+        self,
+        layer: torch.nn.Module,
+        activation: ActivationView,
         bias: torch.Tensor | None,
     ) -> torch.Tensor: ...

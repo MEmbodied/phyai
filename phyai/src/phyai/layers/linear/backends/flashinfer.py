@@ -19,6 +19,7 @@ from phyai_kernel import nvfp4_scale_output
 from phyai.engine_config import get_engine_config
 from phyai.layers.linear.backend import KernelProbe
 from phyai.layers.linear.registry import register_linear_kernel
+from phyai.layers.quant import ActivationView, Granularity
 from phyai.layers.quant.nvfp4 import flashinfer_nvfp4_e4m3_max
 from phyai.parallel.state import Mode, current_mode
 
@@ -267,6 +268,25 @@ class FlashInferKernel:
         if spec.spec_id == "nvfp4_block_16_128x4":
             return self._nvfp4(layer, x, bias)
         raise RuntimeError(f"FlashInferKernel got unhandled spec_id={spec.spec_id!r}")
+
+    def apply_prequantized(
+        self,
+        layer: torch.nn.Module,
+        activation: ActivationView,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not layer.spec.spec_id.startswith("fp8_block_"):
+            raise RuntimeError(
+                "FlashInfer prequantized activation path requires block FP8 weights"
+            )
+        prefix = activation.x.shape[:-1]
+        y = self._block_fp8_from_activation(
+            layer,
+            activation,
+            bias,
+            out_dtype=layer.params_dtype,
+        )
+        return y.reshape(*prefix, -1)
 
     # ------------------------------------------------------------------
     # bf16: mm_bf16(a (M,K) row, b (K,N) col, bias (N,))
@@ -550,13 +570,20 @@ class FlashInferKernel:
         self,
         layer: torch.nn.Module,
         x_2d: torch.Tensor,
+        x_scale: torch.Tensor | None,
+        *,
+        out_dtype: torch.dtype,
     ) -> torch.Tensor:
         if _fi_get_fp8_blockscale_runner_sm90 is None:
             raise RuntimeError("FlashInfer SM90 blockscale runner is unavailable")
 
         M, K = x_2d.shape
         N = layer.weight.shape[0]
-        backend = "sm90_blockscale_bf16_input"
+        backend = (
+            "sm90_blockscale_fp8_input"
+            if x_scale is not None
+            else "sm90_blockscale_bf16_input"
+        )
         key = self._fp8_shape_key(
             "fp8_blockscale",
             x_2d,
@@ -591,64 +618,78 @@ class FlashInferKernel:
                 self._sm90_block_workspaces[key] = workspace
 
             runner.configure_workspace(workspace)
-            out = torch.empty((M, N), dtype=x_2d.dtype, device=x_2d.device)
+            out = torch.empty((M, N), dtype=out_dtype, device=x_2d.device)
             runner.run_gemm(
                 x_2d,
                 layer.weight,
                 out,
-                None,
+                x_scale,
                 layer.weight_scale,
             )
             self._fp8_ready_shapes.add(key)
         return out
 
-    def _block_fp8(
+    def _block_fp8_from_activation(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        activation: ActivationView,
         bias: torch.Tensor | None,
+        *,
+        out_dtype: torch.dtype,
     ) -> torch.Tensor:
-        spec = layer.spec
-        if spec.block_shape != (128, 128):
+        if activation.granularity is not Granularity.BLOCK:
             raise RuntimeError(
-                "FlashInfer block FP8 currently supports block_shape=(128, 128)"
+                "prequantized block FP8 Linear requires block-granularity activation"
             )
-        K = x.shape[-1]
-        x_2d = x.reshape(-1, K)
-        M = x_2d.shape[0]
-        sm = _runtime_sm(x)
-        if sm in _FP8_BLOCK_SM90_SMS:
-            y = self._block_fp8_sm90(layer, x_2d)
-            if bias is not None:
-                y = y + bias
-            return y.reshape(*x.shape[:-1], -1)
+        act_x = activation.x
+        act_scale = activation.x_scale
+        if act_x.dtype is not torch.float8_e4m3fn:
+            raise TypeError(f"block FP8 activation must be E4M3, got {act_x.dtype}")
+        if act_scale is None or act_scale.dtype is not torch.float32:
+            raise TypeError("block FP8 activation requires FP32 scales")
+        if not act_x.is_contiguous():
+            raise ValueError("prequantized block FP8 activation must be contiguous")
 
-        assert _fi_gemm is not None
-        act = spec.quantize_activation(x_2d, layer)
-        if act.x_scale is None or act.x_scale.ndim != 2:
+        K = act_x.shape[-1]
+        x_2d = act_x.reshape(-1, K)
+        M = x_2d.shape[0]
+        if K != layer.weight.shape[1]:
             raise RuntimeError(
-                "block FP8 activation quantization must return a 2-D (M,K/128) scale"
+                f"block FP8 activation K={K} does not match weight K={layer.weight.shape[1]}"
             )
-        if act.x_scale.shape != (M, K // 128):
+        if act_scale.shape != (M, K // 128):
             raise RuntimeError(
-                f"unexpected block FP8 activation scale shape {tuple(act.x_scale.shape)}; "
+                f"unexpected block FP8 activation scale shape {tuple(act_scale.shape)}; "
                 f"expected {(M, K // 128)}"
             )
-        if not act.x.is_contiguous() or not act.x_scale.is_contiguous():
-            if current_mode() is Mode.GRAPH_CAPTURING:
-                raise RuntimeError(
-                    "block FP8 tensors must be contiguous before CUDA-graph capture"
-                )
-            act_x = act.x.contiguous()
-            act_scale = act.x_scale.contiguous()
-        else:
-            act_x = act.x
-            act_scale = act.x_scale
 
+        sm = _runtime_sm(x_2d)
+        if sm in _FP8_BLOCK_SM90_SMS:
+            expected_scale_stride = (1, (M + 3) // 4 * 4)
+            if act_scale.stride() != expected_scale_stride:
+                raise ValueError(
+                    "FlashInfer SM90 prequantized block FP8 requires activation "
+                    f"scale stride {expected_scale_stride}, got {act_scale.stride()}"
+                )
+            y = self._block_fp8_sm90(
+                layer,
+                x_2d,
+                act_scale,
+                out_dtype=out_dtype,
+            )
+            if bias is not None:
+                y = y + bias
+            return y
+
+        assert _fi_gemm is not None
+        if not act_scale.is_contiguous():
+            raise ValueError(
+                "FlashInfer Blackwell block FP8 requires row-major activation scales"
+            )
         padded_m = (M + 3) // 4 * 4
         if padded_m != M:
-            # note(chenghua): cuTile/CUTLASS require M%4; zero rows preserve
-            # the logical result and the slice keeps padding out of the graph.
+            # note(chenghua): cuTile/CUTLASS require M%4. These allocations are
+            # captured and replayed with stable storage.
             act_x_padded = torch.empty(
                 (padded_m, K), dtype=act_x.dtype, device=act_x.device
             )
@@ -682,7 +723,7 @@ class FlashInferKernel:
                 scale_major_mode="K",
                 mma_sm=2 if padded_m >= 256 else 1,
                 scale_granularity_mnk=(1, 128, 128),
-                out_dtype=x.dtype,
+                out_dtype=out_dtype,
                 backend=backend,
             )
 
@@ -690,10 +731,44 @@ class FlashInferKernel:
             key,
             run_groupwise,
             workspace_name="gemm_fp8_nt_groupwise_workspace",
-            device=x.device,
+            device=act_x.device,
         )[:M]
         if bias is not None:
             y = y + bias
+        return y
+
+    def _block_fp8(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        spec = layer.spec
+        if spec.block_shape != (128, 128):
+            raise RuntimeError(
+                "FlashInfer block FP8 currently supports block_shape=(128, 128)"
+            )
+        K = x.shape[-1]
+        x_2d = x.reshape(-1, K)
+        sm = _runtime_sm(x)
+        if sm in _FP8_BLOCK_SM90_SMS:
+            y = self._block_fp8_sm90(
+                layer,
+                x_2d,
+                None,
+                out_dtype=x.dtype,
+            )
+            if bias is not None:
+                y = y + bias
+            return y.reshape(*x.shape[:-1], -1)
+
+        act = spec.quantize_activation(x_2d, layer)
+        y = self._block_fp8_from_activation(
+            layer,
+            act,
+            bias,
+            out_dtype=x.dtype,
+        )
         return y.reshape(*x.shape[:-1], -1)
 
     # ------------------------------------------------------------------

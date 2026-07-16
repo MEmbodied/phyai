@@ -45,10 +45,8 @@ models that use non-standard names.
 
 Limitations
 -----------
-* No fused activation+quantisation. flashinfer ships
-  ``silu_and_mul_scaled_nvfp4_experts_quantize`` for MoE FP4 but
-  plumbing that here would require a non-linear-op spec hook that does
-  not exist yet.
+* Fused activation+quantisation currently covers only BF16 GeGLU-tanh feeding
+  dynamic group-128 FP8. Other activations and quant formats use the split path.
 * No pre-allocated output buffer for ``act_and_mul``. flashinfer
   allocates internally per call. A buffer-pool optimisation would be a
   separate, future change.
@@ -69,6 +67,7 @@ from phyai.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from phyai.layers.quant import ActivationView, Fp8Spec, Granularity
 
 
 _GATED_ACTS = ("silu", "gelu", "gelu_tanh")
@@ -218,11 +217,16 @@ class DenseMLP(nn.Module):
                 mesh=mesh,
                 prefix=f"{prefix}.down_proj" if prefix else "down_proj",
             )
-            # TODO(fp8/fp4 fused act-quant): wire a spec hook that fuses
-            # silu_and_mul + per-token fp8/nvfp4 quant for the down_proj
-            # input. Today the act and quant happen as two separate
-            # kernels.
             self._act_and_mul = _resolve_gated_act(activation)
+            down_spec = self.down_proj.spec
+            self._use_fused_gelu_tanh_fp8 = (
+                self.activation == "gelu_tanh"
+                and isinstance(down_spec, Fp8Spec)
+                and down_spec.granularity is Granularity.BLOCK
+                and down_spec.block_shape == (128, 128)
+                and down_spec.activation is not None
+                and down_spec.activation.dynamic
+            )
             self._act_fn = None
         else:
             self.fc1 = ColumnParallelLinear(
@@ -251,13 +255,30 @@ class DenseMLP(nn.Module):
                 prefix=f"{prefix}.fc2" if prefix else "fc2",
             )
             self._act_and_mul = None
+            self._use_fused_gelu_tanh_fp8 = False
             self._act_fn = _resolve_plain_act(activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.gated:
             fused, _ = self.gate_up_proj(x)
-            activated = self._act_and_mul(fused)
-            out, _ = self.down_proj(activated)
+            if (
+                self._use_fused_gelu_tanh_fp8
+                and fused.is_cuda
+                and fused.dtype is torch.bfloat16
+            ):
+                from phyai_kernel import gelu_tanh_and_mul_fp8_group128
+
+                major, minor = torch.cuda.get_device_capability(fused.device)
+                activated, scale = gelu_tanh_and_mul_fp8_group128(
+                    fused,
+                    column_major_scales=(major * 10 + minor == 90),
+                )
+                out, _ = self.down_proj.forward_prequantized(
+                    ActivationView(activated, scale, Granularity.BLOCK)
+                )
+            else:
+                activated = self._act_and_mul(fused)
+                out, _ = self.down_proj(activated)
             return out
         h, _ = self.fc1(x)
         h = self._act_fn(h)

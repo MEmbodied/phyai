@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 import phyai.layers.linear as L
 from phyai.layers.mlp import DenseMLP
+from phyai.layers.quant import Fp8Spec, Granularity
 from phyai.parallel.mesh import Mesh
 from phyai.parallel.state import _meshes, register_mesh
 
@@ -122,6 +123,38 @@ def test_plain_silu_rejected(fake_mesh):
             gated=False,
             prefix="block.mlp",
         )
+
+
+def test_gelu_tanh_block_fp8_enables_fused_activation_quant(fake_mesh, monkeypatch):
+    fake_mesh()
+    _init_dispatcher()
+    monkeypatch.setattr(
+        "phyai.layers.mlp.dense_mlp._resolve_gated_act", lambda _name: lambda x: x
+    )
+    block_fp8 = Fp8Spec(
+        granularity=Granularity.BLOCK,
+        block_shape=(128, 128),
+    )
+
+    fused = DenseMLP(
+        hidden_size=128,
+        intermediate_size=256,
+        activation="gelu_tanh",
+        gated=True,
+        spec_out=block_fp8,
+        prefix="mlp",
+    )
+    silu = DenseMLP(
+        hidden_size=128,
+        intermediate_size=256,
+        activation="silu",
+        gated=True,
+        spec_out=block_fp8,
+        prefix="mlp",
+    )
+
+    assert fused._use_fused_gelu_tanh_fp8 is True
+    assert silu._use_fused_gelu_tanh_fp8 is False
 
 
 def test_unknown_activation_rejected(fake_mesh):
