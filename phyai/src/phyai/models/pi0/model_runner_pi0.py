@@ -1,9 +1,9 @@
 """pi0 model runners: vision, LLM backbone, action expert.
 
 The runner split mirrors pi0.5, but the expert runner is pi0-specific:
-it embeds a numeric state token, fuses scalar timestep into action
-tokens, runs the expert over ``[state, action_0, ...]``, and projects
-only the action-token outputs back to action velocity.
+it precomputes the invariant numeric state token once per inference,
+caches its per-layer K/V, then runs only the timestep-conditioned action
+tokens in each denoise step and projects them back to action velocity.
 """
 
 from __future__ import annotations
@@ -47,9 +47,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PI0ExpertForwardBatch:
-    """Per-step pi0 expert inputs."""
+    """Per-step pi0 action-denoise inputs."""
 
-    state: torch.Tensor
     x_t: torch.Tensor
     time: torch.Tensor
 
@@ -280,15 +279,18 @@ class PI0LLMRunner(ModelRunner):
 
 
 class PI0ExpertRunner(ModelRunner):
-    """One pi0 Euler denoise step with pi0's state/action block mask.
+    """pi0 state prefill plus action-only Euler denoise steps.
 
-    Each expert layer is run in two calls:
+    The runner preserves pi0's state/action block mask in two phases:
 
-    1. state token attends to cached prefix + fresh state;
-    2. action tokens attend to cached prefix + fresh state + fresh actions.
+    1. once per inference, the state token attends to cached prefix + state
+       and writes its K/V at every expert layer;
+    2. each denoise step, action tokens attend to cached prefix + cached state
+       + the fresh action chunk.
 
-    This matches pi0's prefix/state/action block mask without requiring a
-    custom per-query attention mask in the paged backend.
+    State cannot attend to actions or timestep, so its hidden states and K/V
+    are invariant across the denoise loop. Keeping the two paged plans avoids
+    a custom per-query attention mask while removing repeated state work.
     """
 
     def __init__(
@@ -364,7 +366,8 @@ class PI0ExpertRunner(ModelRunner):
         )
         self._state_capture_plan: DiffusionAttnPlanHandle | None = None
         self._action_capture_plan: DiffusionAttnPlanHandle | None = None
-        self.graph: CudaGraph | None = None
+        self.state_graph: CudaGraph | None = None
+        self.action_graph: CudaGraph | None = None
 
     def set_write_indices(
         self,
@@ -409,7 +412,7 @@ class PI0ExpertRunner(ModelRunner):
             self._action_capture_plan = self.action_attn_backend.init_capture_metadata(
                 self._capture_seed_metadata_action()
             )
-            self._capture_graph()
+            self._capture_graphs()
 
     def _capture_seed_metadata_state(self) -> DiffusionAttnMetadata:
         cu_q = torch.arange(
@@ -485,14 +488,19 @@ class PI0ExpertRunner(ModelRunner):
             write_indices=self.write_indices_action_buf,
         )
 
-    def _capture_graph(self) -> None:
-        example = {
+    def _capture_graphs(self) -> None:
+        state_example = {
             "state": torch.zeros(
                 self.batch_size,
                 self.max_state_dim,
                 dtype=self.params_dtype,
                 device=self.device,
             ),
+        }
+        self.state_graph = CudaGraph()
+        self.state_graph.capture(self._fwd_state, state_example)
+
+        action_example = {
             "x_t": torch.zeros(
                 self.batch_size,
                 self.chunk_size,
@@ -504,22 +512,15 @@ class PI0ExpertRunner(ModelRunner):
                 self.batch_size, dtype=torch.float32, device=self.device
             ),
         }
-        self.graph = CudaGraph()
-        self.graph.capture(self._fwd, example)
+        self.action_graph = CudaGraph()
+        self.action_graph.capture(self._fwd_action, action_example)
 
-    def _fwd(
+    def _fwd_state(
         self,
         *,
         state: torch.Tensor,
-        x_t: torch.Tensor,
-        time: torch.Tensor,
     ) -> torch.Tensor:
-        state_emb = self.heads.embed_state(state).unsqueeze(1)
-        action_emb = self.heads.embed_action_time(x_t, time)
-        suffix_h = torch.cat([state_emb, action_emb], dim=1)
-        state_h = suffix_h[:, :1, :].reshape(self.batch_size, -1)
-        action_h = suffix_h[:, 1:, :].reshape(self.batch_size * self.chunk_size, -1)
-
+        state_h = self.heads.embed_state(state)
         state_ctx = DiffusionAttnCtx(
             backend=self.state_attn_backend,
             plan=self._state_capture_plan,
@@ -528,6 +529,23 @@ class PI0ExpertRunner(ModelRunner):
             kv_pool=self.kv_pool,
             write_indices=self.write_indices_state_buf,
         )
+        for layer in self.expert_stack.layers:
+            state_h = layer(
+                state_h,
+                self.pos_ids_state_buf,
+                self.rope,
+                state_ctx,
+            )
+        return state_h
+
+    def _fwd_action(
+        self,
+        *,
+        x_t: torch.Tensor,
+        time: torch.Tensor,
+    ) -> torch.Tensor:
+        action_h = self.heads.embed_action_time(x_t, time)
+        action_h = action_h.reshape(self.batch_size * self.chunk_size, -1)
         action_ctx = DiffusionAttnCtx(
             backend=self.action_attn_backend,
             plan=self._action_capture_plan,
@@ -537,12 +555,6 @@ class PI0ExpertRunner(ModelRunner):
             write_indices=self.write_indices_action_buf,
         )
         for layer in self.expert_stack.layers:
-            state_h = layer(
-                state_h,
-                self.pos_ids_state_buf,
-                self.rope,
-                state_ctx,
-            )
             action_h = layer(
                 action_h,
                 self.pos_ids_action_buf,
@@ -583,16 +595,22 @@ class PI0ExpertRunner(ModelRunner):
                 action_meta
             )
 
+    def prefill_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Compute invariant state hidden states and cache their per-layer K/V."""
+
+        if self.state_graph is not None:
+            return self.state_graph.replay({"state": state})
+        return self._fwd_state(state=state)
+
     def forward(self, batch: PI0ExpertForwardBatch) -> torch.Tensor:
-        if self.graph is not None:
-            return self.graph.replay(
+        if self.action_graph is not None:
+            return self.action_graph.replay(
                 {
-                    "state": batch.state,
                     "x_t": batch.x_t,
                     "time": batch.time,
                 }
             )
-        return self._fwd(state=batch.state, x_t=batch.x_t, time=batch.time)
+        return self._fwd_action(x_t=batch.x_t, time=batch.time)
 
 
 __all__ = [

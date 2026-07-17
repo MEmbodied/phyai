@@ -261,8 +261,9 @@ class PI0WS1Scheduler(Scheduler):
     def setup(self) -> None:
         self.vision_runner.setup()
         self.llm_runner.setup()
-        self.expert_runner.setup()
 
+        # Bind the fixed suffix slots before capture. Expert graph warmup writes
+        # K/V through these buffers, so their capture-time values must be valid.
         write_indices_state = (
             self.suffix_base
             + torch.arange(
@@ -285,6 +286,7 @@ class PI0WS1Scheduler(Scheduler):
             write_indices_state,
             write_indices_action,
         )
+        self.expert_runner.setup()
 
     @torch.no_grad()
     def step(self, request: PI0Request) -> torch.Tensor:
@@ -465,14 +467,17 @@ class PI0WS1Scheduler(Scheduler):
             )
             self.expert_runner.plan_inference(state_meta, action_meta)
 
+        state = torch.zeros(
+            max_B,
+            cfg.max_state_dim,
+            dtype=dtype,
+            device=device,
+        )
+        state[:actual_B] = request.state.to(device=device, dtype=dtype)
+        with event_scope("pi0.expert_state_prefill"):
+            self.expert_runner.prefill_state(state)
+
         with event_scope("pi0.expert_loop"):
-            state = torch.zeros(
-                max_B,
-                cfg.max_state_dim,
-                dtype=dtype,
-                device=device,
-            )
-            state[:actual_B] = request.state.to(device=device, dtype=dtype)
             if request.noise is None:
                 x_t = torch.randn(
                     max_B,
@@ -502,7 +507,7 @@ class PI0WS1Scheduler(Scheduler):
                         device=device,
                     )
                     v_t = self.expert_runner.forward(
-                        PI0ExpertForwardBatch(state=state, x_t=x_t, time=time)
+                        PI0ExpertForwardBatch(x_t=x_t, time=time)
                     )
                     x_t = x_t + dt * v_t.to(x_t.dtype)
 

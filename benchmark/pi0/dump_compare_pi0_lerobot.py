@@ -15,7 +15,7 @@ Example:
         --vision-dtype float32 \
         --phyai-attn-backend flashinfer \
         --num-steps 10 \
-        --include-layers \
+        --detail-layers 0 1 \
         --out pt/pi0_bf16_combined_dump.pt
 """
 
@@ -88,19 +88,43 @@ COARSE_CUTS = [
     ("action_time_emb", "action+time token embeddings"),
 ]
 
-LAYER0_DETAIL_CUTS = [
-    ("prefix_layer0_input_norm", "prefix layer 0 input RMSNorm output"),
-    ("prefix_layer0_qkv", "prefix layer 0 QKV projection output"),
-    ("prefix_layer0_q_rope", "prefix layer 0 query after RoPE"),
-    ("prefix_layer0_k_rope", "prefix layer 0 key after RoPE"),
-    ("prefix_layer0_v", "prefix layer 0 value projection"),
-    ("prefix_layer0_attn", "prefix layer 0 attention output before o_proj"),
-    ("prefix_layer0_o_proj", "prefix layer 0 attention output projection"),
-    ("prefix_layer0_attn_residual", "prefix layer 0 first residual output"),
-    ("prefix_layer0_post_norm", "prefix layer 0 post-attention RMSNorm output"),
-    ("prefix_layer0_mlp", "prefix layer 0 MLP output"),
-    ("prefix_layer0", "prefix layer 0 second residual output"),
+DETAIL_CUT_SUFFIXES = [
+    ("input_norm", "input RMSNorm output"),
+    ("qkv", "QKV projection output"),
+    ("q_rope", "query after RoPE"),
+    ("k_rope", "key after RoPE"),
+    ("v", "value projection"),
+    ("attn", "attention output before o_proj"),
+    ("o_proj", "attention output projection"),
+    ("attn_residual", "first residual output"),
+    ("post_norm", "post-attention RMSNorm output"),
+    ("mlp", "MLP output"),
 ]
+
+
+def detail_cuts(layer_idx: int) -> list[tuple[str, str]]:
+    cuts = [
+        (
+            f"prefix_layer{layer_idx}_{suffix}",
+            f"prefix layer {layer_idx} {description}",
+        )
+        for suffix, description in DETAIL_CUT_SUFFIXES
+    ]
+    cuts.append(
+        (
+            f"prefix_layer{layer_idx}",
+            f"prefix layer {layer_idx} second residual output",
+        )
+    )
+    return cuts
+
+
+def validate_detail_layers(detail_layers: tuple[int, ...], num_layers: int) -> None:
+    invalid = [layer_idx for layer_idx in detail_layers if layer_idx >= num_layers]
+    if invalid:
+        raise ValueError(
+            f"Detail layer indices {invalid} are out of range for {num_layers} layers."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,6 +183,26 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ap.add_argument(
+        "--layer1-detail",
+        "--layer1detail",
+        action="store_true",
+        help=(
+            "Dump detailed prefix layer-1 intermediates without requiring all "
+            "prefix/expert layer outputs."
+        ),
+    )
+    ap.add_argument(
+        "--detail-layers",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="N",
+        help=(
+            "Prefix layer indices whose detailed intermediates should be dumped, "
+            "for example: --detail-layers 0 1."
+        ),
+    )
+    ap.add_argument(
         "--vision-detail",
         action="store_true",
         help=(
@@ -183,7 +227,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path for a combined dump containing lerobot, phyai, and compare rows.",
     )
-    return ap.parse_args()
+    args = ap.parse_args()
+    detail_layers = set(args.detail_layers or ())
+    if args.layer0_detail:
+        detail_layers.add(0)
+    if args.layer1_detail:
+        detail_layers.add(1)
+    if any(layer_idx < 0 for layer_idx in detail_layers):
+        ap.error("--detail-layers values must be non-negative")
+    args.detail_layers = tuple(sorted(detail_layers))
+    return args
 
 
 def cpu(tensor: torch.Tensor) -> torch.Tensor:
@@ -353,7 +406,7 @@ def dump_lerobot(
     num_images: int,
     image_keys: list[str],
     include_layers: bool,
-    layer0_detail: bool,
+    detail_layers: tuple[int, ...],
     vision_detail: bool,
 ) -> dict[str, Any]:
     add_lerobot_to_path(lerobot_root)
@@ -437,6 +490,8 @@ def dump_lerobot(
         return cpu(tensor)
 
     prefix_layers = model.paligemma_with_expert.paligemma.model.language_model.layers
+    validate_detail_layers(detail_layers, len(prefix_layers))
+    detail_layer_set = set(detail_layers)
     layer0 = prefix_layers[0]
     orig_layer0_forward = layer0.forward
 
@@ -445,7 +500,7 @@ def dump_lerobot(
         prefix_input_dtype["value"] = str(hidden.dtype)
         dump["prefix_embs"] = prefix_cpu(hidden)
         out = orig_layer0_forward(*args, **kwargs)
-        if include_layers or layer0_detail:
+        if include_layers or 0 in detail_layer_set:
             layer_out = first_tensor(out)
             if layer_out is not None:
                 dump["prefix_layer0"] = prefix_cpu(layer_out)
@@ -453,130 +508,143 @@ def dump_lerobot(
 
     patch_method(patches, layer0, "forward", layer0_forward)
 
-    if layer0_detail:
-        from transformers.models.gemma.modeling_gemma import apply_rotary_pos_emb
+    for layer_idx, layer in enumerate(prefix_layers[1:], start=1):
+        if not include_layers and layer_idx not in detail_layer_set:
+            continue
+        orig_forward = layer.forward
 
-        projected: dict[str, torch.Tensor] = {}
-
-        def wrap_norm(module: Any, key: str, *, input_key: str | None = None) -> None:
-            orig = module.forward
-
+        def make_prefix_forward(idx, orig):
             def wrapped(*args, **kwargs):
-                if input_key is not None:
-                    dump[input_key] = prefix_cpu(args[0])
                 out = orig(*args, **kwargs)
                 hidden = first_tensor(out)
                 if hidden is not None:
-                    dump[key] = prefix_cpu(hidden)
+                    dump[f"prefix_layer{idx}"] = prefix_cpu(hidden)
                 return out
 
-            patch_method(patches, module, "forward", wrapped)
+            return wrapped
 
-        wrap_norm(layer0.input_layernorm, "prefix_layer0_input_norm")
-        wrap_norm(
-            layer0.post_attention_layernorm,
-            "prefix_layer0_post_norm",
-            input_key="prefix_layer0_attn_residual",
+        patch_method(
+            patches, layer, "forward", make_prefix_forward(layer_idx, orig_forward)
         )
 
-        for part, projection in (
-            ("q", layer0.self_attn.q_proj),
-            ("k", layer0.self_attn.k_proj),
-            ("v", layer0.self_attn.v_proj),
-        ):
-            orig_projection = projection.forward
+    if detail_layers:
+        from transformers.models.gemma.modeling_gemma import apply_rotary_pos_emb
 
-            def make_projection_forward(name, orig):
+        def install_layer_detail(layer_idx: int, layer: Any) -> None:
+            key_prefix = f"prefix_layer{layer_idx}"
+            projected: dict[str, torch.Tensor] = {}
+
+            def wrap_norm(
+                module: Any, key: str, *, input_key: str | None = None
+            ) -> None:
+                orig = module.forward
+
                 def wrapped(*args, **kwargs):
-                    out = orig(*args, **kwargs)
-                    projected[name] = out
-                    if all(item in projected for item in ("q", "k", "v")):
-                        dump["prefix_layer0_qkv"] = prefix_cpu(
-                            torch.cat(
-                                [projected["q"], projected["k"], projected["v"]],
-                                dim=-1,
-                            )
-                        )
-                    return out
-
-                return wrapped
-
-            patch_method(
-                patches,
-                projection,
-                "forward",
-                make_projection_forward(part, orig_projection),
-            )
-
-        orig_attention_forward = layer0.self_attn.forward
-
-        def attention_forward(*args, **kwargs):
-            hidden = args[0] if args else kwargs["hidden_states"]
-            out = orig_attention_forward(*args, **kwargs)
-            q_raw = projected.get("q")
-            k_raw = projected.get("k")
-            v_raw = projected.get("v")
-            position_embeddings = kwargs.get("position_embeddings")
-            if (
-                q_raw is not None
-                and k_raw is not None
-                and v_raw is not None
-                and position_embeddings is not None
-            ):
-                hidden_shape = (*hidden.shape[:-1], -1, layer0.self_attn.head_dim)
-                q = q_raw.view(hidden_shape).transpose(1, 2)
-                k = k_raw.view(hidden_shape).transpose(1, 2)
-                v = v_raw.view(hidden_shape).transpose(1, 2)
-                cos, sin = position_embeddings
-                q, k = apply_rotary_pos_emb(q, k, cos, sin)
-                dump["prefix_layer0_q_rope"] = prefix_cpu(
-                    q.transpose(1, 2).contiguous()
-                )
-                dump["prefix_layer0_k_rope"] = prefix_cpu(
-                    k.transpose(1, 2).contiguous()
-                )
-                dump["prefix_layer0_v"] = prefix_cpu(v.transpose(1, 2).contiguous())
-            return out
-
-        patch_method(patches, layer0.self_attn, "forward", attention_forward)
-
-        orig_o_proj_forward = layer0.self_attn.o_proj.forward
-
-        def o_proj_forward(*args, **kwargs):
-            dump["prefix_layer0_attn"] = prefix_cpu(args[0])
-            out = orig_o_proj_forward(*args, **kwargs)
-            dump["prefix_layer0_o_proj"] = prefix_cpu(out)
-            return out
-
-        patch_method(patches, layer0.self_attn.o_proj, "forward", o_proj_forward)
-
-        orig_mlp_forward = layer0.mlp.forward
-
-        def mlp_forward(*args, **kwargs):
-            out = orig_mlp_forward(*args, **kwargs)
-            dump["prefix_layer0_mlp"] = prefix_cpu(out)
-            return out
-
-        patch_method(patches, layer0.mlp, "forward", mlp_forward)
-
-    if include_layers:
-        for layer_idx, layer in enumerate(prefix_layers[1:], start=1):
-            orig_forward = layer.forward
-
-            def make_prefix_forward(idx, orig):
-                def wrapped(*args, **kwargs):
+                    if input_key is not None:
+                        dump[input_key] = prefix_cpu(args[0])
                     out = orig(*args, **kwargs)
                     hidden = first_tensor(out)
                     if hidden is not None:
-                        dump[f"prefix_layer{idx}"] = prefix_cpu(hidden)
+                        dump[key] = prefix_cpu(hidden)
                     return out
 
-                return wrapped
+                patch_method(patches, module, "forward", wrapped)
 
-            patch_method(
-                patches, layer, "forward", make_prefix_forward(layer_idx, orig_forward)
+            wrap_norm(layer.input_layernorm, f"{key_prefix}_input_norm")
+            wrap_norm(
+                layer.post_attention_layernorm,
+                f"{key_prefix}_post_norm",
+                input_key=f"{key_prefix}_attn_residual",
             )
 
+            for part, projection in (
+                ("q", layer.self_attn.q_proj),
+                ("k", layer.self_attn.k_proj),
+                ("v", layer.self_attn.v_proj),
+            ):
+                orig_projection = projection.forward
+
+                def make_projection_forward(name, orig):
+                    def wrapped(*args, **kwargs):
+                        out = orig(*args, **kwargs)
+                        projected[name] = out
+                        if all(item in projected for item in ("q", "k", "v")):
+                            dump[f"{key_prefix}_qkv"] = prefix_cpu(
+                                torch.cat(
+                                    [
+                                        projected["q"],
+                                        projected["k"],
+                                        projected["v"],
+                                    ],
+                                    dim=-1,
+                                )
+                            )
+                        return out
+
+                    return wrapped
+
+                patch_method(
+                    patches,
+                    projection,
+                    "forward",
+                    make_projection_forward(part, orig_projection),
+                )
+
+            orig_attention_forward = layer.self_attn.forward
+
+            def attention_forward(*args, **kwargs):
+                hidden = args[0] if args else kwargs["hidden_states"]
+                out = orig_attention_forward(*args, **kwargs)
+                q_raw = projected.get("q")
+                k_raw = projected.get("k")
+                v_raw = projected.get("v")
+                position_embeddings = kwargs.get("position_embeddings")
+                if (
+                    q_raw is not None
+                    and k_raw is not None
+                    and v_raw is not None
+                    and position_embeddings is not None
+                ):
+                    hidden_shape = (*hidden.shape[:-1], -1, layer.self_attn.head_dim)
+                    q = q_raw.view(hidden_shape).transpose(1, 2)
+                    k = k_raw.view(hidden_shape).transpose(1, 2)
+                    v = v_raw.view(hidden_shape).transpose(1, 2)
+                    cos, sin = position_embeddings
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                    dump[f"{key_prefix}_q_rope"] = prefix_cpu(
+                        q.transpose(1, 2).contiguous()
+                    )
+                    dump[f"{key_prefix}_k_rope"] = prefix_cpu(
+                        k.transpose(1, 2).contiguous()
+                    )
+                    dump[f"{key_prefix}_v"] = prefix_cpu(v.transpose(1, 2).contiguous())
+                return out
+
+            patch_method(patches, layer.self_attn, "forward", attention_forward)
+
+            orig_o_proj_forward = layer.self_attn.o_proj.forward
+
+            def o_proj_forward(*args, **kwargs):
+                dump[f"{key_prefix}_attn"] = prefix_cpu(args[0])
+                out = orig_o_proj_forward(*args, **kwargs)
+                dump[f"{key_prefix}_o_proj"] = prefix_cpu(out)
+                return out
+
+            patch_method(patches, layer.self_attn.o_proj, "forward", o_proj_forward)
+
+            orig_mlp_forward = layer.mlp.forward
+
+            def mlp_forward(*args, **kwargs):
+                out = orig_mlp_forward(*args, **kwargs)
+                dump[f"{key_prefix}_mlp"] = prefix_cpu(out)
+                return out
+
+            patch_method(patches, layer.mlp, "forward", mlp_forward)
+
+        for layer_idx in detail_layers:
+            install_layer_detail(layer_idx, prefix_layers[layer_idx])
+
+    if include_layers:
         expert_layers = model.paligemma_with_expert.gemma_expert.model.layers
         for layer_idx, layer in enumerate(expert_layers):
             orig_forward = layer.forward
@@ -709,7 +777,9 @@ def dump_lerobot(
         "chunk_size": int(policy.config.chunk_size),
         "num_steps": num_steps,
         "include_layers": include_layers,
-        "layer0_detail": layer0_detail,
+        "detail_layers": list(detail_layers),
+        "layer0_detail": 0 in detail_layer_set,
+        "layer1_detail": 1 in detail_layer_set,
         "img_emb_pre_io_cast_dtype": image_pre_io_cast_dtype["value"],
         "num_vision_layers": len(vision_model.encoder.layers),
         "vision_input_dtype": vision_input_dtype["value"],
@@ -737,7 +807,7 @@ def dump_phyai(
     num_steps: int,
     image_keys: list[str],
     include_layers: bool,
-    layer0_detail: bool,
+    detail_layers: tuple[int, ...],
     vision_detail: bool,
 ) -> dict[str, Any]:
     request, reference_actions = build_request(payload, device, image_keys)
@@ -763,7 +833,11 @@ def dump_phyai(
     )
 
     sched = engine.entry.scheduler
-    if sched.llm_runner.graph is not None or sched.expert_runner.graph is not None:
+    if (
+        sched.llm_runner.graph is not None
+        or sched.expert_runner.state_graph is not None
+        or sched.expert_runner.action_graph is not None
+    ):
         raise RuntimeError(
             "CUDA graph is active; wrappers cannot capture. Disable cuda graph."
         )
@@ -778,7 +852,7 @@ def dump_phyai(
 
     orig_pack = sched_mod.pack_prefix_per_sample_padded
     current_step: dict[str, int | None] = {"value": None}
-    pending_state: dict[tuple[int, int], torch.Tensor] = {}
+    cached_state: dict[int, torch.Tensor] = {}
     prefix_input_dtype: dict[str, str | None] = {"value": None}
     prefix_pre_cast_dtype: dict[str, str | None] = {"value": None}
     image_pre_io_cast_dtype: dict[str, str | None] = {"value": None}
@@ -855,6 +929,8 @@ def dump_phyai(
 
     sched_mod.pack_prefix_per_sample_padded = pack
 
+    validate_detail_layers(detail_layers, len(lm.layers))
+    detail_layer_set = set(detail_layers)
     layer0 = lm.layers[0]
     orig_layer0_forward = layer0.forward
 
@@ -862,13 +938,33 @@ def dump_phyai(
         prefix_input_dtype["value"] = str(h.dtype)
         dump["prefix_input_flat"] = cpu(h)
         out = orig_layer0_forward(h, *args, **kwargs)
-        if include_layers or layer0_detail:
+        if include_layers or 0 in detail_layer_set:
             dump["prefix_layer0_flat"] = cpu(out)
         return out
 
     patch_method(layer_patches, layer0, "forward", layer0_forward)
 
-    if layer0_detail:
+    for layer_idx, layer in enumerate(lm.layers[1:], start=1):
+        if not include_layers and layer_idx not in detail_layer_set:
+            continue
+        orig_forward = layer.forward
+
+        def make_prefix_forward(idx, orig):
+            def wrapped(*args, **kwargs):
+                out = orig(*args, **kwargs)
+                dump[f"prefix_layer{idx}_flat"] = cpu(out)
+                return out
+
+            return wrapped
+
+        patch_method(
+            layer_patches,
+            layer,
+            "forward",
+            make_prefix_forward(layer_idx, orig_forward),
+        )
+
+    if detail_layers:
 
         def wrap_tensor_output(
             module: Any, key: str, *, input_key: str | None = None
@@ -886,60 +982,47 @@ def dump_phyai(
 
             patch_method(layer_patches, module, "forward", wrapped)
 
-        wrap_tensor_output(
-            layer0.input_layernorm,
-            "prefix_layer0_input_norm_flat",
-        )
-        wrap_tensor_output(
-            layer0.qkv_proj,
-            "prefix_layer0_qkv_flat",
-        )
-
-        orig_attention_forward = layer0.attn.forward
-
-        def attention_forward(q, k, v, *args, **kwargs):
-            dump["prefix_layer0_q_rope_flat"] = cpu(q)
-            dump["prefix_layer0_k_rope_flat"] = cpu(k)
-            dump["prefix_layer0_v_flat"] = cpu(v)
-            out = orig_attention_forward(q, k, v, *args, **kwargs)
-            dump["prefix_layer0_attn_flat"] = cpu(out.reshape(*out.shape[:-2], -1))
-            return out
-
-        patch_method(layer_patches, layer0.attn, "forward", attention_forward)
-
-        wrap_tensor_output(
-            layer0.o_proj,
-            "prefix_layer0_o_proj_flat",
-        )
-        wrap_tensor_output(
-            layer0.post_attention_layernorm,
-            "prefix_layer0_post_norm_flat",
-            input_key="prefix_layer0_attn_residual_flat",
-        )
-        wrap_tensor_output(
-            layer0.mlp,
-            "prefix_layer0_mlp_flat",
-        )
-
-    if include_layers:
-        for layer_idx, layer in enumerate(lm.layers[1:], start=1):
-            orig_forward = layer.forward
-
-            def make_prefix_forward(idx, orig):
-                def wrapped(*args, **kwargs):
-                    out = orig(*args, **kwargs)
-                    dump[f"prefix_layer{idx}_flat"] = cpu(out)
-                    return out
-
-                return wrapped
-
-            patch_method(
-                layer_patches,
-                layer,
-                "forward",
-                make_prefix_forward(layer_idx, orig_forward),
+        def install_layer_detail(layer_idx: int, layer: Any) -> None:
+            key_prefix = f"prefix_layer{layer_idx}"
+            wrap_tensor_output(
+                layer.input_layernorm,
+                f"{key_prefix}_input_norm_flat",
+            )
+            wrap_tensor_output(
+                layer.qkv_proj,
+                f"{key_prefix}_qkv_flat",
             )
 
+            orig_attention_forward = layer.attn.forward
+
+            def attention_forward(q, k, v, *args, **kwargs):
+                dump[f"{key_prefix}_q_rope_flat"] = cpu(q)
+                dump[f"{key_prefix}_k_rope_flat"] = cpu(k)
+                dump[f"{key_prefix}_v_flat"] = cpu(v)
+                out = orig_attention_forward(q, k, v, *args, **kwargs)
+                dump[f"{key_prefix}_attn_flat"] = cpu(out.reshape(*out.shape[:-2], -1))
+                return out
+
+            patch_method(layer_patches, layer.attn, "forward", attention_forward)
+
+            wrap_tensor_output(
+                layer.o_proj,
+                f"{key_prefix}_o_proj_flat",
+            )
+            wrap_tensor_output(
+                layer.post_attention_layernorm,
+                f"{key_prefix}_post_norm_flat",
+                input_key=f"{key_prefix}_attn_residual_flat",
+            )
+            wrap_tensor_output(
+                layer.mlp,
+                f"{key_prefix}_mlp_flat",
+            )
+
+        for layer_idx in detail_layers:
+            install_layer_detail(layer_idx, lm.layers[layer_idx])
+
+    if include_layers:
         runner = sched.expert_runner
         for layer_idx, layer in enumerate(runner.expert_stack.layers):
             orig_forward = layer.forward
@@ -948,14 +1031,13 @@ def dump_phyai(
                 def wrapped(h, *args, **kwargs):
                     out = orig(h, *args, **kwargs)
                     step = current_step["value"]
-                    if step is None:
-                        return out
                     if out.shape[0] == runner.batch_size:
-                        pending_state[(step, idx)] = cpu(
-                            out.view(runner.batch_size, 1, -1)
-                        )
-                    elif out.shape[0] == runner.batch_size * runner.chunk_size:
-                        state_out = pending_state.pop((step, idx), None)
+                        cached_state[idx] = cpu(out.view(runner.batch_size, 1, -1))
+                    elif (
+                        step is not None
+                        and out.shape[0] == runner.batch_size * runner.chunk_size
+                    ):
+                        state_out = cached_state.get(idx)
                         action_out = cpu(
                             out.view(runner.batch_size, runner.chunk_size, -1)
                         )
@@ -1097,27 +1179,19 @@ def dump_phyai(
                 dump[key] = dump[key][:B]
             elif key.startswith("expert_step") and key.endswith("_norm"):
                 dump[key] = dump[key][:B]
-    elif layer0_detail:
-        layer = dump.pop("prefix_layer0_flat").view(-1, n_per_sample, packed.shape[-1])
-        dump["prefix_layer0"] = layer[:B, :real_len]
+    else:
+        for layer_idx in detail_layers:
+            key = f"prefix_layer{layer_idx}"
+            layer = dump.pop(f"{key}_flat").view(-1, n_per_sample, packed.shape[-1])
+            dump[key] = layer[:B, :real_len]
 
-    if layer0_detail:
-        detail_flat_keys = {
-            "prefix_layer0_input_norm_flat": "prefix_layer0_input_norm",
-            "prefix_layer0_qkv_flat": "prefix_layer0_qkv",
-            "prefix_layer0_q_rope_flat": "prefix_layer0_q_rope",
-            "prefix_layer0_k_rope_flat": "prefix_layer0_k_rope",
-            "prefix_layer0_v_flat": "prefix_layer0_v",
-            "prefix_layer0_attn_flat": "prefix_layer0_attn",
-            "prefix_layer0_o_proj_flat": "prefix_layer0_o_proj",
-            "prefix_layer0_attn_residual_flat": "prefix_layer0_attn_residual",
-            "prefix_layer0_post_norm_flat": "prefix_layer0_post_norm",
-            "prefix_layer0_mlp_flat": "prefix_layer0_mlp",
-        }
-        for flat_key, key in detail_flat_keys.items():
+    for layer_idx in detail_layers:
+        key_prefix = f"prefix_layer{layer_idx}"
+        for suffix, _ in DETAIL_CUT_SUFFIXES:
+            flat_key = f"{key_prefix}_{suffix}_flat"
             tensor = dump.pop(flat_key)
             tensor = tensor.view(-1, n_per_sample, *tensor.shape[1:])
-            dump[key] = tensor[:B, :real_len]
+            dump[f"{key_prefix}_{suffix}"] = tensor[:B, :real_len]
     dump["state_emb"] = dump["state_emb"][:B]
     dump["x_t_step0"] = dump["x_t_step0"][:B]
     dump["action_time_emb"] = dump["action_time_emb"][:B]
@@ -1137,7 +1211,9 @@ def dump_phyai(
         "lang_len": lang_len,
         "num_steps": config.num_inference_steps,
         "include_layers": include_layers,
-        "layer0_detail": layer0_detail,
+        "detail_layers": list(detail_layers),
+        "layer0_detail": 0 in detail_layer_set,
+        "layer1_detail": 1 in detail_layer_set,
         "img_emb_pre_io_cast_dtype": image_pre_io_cast_dtype["value"],
         "num_vision_layers": len(vision_model.encoder.layers),
         "vision_input_dtype": vision_input_dtype["value"],
@@ -1184,7 +1260,7 @@ def build_compare_cuts(
     phyai_dump: dict[str, Any],
     *,
     include_layers: bool,
-    layer0_detail: bool,
+    detail_layers: tuple[int, ...],
     vision_detail: bool,
 ) -> list[tuple[str, str]]:
     num_steps = int(
@@ -1239,8 +1315,8 @@ def build_compare_cuts(
             ("prefix_embs", "packed prefix after Gemma input dtype cast"),
         ]
     )
-    if layer0_detail:
-        cuts.extend(LAYER0_DETAIL_CUTS)
+    for layer_idx in detail_layers:
+        cuts.extend(detail_cuts(layer_idx))
     if include_layers:
         cuts.extend(
             (f"prefix_layer{i}", f"prefix layer {i} output")
@@ -1290,7 +1366,7 @@ def compare_dumps(
     phyai_dump: dict[str, Any],
     *,
     include_layers: bool,
-    layer0_detail: bool,
+    detail_layers: tuple[int, ...],
     vision_detail: bool,
     threshold: float,
 ) -> tuple[list[dict[str, Any]], str | None]:
@@ -1300,7 +1376,7 @@ def compare_dumps(
         lerobot_dump,
         phyai_dump,
         include_layers=include_layers,
-        layer0_detail=layer0_detail,
+        detail_layers=detail_layers,
         vision_detail=vision_detail,
     ):
         row: dict[str, Any] = {
@@ -1400,7 +1476,7 @@ def main() -> None:
         num_images=config.num_images,
         image_keys=image_keys,
         include_layers=args.include_layers,
-        layer0_detail=args.layer0_detail,
+        detail_layers=args.detail_layers,
         vision_detail=args.vision_detail,
     )
     print("dumping PhyAI...")
@@ -1417,7 +1493,7 @@ def main() -> None:
         num_steps=num_steps,
         image_keys=image_keys,
         include_layers=args.include_layers,
-        layer0_detail=args.layer0_detail,
+        detail_layers=args.detail_layers,
         vision_detail=args.vision_detail,
     )
 
@@ -1425,7 +1501,7 @@ def main() -> None:
         lerobot_dump,
         phyai_dump,
         include_layers=args.include_layers,
-        layer0_detail=args.layer0_detail,
+        detail_layers=args.detail_layers,
         vision_detail=args.vision_detail,
         threshold=args.threshold,
     )
@@ -1475,7 +1551,9 @@ def main() -> None:
             "num_steps": num_steps,
             "image_keys_order": image_keys,
             "include_layers": args.include_layers,
-            "layer0_detail": args.layer0_detail,
+            "detail_layers": list(args.detail_layers),
+            "layer0_detail": 0 in args.detail_layers,
+            "layer1_detail": 1 in args.detail_layers,
             "vision_detail": args.vision_detail,
             "threshold": args.threshold,
             "tokenizer_name": args.tokenizer_name,
