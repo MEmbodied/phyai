@@ -7,6 +7,7 @@ action chunk. Image transform, tokenization, and decode stay outside the engine.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -75,9 +76,67 @@ class GR00TN17WS1Scheduler(Scheduler):
             use_cuda_graph=self.use_cuda_graph,
         )
 
-    def setup(self) -> None:
+    def setup(
+        self,
+        *,
+        capture_profiles: Sequence[GR00TN17Request] = (),
+    ) -> None:
         self.backbone_runner.setup()
         self.action_head_runner.setup()
+        self.capture_profiles(capture_profiles)
+
+    def _fixed_noise_profile(
+        self,
+        request: GR00TN17Request,
+    ) -> GR00TN17Request:
+        if request.noise is not None:
+            return request
+        state = request.tensors.get("state")
+        if not isinstance(state, torch.Tensor) or state.ndim == 0:
+            raise ValueError("A capture profile requires a batched state tensor.")
+        action_head = self.model.action_head
+        noise = torch.zeros(
+            state.shape[0],
+            action_head.action_horizon,
+            action_head.action_dim,
+            dtype=self.model.params_dtype,
+            device=self.device,
+        )
+        return GR00TN17Request(tensors=request.tensors, noise=noise)
+
+    @torch.no_grad()
+    def capture_profiles(
+        self,
+        profiles: Sequence[GR00TN17Request],
+    ) -> None:
+        """Stabilize and capture the supplied request profiles during setup."""
+        profiles = tuple(profiles)
+        for index, profile in enumerate(profiles):
+            if not isinstance(profile, GR00TN17Request):
+                raise TypeError(
+                    f"capture_profiles[{index}] must be GR00TN17Request, got "
+                    f"{type(profile).__name__}."
+                )
+        if not profiles or not (
+            self.backbone_runner.use_cuda_graph
+            and self.action_head_runner.use_cuda_graph
+        ):
+            return
+
+        capture_requests = tuple(self._fixed_noise_profile(p) for p in profiles)
+        for request in capture_requests:
+            self._step(request, force_eager_warmup=True)
+        for index, request in enumerate(capture_requests):
+            self._step(request)
+            if (
+                self.backbone_runner.last_forward_used_eager_warmup
+                or self.action_head_runner.last_forward_used_eager_warmup
+            ):
+                raise ValueError(
+                    f"capture_profiles[{index}] is not supported by the current "
+                    "GR00T-N1.7 CUDA Graph path."
+                )
+        torch.cuda.current_stream(self.device).synchronize()
 
     def _has_mixed_attention_masks(
         self,
@@ -202,6 +261,14 @@ class GR00TN17WS1Scheduler(Scheduler):
         back to physical units via the processor's ``decode_action`` (which
         needs the per-request ``raw_state``).
         """
+        return self._step(request)
+
+    def _step(
+        self,
+        request: GR00TN17Request,
+        *,
+        force_eager_warmup: bool = False,
+    ) -> torch.Tensor:
         tensors = request.tensors
         batch = tensors["state"].shape[0]
         if batch > self.max_batch_size:
@@ -215,10 +282,22 @@ class GR00TN17WS1Scheduler(Scheduler):
         backbone_inputs, action_inputs = self.model.prepare_input(
             tensors, device=self.device
         )
-        backbone_output = self.backbone_runner.forward(backbone_inputs)
-        normalized_action = self.action_head_runner.forward(
-            backbone_output, action_inputs, noise=request.noise
+        backbone_output = self.backbone_runner.forward(
+            backbone_inputs,
+            force_eager_warmup=force_eager_warmup,
         )
+        backbone_warmed = self.backbone_runner.last_forward_used_eager_warmup
+        normalized_action = self.action_head_runner.forward(
+            backbone_output,
+            action_inputs,
+            noise=request.noise,
+            force_eager_warmup=force_eager_warmup or backbone_warmed,
+        )
+        if backbone_warmed or self.action_head_runner.last_forward_used_eager_warmup:
+            if self.device.type == "cuda":
+                torch.cuda.current_stream(self.device).synchronize()
+            self.backbone_runner.reset_graphs()
+            self.action_head_runner.reset_graphs()
         return normalized_action
 
     def close(self) -> None:

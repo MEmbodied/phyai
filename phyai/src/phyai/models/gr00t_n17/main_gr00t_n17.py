@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, ClassVar
@@ -117,6 +118,9 @@ class GR00TN17Args(EntryArgs):
     tokenization, and state/action normalization are the caller's job via
     ``phyai_utils_tools.models.gr00t.GR00TProcessor``. Hence there is no
     ``embodiment_tag`` / processor knob here — those live with the processor.
+
+    ``capture_profiles`` contains prepared requests whose CUDA graphs are
+    captured during engine setup. Their outputs are discarded.
     """
 
     checkpoint_dir: str | Path | None = None
@@ -126,6 +130,7 @@ class GR00TN17Args(EntryArgs):
     weight_strict: bool = True
     backbone_model_name_or_path: str | Path | None = None
     backbone_transformers_loading_kwargs: dict[str, Any] | None = None
+    capture_profiles: Sequence[GR00TN17Request] = ()
 
 
 @Engine.register
@@ -142,8 +147,7 @@ class GR00TN17Entry(Entry):
     def setup(self, args: EntryArgs) -> None:
         if not isinstance(args, GR00TN17Args):
             raise TypeError(
-                "GR00TN17Entry.setup expected GR00TN17Args, got "
-                f"{type(args).__name__}."
+                f"GR00TN17Entry.setup expected GR00TN17Args, got {type(args).__name__}."
             )
         eng = get_engine_config()
         if args.config is not None:
@@ -190,7 +194,7 @@ class GR00TN17Entry(Entry):
             device=eng.device.target,
             use_cuda_graph=eng.runtime.use_cuda_graph,
         )
-        self.scheduler.setup()
+        self.scheduler.setup(capture_profiles=args.capture_profiles)
 
     def step(self, request: GR00TN17Request) -> torch.Tensor:
         if self.scheduler is None:

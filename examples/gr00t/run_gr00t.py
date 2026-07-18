@@ -55,10 +55,7 @@ def make_synthetic_observation(
     state = {}
     for key in cfg["state"].modality_keys:
         t = len(cfg["state"].delta_indices)
-        try:
-            dim = int(processor.norm_params[tag]["state"][key]["dim"])
-        except (KeyError, TypeError):
-            dim = 7
+        dim = int(processor.norm_params[tag]["state"][key]["dim"])
         state[key] = np.random.rand(batch_size, t, dim).astype(np.float32) * 2 - 1
     language_key = cfg["language"].modality_keys[0]
     t = len(cfg["language"].delta_indices)
@@ -73,7 +70,7 @@ def benchmark(
     n_warmup: int,
     n_timed: int,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Warm up, then time ``n_timed`` ``engine.step`` calls."""
+    """Run untimed stabilization steps, then time ``engine.step`` calls."""
     action: torch.Tensor | None = None
     for _ in range(n_warmup):
         action = engine.step(request)
@@ -126,7 +123,12 @@ def main() -> None:
         default="pick up the object",
         help="Synthetic language instruction passed through the GR00T processor.",
     )
-    parser.add_argument("--n-warmup", type=int, default=3)
+    parser.add_argument(
+        "--n-warmup",
+        type=int,
+        default=3,
+        help="Untimed steps used to stabilize latency measurements.",
+    )
     parser.add_argument("--n-timed", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -205,12 +207,32 @@ def main() -> None:
     loading_kwargs = {"trust_remote_code": True, "local_files_only": not args.online}
     use_cuda_graph = args.dump_dir is None and not args.no_cuda_graph
 
+    # Lazy import keeps --help fast and the engine import free of the processor.
+    from phyai_utils_tools.models.gr00t import GR00TProcessor
+
+    cfg = load_config(args.checkpoint, GR00TN17Config)
+    processor = GR00TProcessor.from_pretrained(
+        args.checkpoint,
+        embodiment_tag=args.embodiment_tag,
+        model_name=args.backbone_model_name_or_path or cfg.backbone.model_name,
+        transformers_loading_kwargs=loading_kwargs,
+    )
+    observation = make_synthetic_observation(
+        processor,
+        batch_size=args.batch_size,
+        image_size=args.image_size,
+        task=args.task,
+    )
+    prepared = processor.process_observation(observation)
+    capture_profile = GR00TN17Request(tensors=prepared.tensors)
+
     engine = Engine(
         EngineArgs(
             plugin="gr00t_n17",
             plugin_args=GR00TN17Args(
                 checkpoint_dir=args.checkpoint,
                 max_batch_size=args.batch_size,
+                capture_profiles=(capture_profile,),
                 backbone_model_name_or_path=args.backbone_model_name_or_path,
                 backbone_transformers_loading_kwargs=loading_kwargs,
             ),
@@ -232,23 +254,6 @@ def main() -> None:
         )
     )
     try:
-        # Lazy import keeps --help fast and the engine import free of the processor.
-        from phyai_utils_tools.models.gr00t import GR00TProcessor
-
-        cfg = load_config(args.checkpoint, GR00TN17Config)
-        processor = GR00TProcessor.from_pretrained(
-            args.checkpoint,
-            embodiment_tag=args.embodiment_tag,
-            model_name=args.backbone_model_name_or_path or cfg.backbone.model_name,
-            transformers_loading_kwargs=loading_kwargs,
-        )
-        observation = make_synthetic_observation(
-            processor,
-            batch_size=args.batch_size,
-            image_size=args.image_size,
-            task=args.task,
-        )
-        prepared = processor.process_observation(observation)
         tensors = {
             key: value.to(device=device) if isinstance(value, torch.Tensor) else value
             for key, value in prepared.tensors.items()

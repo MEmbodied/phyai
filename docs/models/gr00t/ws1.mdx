@@ -94,16 +94,16 @@ raw cameras + state + instruction
     ```bash
     uv run hf download nvidia/GR00T-N1.7-LIBERO \
       --include "libero_10/config.json" \
-        "libero_10/embodiment_id.json" \
-        "libero_10/model-*.safetensors" \
-        "libero_10/model.safetensors.index.json" \
-        "libero_10/processor_config.json" \
-        "libero_10/statistics.json" \
+      --include "libero_10/embodiment_id.json" \
+      --include "libero_10/model-*.safetensors" \
+      --include "libero_10/model.safetensors.index.json" \
+      --include "libero_10/processor_config.json" \
+      --include "libero_10/statistics.json" \
       --local-dir checkpoints/GR00T-N1.7-LIBERO
     ```
   </Step>
 
-  <Step title="Construct the processor and engine">
+  <Step title="Construct the processor">
     Use the same checkpoint directory for both. `--online` in the bundled example allows the first run to fetch uncached Cosmos-Reason2 tokenizer and preprocessor files.
 
     ```python
@@ -128,6 +128,28 @@ raw cameras + state + instruction
         transformers_loading_kwargs=loading_kwargs,
     )
 
+    ```
+
+    Set `local_files_only=True` after the Cosmos-Reason2 tokenizer and preprocessor files are present in the local Hugging Face cache.
+  </Step>
+
+  <Step title="Prepare a request and construct the engine">
+    Build `GR00TObservation` with the camera, state, and language keys listed in the checkpoint's modality config. The processor validates these keys and their history lengths before inference.
+
+    | Field | Value shape | Dtype |
+    | --- | --- | --- |
+    | `video[view]` | `(B, T, H, W, 3)` | `np.uint8` |
+    | `state[name]` | `(B, T, D)` | `np.float32` |
+    | `language[name]` | nested `(B, T)` | `str` |
+
+    After constructing `observation` from this contract, continue with:
+
+    ```python
+    from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+
+    prepared = processor.process_observation(observation)
+    request = GR00TN17Request(tensors=prepared.tensors)
+
     engine = Engine(
         EngineArgs(
             plugin="gr00t_n17",
@@ -135,6 +157,7 @@ raw cameras + state + instruction
                 checkpoint_dir=checkpoint_dir,
                 max_batch_size=1,
                 backbone_transformers_loading_kwargs=loading_kwargs,
+                capture_profiles=(request,),
             ),
             config=EngineConfig(
                 device=DeviceConfig(
@@ -145,31 +168,8 @@ raw cameras + state + instruction
             ),
         )
     )
-    ```
 
-    `max_batch_size` is the scheduler's upper bound. Rebuild the engine if a later request needs a larger batch.
-
-    Set `local_files_only=True` after the Cosmos-Reason2 tokenizer and preprocessor files are present in the local Hugging Face cache.
-
-    CUDA graphs are captured lazily and reused by input shape. A new sequence-length bucket, camera layout, batch shape, or embodiment combination may trigger capture on its first request.
-  </Step>
-
-  <Step title="Process and run a request">
-    Build `GR00TObservation` with the camera, state, and language keys listed in the checkpoint's modality config. The processor validates these keys and their history lengths before inference.
-
-    | Field | Value shape | Dtype |
-    | --- | --- | --- |
-    | `video[view]` | `(B, T, H, W, 3)` | `np.uint8` |
-    | `state[name]` | `(B, T, D)` | `np.float32` |
-    | `language[name]` | nested `(B, T)` | `str` |
-
-    ```python
-    from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
-
-    prepared = processor.process_observation(observation)
-    normalized_action = engine.step(
-        GR00TN17Request(tensors=prepared.tensors)
-    )
+    normalized_action = engine.step(request)
     action = processor.decode_action(
         normalized_action,
         raw_state=prepared.raw_state,
@@ -177,6 +177,10 @@ raw cameras + state + instruction
     ```
 
     The processor reads the required camera views, state fields, language key, and history lengths from the selected checkpoint. Keep `prepared.raw_state` for checkpoints that use relative actions; the decoder needs it to reconstruct actions in the robot's reference frame.
+
+    With CUDA graphs enabled, `capture_profiles` are stabilized and captured while the engine is constructed. Profile outputs are discarded, and the first matching request uses graph replay directly. Pass a prepared request representative of the inputs this engine will serve; the fixed LIBERO example needs only the profile shown above. Add profiles only if the same engine will serve other sequence-length buckets, camera layouts, batch shapes, or embodiment combinations. An unlisted structure falls back to safe lazy preparation.
+
+    `max_batch_size` is the scheduler's upper bound. Rebuild the engine if a later request needs a larger batch.
 
     `GR00TN17Request.noise` is optional. Leave it unset to sample Gaussian noise, or provide a fixed tensor for deterministic regression checks.
   </Step>
@@ -200,7 +204,7 @@ uv run python examples/gr00t/run_gr00t.py \
   --embodiment-tag LIBERO_PANDA
 ```
 
-The script prints `engine.step()` latency statistics (mean / median / std / min / max over 3 warmups + 30 timed runs). Observation preprocessing, input transfer to the GPU, and action decoding are outside the timed loop.
+The script prints `engine.step()` latency statistics (mean / median / std / min / max over 3 untimed runs + 30 timed runs). CUDA Graph capture happens during engine construction; the untimed steps only stabilize the latency measurement. Observation preprocessing, input transfer to the GPU, and action decoding are outside the timed loop.
 
 The synthetic inputs only test the execution path; their predicted actions have no task-level meaning. The command assumes the Cosmos-Reason2 tokenizer and preprocessor are already cached. Add `--online` to the first run only if those files are missing, then omit it for later runs.
 
@@ -244,6 +248,41 @@ processor = GR00TProcessor.from_pretrained(
 )
 embodiment_tag = processor.embodiment_tag
 
+# Build a synthetic observation from the checkpoint's modality contract.
+modality_cfg = processor.modality_config
+video = {}
+for key in modality_cfg["video"].modality_keys:
+    history = len(modality_cfg["video"].delta_indices)
+    video[key] = np.random.randint(
+        0,
+        256,
+        size=(BATCH_SIZE, history, IMAGE_SIZE, IMAGE_SIZE, 3),
+        dtype=np.uint8,
+    )
+
+state = {}
+for key in modality_cfg["state"].modality_keys:
+    history = len(modality_cfg["state"].delta_indices)
+    state_dim = int(processor.norm_params[embodiment_tag]["state"][key]["dim"])
+    state[key] = (
+        np.random.rand(BATCH_SIZE, history, state_dim).astype(np.float32) * 2 - 1
+    )
+
+language_key = modality_cfg["language"].modality_keys[0]
+language_history = len(modality_cfg["language"].delta_indices)
+observation = GR00TObservation(
+    video=video,
+    state=state,
+    language={
+        language_key: [
+            ["pick up the object" for _ in range(language_history)]
+            for _ in range(BATCH_SIZE)
+        ]
+    },
+)
+prepared = processor.process_observation(observation)
+request = GR00TN17Request(tensors=prepared.tensors)
+
 engine = Engine(
     EngineArgs(
         plugin="gr00t_n17",
@@ -251,6 +290,7 @@ engine = Engine(
             checkpoint_dir=CHECKPOINT_DIR,
             max_batch_size=BATCH_SIZE,
             backbone_transformers_loading_kwargs=loading_kwargs,
+            capture_profiles=(request,),
         ),
         config=EngineConfig(
             device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
@@ -260,42 +300,8 @@ engine = Engine(
 )
 
 try:
-    # Build a synthetic observation from the checkpoint's modality contract.
-    modality_cfg = processor.modality_config
-    video = {}
-    for key in modality_cfg["video"].modality_keys:
-        history = len(modality_cfg["video"].delta_indices)
-        video[key] = np.random.randint(
-            0,
-            256,
-            size=(BATCH_SIZE, history, IMAGE_SIZE, IMAGE_SIZE, 3),
-            dtype=np.uint8,
-        )
-
-    state = {}
-    for key in modality_cfg["state"].modality_keys:
-        history = len(modality_cfg["state"].delta_indices)
-        state_dim = int(processor.norm_params[embodiment_tag]["state"][key]["dim"])
-        state[key] = (
-            np.random.rand(BATCH_SIZE, history, state_dim).astype(np.float32) * 2 - 1
-        )
-
-    language_key = modality_cfg["language"].modality_keys[0]
-    language_history = len(modality_cfg["language"].delta_indices)
-    observation = GR00TObservation(
-        video=video,
-        state=state,
-        language={
-            language_key: [
-                ["pick up the object" for _ in range(language_history)]
-                for _ in range(BATCH_SIZE)
-            ]
-        },
-    )
-
-    # Process raw inputs, run one model step, and decode the physical action fields.
-    prepared = processor.process_observation(observation)
-    normalized_action = engine.step(GR00TN17Request(tensors=prepared.tensors))
+    # Run one model step and decode the physical action fields.
+    normalized_action = engine.step(request)
     action = processor.decode_action(
         normalized_action,
         raw_state=prepared.raw_state,

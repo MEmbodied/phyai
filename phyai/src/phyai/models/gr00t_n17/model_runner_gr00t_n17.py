@@ -2,7 +2,9 @@
 
 Runners own CUDA graph capture, request-scoped sampling state, and the
 multi-step action denoising loop. The model modules remain parameter
-containers plus single-step math.
+containers plus single-step math. Setup profiles run eagerly before capture so
+external workspaces have stable storage. An unlisted graph shape is stabilized
+on first use before later capture.
 """
 
 from __future__ import annotations
@@ -81,6 +83,8 @@ class GR00TN17BackboneRunner(ModelRunner):
         self.use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
         self.graphs = CudaGraphRegistry()
         self._vision_graph_states: dict[tuple, tuple] = {}
+        self._warmed_graph_keys: set[tuple] = set()
+        self.last_forward_used_eager_warmup = False
 
     def setup(self) -> None:
         return None
@@ -329,7 +333,13 @@ class GR00TN17BackboneRunner(ModelRunner):
             hidden_states=None,
         )
 
-    def forward(self, inputs) -> GR00TN17BackboneOutput:
+    def forward(
+        self,
+        inputs,
+        *,
+        force_eager_warmup: bool = False,
+    ) -> GR00TN17BackboneOutput:
+        self.last_forward_used_eager_warmup = False
         backbone_inputs = dict(inputs)
         if "position_ids" not in backbone_inputs:
             position_ids = self.model.backbone.prepare_position_ids(backbone_inputs)
@@ -339,15 +349,30 @@ class GR00TN17BackboneRunner(ModelRunner):
         if self.use_cuda_graph:
             plan = self._backbone_graph_plan(backbone_inputs)
             if plan is None:
+                self.last_forward_used_eager_warmup = True
                 return backbone.forward(backbone_inputs)
             core_fn, buffers, key, model_inputs = plan
-            features = self._replay_or_capture(core_fn, buffers, key)
+            if force_eager_warmup or key not in self._warmed_graph_keys:
+                vision_graph_state = self._make_vision_graph_state(buffers)
+                output = core_fn(
+                    vision_graph_state=vision_graph_state,
+                    **buffers,
+                )
+                features = output.pre_norm_hidden_state.clone()
+                self._warmed_graph_keys.add(key)
+                self.last_forward_used_eager_warmup = True
+            else:
+                features = self._replay_or_capture(core_fn, buffers, key)
             return backbone.build_graph_output(features, model_inputs)
         return backbone.forward(backbone_inputs)
 
-    def close(self) -> None:
+    def reset_graphs(self) -> None:
         self.graphs = CudaGraphRegistry()
         self._vision_graph_states = {}
+
+    def close(self) -> None:
+        self.reset_graphs()
+        self._warmed_graph_keys.clear()
         return None
 
 
@@ -390,6 +415,8 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         self._action_position_ids: torch.Tensor | None = None
         self._dt: float = 1.0
         self._empty_image_masks: dict[tuple[object, ...], torch.Tensor] = {}
+        self._warmed_graph_keys: set[tuple[object, ...]] = set()
+        self.last_forward_used_eager_warmup = False
 
     def setup(self) -> None:
         self._init_scheduler_buffers()
@@ -717,7 +744,9 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         action_input: GR00TN17ActionInput,
         *,
         noise=None,
+        force_eager_warmup: bool = False,
     ):
+        self.last_forward_used_eager_warmup = False
         action_head = self.model.action_head
         action_head.validate_embodiment_id(action_input.embodiment_id)
         if backbone_output.backbone_features.shape[0] > self.max_batch_size:
@@ -739,8 +768,17 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         if self.use_cuda_graph:
             category_key = self._category_key(action_input)
             if category_key is None:
+                self.last_forward_used_eager_warmup = True
                 return self._fwd_loop(**inputs)
             key = self._shape_key(inputs) + (("category_key", category_key),)
+            if force_eager_warmup or key not in self._warmed_graph_keys:
+                output = self._static_category_fwd_loop(
+                    category_key=category_key,
+                    **inputs,
+                )
+                self._warmed_graph_keys.add(key)
+                self.last_forward_used_eager_warmup = True
+                return output
             graph = self.graphs.get(key)
             if graph is None:
                 graph = CudaGraph()
@@ -755,9 +793,13 @@ class GR00TN17ActionHeadRunner(ModelRunner):
             return graph.replay(inputs).clone()
         return self._fwd_loop(**inputs)
 
-    def close(self) -> None:
+    def reset_graphs(self) -> None:
         self.graphs = CudaGraphRegistry()
         self._empty_image_masks = {}
+
+    def close(self) -> None:
+        self.reset_graphs()
+        self._warmed_graph_keys.clear()
         return None
 
 
