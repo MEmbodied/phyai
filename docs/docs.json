@@ -39,6 +39,13 @@
                 ]
               },
               {
+                "group": "GR00T",
+                "pages": [
+                  "models/gr00t/ws1",
+                  "models/gr00t/n17-accuracy-parity"
+                ]
+              },
+              {
                 "group": "Cosmos",
                 "pages": [
                   "models/cosmos/ws1",
@@ -97,6 +104,13 @@
                 "pages": [
                   "zh/models/pi05/ws1",
                   "zh/models/pi05/processors"
+                ]
+              },
+              {
+                "group": "GR00T",
+                "pages": [
+                  "zh/models/gr00t/ws1",
+                  "zh/models/gr00t/n17-accuracy-parity"
                 ]
               },
               {
