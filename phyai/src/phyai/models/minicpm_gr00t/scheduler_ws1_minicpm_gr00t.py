@@ -36,6 +36,7 @@ class MiniCPMGR00TWS1Scheduler(Scheduler):
         self.runner = runner
         self.device = torch.device(device)
         self.config = runner.config
+        self.action_dtype = runner.action_dtype
 
     def setup(self) -> None:
         self.runner.setup()
@@ -58,7 +59,7 @@ class MiniCPMGR00TWS1Scheduler(Scheduler):
         if request.noise is None:
             noise = torch.randn(
                 expected_noise_shape,
-                dtype=torch.float32,
+                dtype=self.action_dtype,
                 device=self.device,
             )
         else:
@@ -67,7 +68,7 @@ class MiniCPMGR00TWS1Scheduler(Scheduler):
                     f"noise has shape {tuple(request.noise.shape)}; expected "
                     f"{expected_noise_shape}."
                 )
-            noise = request.noise.to(device=self.device, dtype=torch.float32)
+            noise = request.noise.to(device=self.device, dtype=self.action_dtype)
 
         return self.runner.predict_actions(
             vlm_hidden_states=vlm_hidden_states,

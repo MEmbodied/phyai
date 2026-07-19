@@ -33,6 +33,10 @@ DEFAULT_PROMPT_TEMPLATE = (
     "unified 80D layout with gripper closed command, and its action FPS is 20 Hz. "
     "Task: {instruction}"
 )
+ACTION_DTYPES: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
 
 
 def initialize_random_weights(engine: Engine, seed: int = 123) -> tuple[int, int]:
@@ -80,14 +84,14 @@ def model_storage(engine: Engine) -> tuple[int, int]:
 
 
 def build_synthetic_request(seed: int = 123, seq_len: int = 214) -> MiniCPMGR00TRequest:
-    """Build the same vision layout as two processor-produced 224x224 images."""
-    image_tokens = 128
+    """Build the vision layout for three processor-produced 224x224 images."""
+    image_tokens = 192
     if seq_len < image_tokens:
         raise ValueError(f"seq_len must be at least {image_tokens}, got {seq_len}.")
     input_ids = torch.full((1, seq_len), 1, dtype=torch.int64)
     input_ids[:, :image_tokens] = 248056
-    pixel_values = torch.zeros((1, 3, 14, 28_672), dtype=torch.float32)
-    target_sizes = torch.tensor(((32, 32), (32, 32)), dtype=torch.int32)
+    pixel_values = torch.zeros((1, 3, 14, 43_008), dtype=torch.float32)
+    target_sizes = torch.tensor(((32, 32), (32, 32), (32, 32)), dtype=torch.int32)
     generator = torch.Generator().manual_seed(seed)
     return MiniCPMGR00TRequest(
         input_ids=input_ids,
@@ -221,6 +225,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-warmup", type=int, default=10)
     parser.add_argument("--n-timed", type=int, default=100)
     parser.add_argument("--gdn-backend", choices=("fla", "flashinfer"), default="fla")
+    parser.add_argument(
+        "--action-dtype",
+        choices=tuple(ACTION_DTYPES),
+        default="bfloat16",
+        help="Action parameter/activation dtype.",
+    )
     parser.add_argument("--output-json", type=Path, default=None)
     args = parser.parse_args()
     if args.n_warmup < 0:
@@ -233,6 +243,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     os.environ.setdefault("PHYAI_NORM_BACKEND", "phyai-kernel")
+    action_params_dtype = ACTION_DTYPES[args.action_dtype]
 
     preprocess_start = time.perf_counter()
     if args.synthetic_input:
@@ -254,6 +265,7 @@ def main() -> None:
             plugin_args=MiniCPMGR00TArgs(
                 checkpoint=args.checkpoint,
                 gdn_backend=args.gdn_backend,
+                action_params_dtype=action_params_dtype,
             ),
         )
     )
@@ -285,7 +297,8 @@ def main() -> None:
         )
         print(
             f"backend norm={os.environ['PHYAI_NORM_BACKEND']} "
-            f"gdn={args.gdn_backend} warmup={args.n_warmup} timed={args.n_timed}"
+            f"gdn={args.gdn_backend} action_dtype={args.action_dtype} "
+            f"warmup={args.n_warmup} timed={args.n_timed}"
         )
         print(f"cold_start_wall={cold_wall_ms:.3f}ms (includes JIT)")
         print(f"latency_gpu_ms {format_stats(gpu_stats)}")
@@ -312,6 +325,8 @@ def main() -> None:
                 "parameter_bytes": parameter_bytes,
                 "norm_backend": os.environ["PHYAI_NORM_BACKEND"],
                 "gdn_backend": args.gdn_backend,
+                "action_dtype": args.action_dtype,
+                "action_params_dtype": str(action_params_dtype).removeprefix("torch."),
                 "seed": args.seed,
                 "n_warmup": args.n_warmup,
                 "n_timed": args.n_timed,

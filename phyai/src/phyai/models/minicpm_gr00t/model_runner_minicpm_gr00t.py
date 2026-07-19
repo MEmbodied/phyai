@@ -199,6 +199,7 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         self.model = model
         self.device = torch.device(device)
         self.config = model.config
+        self.action_dtype = model.action_params_dtype
         self.use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
         self._vlm_graphs = CudaGraphRegistry()
         self._action_graphs = CudaGraphRegistry()
@@ -410,7 +411,7 @@ class MiniCPMGR00TModelRunner(ModelRunner):
                 f"noisy_actions has shape {tuple(noisy_actions.shape)}; expected "
                 f"(B, {cfg.action_horizon}, {cfg.action_dim})."
             )
-        state = state.to(device=self.device, dtype=torch.float32)
+        state = state.to(device=self.device, dtype=self.action_dtype)
         if state.ndim == 2:
             state = state.unsqueeze(1)
         if state.shape != (batch_size, 1, cfg.proprio_dim):
@@ -419,7 +420,7 @@ class MiniCPMGR00TModelRunner(ModelRunner):
                 f"(B, 1, {cfg.proprio_dim})."
             )
 
-        noisy_actions = noisy_actions.to(device=self.device, dtype=torch.float32)
+        noisy_actions = noisy_actions.to(device=self.device, dtype=self.action_dtype)
         action_proprio = torch.cat(
             (noisy_actions, state.expand(-1, cfg.action_horizon, -1)),
             dim=-1,
@@ -457,10 +458,10 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         dit_time = build_dit_time_sinusoid(
             timestep,
             embedding_dim=cfg.dit.timestep_input_dim,
-        )
+        ).to(self.action_dtype)
         dit_output = self.model.run_dit(
             dit_input,
-            vlm_hidden_states.to(device=self.device, dtype=torch.float32),
+            vlm_hidden_states.to(device=self.device, dtype=self.action_dtype),
             dit_time,
         )
         decoded = self.model.decode_action(dit_output)
@@ -527,9 +528,11 @@ class MiniCPMGR00TModelRunner(ModelRunner):
             )
 
         graph_inputs = {
-            "vlm_hidden_states": vlm_hidden_states.to(device=self.device),
-            "state": state.to(device=self.device, dtype=torch.float32),
-            "noise": noise.to(device=self.device, dtype=torch.float32),
+            "vlm_hidden_states": vlm_hidden_states.to(
+                device=self.device, dtype=self.action_dtype
+            ),
+            "state": state.to(device=self.device, dtype=self.action_dtype),
+            "noise": noise.to(device=self.device, dtype=self.action_dtype),
         }
         if not self.use_cuda_graph:
             return self._predict_actions_loop(**graph_inputs)

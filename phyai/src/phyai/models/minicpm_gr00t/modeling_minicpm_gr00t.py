@@ -1426,6 +1426,7 @@ class MiniCPMGR00TActionHead(nn.Module):
         )
         action_norm_backend = _fp32_norm_backend(norm_backend, params_dtype)
         self.config = config
+        self.params_dtype = params_dtype
         self.model = MiniCPMGR00TDiT(
             config.dit,
             params_dtype=params_dtype,
@@ -1507,7 +1508,7 @@ class MiniCPMGR00TModel(nn.Module):
         config: MiniCPMGR00TConfig,
         *,
         vlm_params_dtype: torch.dtype = torch.bfloat16,
-        action_params_dtype: torch.dtype = torch.float32,
+        action_params_dtype: torch.dtype = torch.bfloat16,
         attn_backend: str | None = None,
         gdn_backend: str = "flashinfer",
         norm_backend: str | None = None,
@@ -1522,6 +1523,7 @@ class MiniCPMGR00TModel(nn.Module):
         if device is None:
             device = get_engine_config().device.target
         self.config = config
+        self.action_params_dtype = action_params_dtype
         self.vlm = MiniCPMGR00TVLM(
             config,
             params_dtype=vlm_params_dtype,
