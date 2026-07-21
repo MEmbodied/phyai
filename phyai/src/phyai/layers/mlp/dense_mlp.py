@@ -14,11 +14,10 @@ example):
   ``act(input[..., :H]) * input[..., H:]`` exactly: gate occupies the
   first half (shard_id 0) and up the second half (shard_id 1).
 
-* **Plain** (``gated=False``) — ``y = fc2(act(fc1(x)))``. No fused
-  kernel exists, so the activation runs through ``F.gelu`` (or
-  ``F.gelu(approximate="tanh")``). This is BERT / CLIP / SigLIP /
-  ViT-style. SiLU is rejected here because no real model uses
-  non-gated SiLU.
+* **Plain** (``gated=False``) — ``y = fc2(act(fc1(x)))``. GELU runs through
+  ``F.gelu`` (or ``F.gelu(approximate="tanh")``); ReLU squared uses a fused
+  Triton kernel on CUDA and a Torch fallback on CPU. This is BERT / CLIP /
+  SigLIP / ViT-style and the Nemotron dense backbone used by Cosmos3-Edge.
 
 Activation x gated matrix:
 
@@ -30,7 +29,7 @@ Activation x gated matrix:
 ``True``    ``"gelu_tanh"`` Gemma GeGLU                 ``flashinfer.activation.gelu_tanh_and_mul``
 ``False``   ``"gelu"``      BERT / CLIP MLP             ``F.gelu``
 ``False``   ``"gelu_tanh"`` SigLIP / Gemma2 MLP head    ``F.gelu(approximate="tanh")``
-``False``   ``"silu"``      (no real model)             rejected — ``ValueError``
+``False``   ``"relu2"``      Nemotron dense MLP          fused Triton / ``relu(x).square()``
 ==========  ==============  ==========================  ===================================
 
 Aliases ``gelu_pytorch_tanh`` and ``gelu_new`` both normalise to
@@ -41,7 +40,8 @@ Weight loading: each child linear attaches its own ``hf_keys`` and
 for the gated path defaults to ``gate_proj`` / ``up_proj`` /
 ``down_proj``; non-gated defaults to ``fc1`` / ``fc2``. The gated leg
 names are overridable via the ``gated_hf_legs=`` constructor kwarg for
-models that use non-standard names.
+models that use non-standard names; ``plain_hf_legs=`` does the same for
+the two plain projections.
 
 Limitations
 -----------
@@ -71,7 +71,7 @@ from phyai.layers.quant import ActivationView, Fp8Spec, Granularity
 
 
 _GATED_ACTS = ("silu", "gelu", "gelu_tanh")
-_PLAIN_ACTS = ("gelu", "gelu_tanh")
+_PLAIN_ACTS = ("gelu", "gelu_tanh", "relu2")
 _TANH_ALIASES = ("gelu_tanh", "gelu_pytorch_tanh", "gelu_new")
 
 
@@ -113,6 +113,16 @@ def _resolve_plain_act(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
         return F.gelu
     if canon == "gelu_tanh":
         return functools.partial(F.gelu, approximate="tanh")
+    if canon == "relu2":
+
+        def relu2(x: torch.Tensor) -> torch.Tensor:
+            if x.is_cuda:
+                from phyai_kernel import relu2 as fused_relu2
+
+                return fused_relu2(x)
+            return F.relu(x).square()
+
+        return relu2
     if canon == "silu":
         raise ValueError(
             "non-gated SiLU is not supported (no real model uses it; "
@@ -135,7 +145,7 @@ class DenseMLP(nn.Module):
         the size of *each* of ``gate``, ``up``, and the input to
         ``down``.
     activation:
-        ``"silu"`` | ``"gelu"`` | ``"gelu_tanh"``. Aliases
+        ``"silu"`` | ``"gelu"`` | ``"gelu_tanh"`` | ``"relu2"``. Aliases
         ``gelu_pytorch_tanh`` / ``gelu_new`` map to ``gelu_tanh``.
     gated:
         If ``True`` (default), build the gated SwiGLU/GeGLU path. If
@@ -170,7 +180,7 @@ class DenseMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         *,
-        activation: Literal["silu", "gelu", "gelu_tanh"] = "silu",
+        activation: Literal["silu", "gelu", "gelu_tanh", "relu2"] = "silu",
         gated: bool = True,
         bias: bool = False,
         axis: str = "tp",
@@ -179,6 +189,7 @@ class DenseMLP(nn.Module):
         spec_in: object | None = None,
         spec_out: object | None = None,
         gated_hf_legs: tuple[str, str] = ("gate_proj", "up_proj"),
+        plain_hf_legs: tuple[str, str] = ("fc1", "fc2"),
         mesh: str = "model",
         prefix: str = "",
     ) -> None:
@@ -229,6 +240,11 @@ class DenseMLP(nn.Module):
             )
             self._act_fn = None
         else:
+            if len(plain_hf_legs) != 2:
+                raise ValueError(
+                    f"plain_hf_legs must contain exactly two names, got {plain_hf_legs!r}"
+                )
+            fc1_name, fc2_name = plain_hf_legs
             self.fc1 = ColumnParallelLinear(
                 in_features=hidden_size,
                 out_features=intermediate_size,
@@ -239,7 +255,7 @@ class DenseMLP(nn.Module):
                 params_dtype=params_dtype,
                 spec=spec_in,
                 mesh=mesh,
-                prefix=f"{prefix}.fc1" if prefix else "fc1",
+                prefix=f"{prefix}.{fc1_name}" if prefix else fc1_name,
             )
             self.fc2 = RowParallelLinear(
                 in_features=intermediate_size,
@@ -252,7 +268,7 @@ class DenseMLP(nn.Module):
                 params_dtype=params_dtype,
                 spec=spec_out,
                 mesh=mesh,
-                prefix=f"{prefix}.fc2" if prefix else "fc2",
+                prefix=f"{prefix}.{fc2_name}" if prefix else fc2_name,
             )
             self._act_and_mul = None
             self._use_fused_gelu_tanh_fp8 = False

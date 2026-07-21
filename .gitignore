@@ -107,6 +107,7 @@ skills-lock.json
 
 # profile
 .profile/
+/profile/
 .memory/
 
 # For some OpenCode agents

@@ -106,8 +106,7 @@ class UniPCMultistepSampler:
                 - np.linspace(
                     1.0, 1.0 / self.num_train_timesteps, self.num_train_timesteps
                 )[::-1]
-            )
-            base = shift * base / (1.0 + (shift - 1.0) * base)
+            ).astype(np.float32)
             sigma_max, sigma_min = float(base[0]), float(base[-1])
             sigmas = np.linspace(sigma_max, sigma_min, n + 1)[:-1]
             sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)

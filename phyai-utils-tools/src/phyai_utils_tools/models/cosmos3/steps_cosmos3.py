@@ -422,8 +422,10 @@ def _to_pil_rgb(value: Any):
     )
 
 
-def _resize_and_pad_action_image(image, target_h: int, target_w: int) -> np.ndarray:
-    """Action-mode resize: scale DOWN with BICUBIC + reflect/edge pad."""
+def _resize_and_pad_action_image(
+    image, target_h: int, target_w: int
+) -> tuple[np.ndarray, int, int]:
+    """Resize and pad an action frame, returning pixels and valid content size."""
     import PIL.Image
 
     img = _to_pil_rgb(image)
@@ -437,9 +439,10 @@ def _resize_and_pad_action_image(image, target_h: int, target_w: int) -> np.ndar
     pad_h = target_h - resize_h
     pad_w = target_w - resize_w
     if pad_h == 0 and pad_w == 0:
-        return array
+        return array, resize_h, resize_w
     pad_mode = "reflect" if pad_h < resize_h and pad_w < resize_w else "edge"
-    return np.pad(array, ((0, pad_h), (0, pad_w), (0, 0)), mode=pad_mode)
+    padded = np.pad(array, ((0, pad_h), (0, pad_w), (0, 0)), mode=pad_mode)
+    return padded, resize_h, resize_w
 
 
 @ProcessorStepRegistry.register("cosmos3_image_preprocess_step")
@@ -478,28 +481,33 @@ class Cosmos3ImagePreprocessStep(ProcessorStep):
         else:
             frames = [raw]
 
-        # Resolve the (uniform) target size. With image_size set, snap the first
+        # note(chenghua): Resolve one canvas and preserve the valid content size
+        # so the transformer can remove reflection padding after VAE encoding.
+        # With image_size set, snap the first
         # frame's native dims to the closest predefined aspect ratio; otherwise
-        # use the explicit height/width. ``meta_*`` records the scaled pre-pad dims
-        # (reported in the prompt resolution sentence).
+        # use the explicit height/width.
         if self.image_size is not None:
             first = _to_pil_rgb(frames[0])
-            scale = self.image_size / first.height
-            meta_h, meta_w = self.image_size, max(1, int(round(first.width * scale)))
             target_h, target_w = resolve_target_size(
                 first.height, first.width, self.image_size
             )
         else:
             target_h, target_w = self.height, self.width
-            meta_h, meta_w = self.height, self.width
 
         # Process every frame the caller provides (single image -> 1 frame ->
         # t_lat=1; a video observation -> N frames -> correct t_lat). Only the first
         # 1-2 latent frames are conditioned clean downstream, but the full clip is
         # VAE-encoded, so all provided frames are kept here.
-        processed_frames = [
+        processed = [
             _resize_and_pad_action_image(frame, target_h, target_w) for frame in frames
         ]
+        processed_frames = [item[0] for item in processed]
+        content_sizes = [(item[1], item[2]) for item in processed]
+        if any(size != content_sizes[0] for size in content_sizes[1:]):
+            raise ValueError(
+                f"All observation frames must share one content size, got {content_sizes}."
+            )
+        meta_h, meta_w = content_sizes[0]
 
         tensors = []
         for arr in processed_frames:

@@ -41,10 +41,9 @@ class Cosmos3PolicyArgs(EntryArgs):
     config: Cosmos3Config | None = None
     # Default flow_shift for the action-policy sampler.
     flow_shift: float = 10.0
-    # UniPC sigma schedule: True=Karras (the checkpoint scheduler_config.json
-    # default), False=linear-flow + flow_shift. ``None`` reads ``use_karras_sigmas``
-    # from the checkpoint's ``scheduler/scheduler_config.json`` (falling back to True).
-    use_karras_sigmas: bool | None = None
+    # note(chenghua): Native policy inference uses linear-flow UniPC, including
+    # for Nano checkpoints whose exported Diffusers config requests Karras sigmas.
+    use_karras_sigmas: bool | None = False
     decode_video: bool = False
     weight_strict: bool = False
 

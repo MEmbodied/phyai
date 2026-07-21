@@ -243,6 +243,8 @@ class Cosmos3CausalAttention(nn.Module):
         attn_backend: str,
         norm_backend: str,
         params_dtype: torch.dtype | None,
+        qk_norm: bool = True,
+        use_und_k_norm_for_gen: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -275,20 +277,34 @@ class Cosmos3CausalAttention(nn.Module):
         self.q_size, self.k_size, self.v_size = self.qkv_proj.output_partition_sizes
         self.num_local_heads = self.q_size // head_dim
         self.num_local_kv_heads = self.k_size // head_dim
-        self.norm_q = RMSNorm(
-            head_dim,
-            eps=rms_norm_eps,
-            backend=norm_backend,
-            dtype=params_dtype,
-            prefix=f"{prefix}.norm_q" if prefix else "",
-        )
-        self.norm_k = RMSNorm(
-            head_dim,
-            eps=rms_norm_eps,
-            backend=norm_backend,
-            dtype=params_dtype,
-            prefix=f"{prefix}.norm_k" if prefix else "",
-        )
+        if qk_norm:
+            self.norm_q = RMSNorm(
+                head_dim,
+                eps=rms_norm_eps,
+                backend=norm_backend,
+                dtype=params_dtype,
+                prefix=f"{prefix}.norm_q" if prefix else "",
+            )
+            self.norm_k = RMSNorm(
+                head_dim,
+                eps=rms_norm_eps,
+                backend=norm_backend,
+                dtype=params_dtype,
+                prefix=f"{prefix}.norm_k" if prefix else "",
+            )
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_k = nn.Identity()
+        if use_und_k_norm_for_gen and qk_norm is False:
+            self.k_norm_und_for_gen: nn.Module | None = RMSNorm(
+                head_dim,
+                eps=rms_norm_eps,
+                backend=norm_backend,
+                dtype=params_dtype,
+                prefix=f"{prefix}.k_norm_und_for_gen" if prefix else "",
+            )
+        else:
+            self.k_norm_und_for_gen = None
         self.attn = Attention(
             num_heads=self.num_local_heads,
             head_dim=head_dim,
@@ -309,13 +325,26 @@ class Cosmos3CausalAttention(nn.Module):
         q = q.view(B, S, self.num_local_heads, self.head_dim)
         k = k.view(B, S, self.num_local_kv_heads, self.head_dim)
         v = v.view(B, S, self.num_local_kv_heads, self.head_dim)
-        q = self.norm_q(q)
-        k = self.norm_k(k)
-        q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
-        out = self.attn(q, k, v)  # [B, S, H, D]  (4-D padded causal path)
+        q_normalized = self.norm_q(q)
+        k_normalized = self.norm_k(k)
+        q_rotated, k_rotated = _apply_rotary_pos_emb(
+            q_normalized, k_normalized, freqs_cos, freqs_sin
+        )
+        if self.k_norm_und_for_gen is not None:
+            _, k_for_gen = _apply_rotary_pos_emb(
+                q_normalized,
+                self.k_norm_und_for_gen(k),
+                freqs_cos,
+                freqs_sin,
+            )
+        else:
+            k_for_gen = k_rotated
+        out = self.attn(
+            q_rotated, k_rotated, v
+        )  # [B, S, H, D]  (4-D padded causal path)
         out = out.reshape(B, S, -1)
         out, _ = self.to_out(out)
-        return out, k, v
+        return out, k_for_gen, v
 
 
 class Cosmos3CrossAttention(nn.Module):
@@ -332,6 +361,7 @@ class Cosmos3CrossAttention(nn.Module):
         attn_backend: str,
         norm_backend: str,
         params_dtype: torch.dtype | None,
+        qk_norm: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -361,20 +391,24 @@ class Cosmos3CrossAttention(nn.Module):
         self.q_size, self.k_size, self.v_size = self.qkv_proj.output_partition_sizes
         self.num_local_heads = self.q_size // head_dim
         self.num_local_kv_heads = self.k_size // head_dim
-        self.norm_q = RMSNorm(
-            head_dim,
-            eps=rms_norm_eps,
-            backend=norm_backend,
-            dtype=params_dtype,
-            prefix=f"{prefix}.norm_q" if prefix else "",
-        )
-        self.norm_k = RMSNorm(
-            head_dim,
-            eps=rms_norm_eps,
-            backend=norm_backend,
-            dtype=params_dtype,
-            prefix=f"{prefix}.norm_k" if prefix else "",
-        )
+        if qk_norm:
+            self.norm_q = RMSNorm(
+                head_dim,
+                eps=rms_norm_eps,
+                backend=norm_backend,
+                dtype=params_dtype,
+                prefix=f"{prefix}.norm_q" if prefix else "",
+            )
+            self.norm_k = RMSNorm(
+                head_dim,
+                eps=rms_norm_eps,
+                backend=norm_backend,
+                dtype=params_dtype,
+                prefix=f"{prefix}.norm_k" if prefix else "",
+            )
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_k = nn.Identity()
         self.attn = Attention(
             num_heads=self.num_local_heads,
             head_dim=head_dim,
@@ -409,7 +443,7 @@ class Cosmos3CrossAttention(nn.Module):
 
 
 class Cosmos3UndDecoderLayer(nn.Module):
-    """UND layer: pre-norm causal self-attn (returns K/V) + SwiGLU MLP."""
+    """UND layer: pre-norm causal self-attn (returns K/V) + configured MLP."""
 
     def __init__(
         self,
@@ -430,6 +464,10 @@ class Cosmos3UndDecoderLayer(nn.Module):
             attn_backend=attn_backend,
             norm_backend=norm_backend,
             params_dtype=params_dtype,
+            qk_norm=config.qk_norm_for_text,
+            use_und_k_norm_for_gen=(
+                config.use_und_k_norm_for_gen and config.qk_norm_for_diffusion
+            ),
             prefix=f"{prefix}.self_attn" if prefix else "",
         )
         self.input_layernorm = RMSNorm(
@@ -449,10 +487,11 @@ class Cosmos3UndDecoderLayer(nn.Module):
         self.mlp = DenseMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation="silu",
-            gated=True,
+            activation=config.hidden_act,
+            gated=config.hidden_act != "relu2",
             bias=False,
             params_dtype=params_dtype,
+            plain_hf_legs=("up_proj", "down_proj"),
             prefix=f"{prefix}.mlp" if prefix else "",
         )
 
@@ -471,7 +510,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
 
 
 class Cosmos3GenDecoderLayer(nn.Module):
-    """GEN layer: pre-norm cross-attn (to UND K/V) + SwiGLU MLP."""
+    """GEN layer: pre-norm cross-attn (to UND K/V) + configured MLP."""
 
     def __init__(
         self,
@@ -492,6 +531,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             attn_backend=attn_backend,
             norm_backend=norm_backend,
             params_dtype=params_dtype,
+            qk_norm=config.qk_norm_for_diffusion,
             prefix=f"{prefix}.cross_attention" if prefix else "",
         )
         self.input_layernorm = RMSNorm(
@@ -511,10 +551,11 @@ class Cosmos3GenDecoderLayer(nn.Module):
         self.mlp = DenseMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation="silu",
-            gated=True,
+            activation=config.hidden_act,
+            gated=config.hidden_act != "relu2",
             bias=False,
             params_dtype=params_dtype,
+            plain_hf_legs=("up_proj", "down_proj"),
             prefix=f"{prefix}.mlp" if prefix else "",
         )
 
@@ -1062,6 +1103,7 @@ _UND_LEAF = {
     "self_attn.to_out": "self_attn.to_out",
     "self_attn.norm_q": "self_attn.norm_q",
     "self_attn.norm_k": "self_attn.norm_k",
+    "self_attn.k_norm_und_for_gen": "self_attn.k_norm_und_for_gen",
     "input_layernorm": "input_layernorm",
     "post_attention_layernorm": "post_attention_layernorm",
     "mlp.gate_proj": "mlp.gate_proj",

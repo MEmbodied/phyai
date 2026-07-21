@@ -184,7 +184,7 @@ def main() -> None:
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--flow-shift", type=float, default=10.0)
     parser.add_argument(
-        "--use-karras-sigmas", choices=("auto", "true", "false"), default="auto"
+        "--use-karras-sigmas", choices=("auto", "true", "false"), default="false"
     )
     parser.add_argument("--fps", type=float, default=24.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -312,7 +312,9 @@ def main() -> None:
 
         processed = processor.preprocess(raw_input)
         video_shape = pixel_to_latent_shape(
-            processed.video_shape[0], processed.video_shape[1], processed.video_shape[2]
+            processed.action_chunk + 1,
+            processed.content_size[0],
+            processed.content_size[1],
         )
         request = Cosmos3ActionRequest(
             text_ids=processed.text_ids.to(device),

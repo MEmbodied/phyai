@@ -61,9 +61,11 @@ class Cosmos3Config(PretrainedConfig):
     temporal_compression_factor: int = 4
     temporal_modality_margin: int = 15000
 
-    # QK Norm
+    # note(chenghua): Edge keeps UND unnormalised but normalises its K values
+    # separately before generation cross-attention.
     qk_norm_for_text: bool = True
     qk_norm_for_diffusion: bool = True
+    use_und_k_norm_for_gen: bool = False
 
     # Optional modalities (omitted from the T2V build when False).
     action_gen: bool = False

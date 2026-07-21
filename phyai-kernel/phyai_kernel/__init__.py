@@ -20,6 +20,7 @@ from phyai_kernel.triton import (
     layernorm,
     masked_embedding_lookup,
     nvfp4_scale_output,
+    relu2,
     rmsnorm,
     rmsnorm_hf,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "layernorm",
     "masked_embedding_lookup",
     "nvfp4_scale_output",
+    "relu2",
     "rmsnorm",
     "rmsnorm_hf",
 ]

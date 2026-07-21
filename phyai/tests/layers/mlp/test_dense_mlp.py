@@ -112,6 +112,21 @@ def test_plain_construct_with_bias(fake_mesh):
     assert m.fc2.bias is not None
 
 
+def test_plain_relu2_constructs_cosmos3_edge_layout(fake_mesh):
+    fake_mesh()
+    _init_dispatcher()
+    m = DenseMLP(
+        hidden_size=8,
+        intermediate_size=24,
+        activation="relu2",
+        gated=False,
+        plain_hf_legs=("up_proj", "down_proj"),
+        prefix="model.layers.0.mlp",
+    )
+    assert m.fc1.weight.hf_keys == [("model.layers.0.mlp.up_proj.weight", None)]
+    assert m.fc2.weight.hf_keys == [("model.layers.0.mlp.down_proj.weight", None)]
+
+
 def test_plain_silu_rejected(fake_mesh):
     fake_mesh()
     _init_dispatcher()
@@ -324,6 +339,28 @@ def test_forward_plain_gelu_tanh_matches_torch_reference(fake_mesh):
     y = m(x)
     h = F.gelu(F.linear(x, m.fc1.weight, m.fc1.bias), approximate="tanh")
     ref = F.linear(h, m.fc2.weight, m.fc2.bias)
+    torch.testing.assert_close(y, ref, atol=0, rtol=0)
+
+
+def test_forward_plain_relu2_matches_torch_reference(fake_mesh):
+    fake_mesh()
+    _init_dispatcher()
+    m = DenseMLP(
+        hidden_size=32,
+        intermediate_size=96,
+        activation="relu2",
+        gated=False,
+        params_dtype=torch.bfloat16,
+        plain_hf_legs=("up_proj", "down_proj"),
+        prefix="mlp",
+    )
+    torch.manual_seed(4)
+    nn.init.normal_(m.fc1.weight, std=0.02)
+    nn.init.normal_(m.fc2.weight, std=0.02)
+
+    x = (torch.randn(4, 32) * 0.1).to(torch.bfloat16)
+    y = m(x)
+    ref = F.linear(F.relu(F.linear(x, m.fc1.weight)).square(), m.fc2.weight)
     torch.testing.assert_close(y, ref, atol=0, rtol=0)
 
 

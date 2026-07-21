@@ -20,6 +20,8 @@ from phyai_utils_tools.models.cosmos3.steps_cosmos3 import (
     DOMAIN_ID,
     EMBODIMENT_TO_DOMAIN_ID,
     EMBODIMENT_TO_RAW_ACTION_DIM,
+    META_HEIGHT,
+    META_WIDTH,
     MODE,
     NEG_TEXT_IDS,
     NEG_TEXT_MASK,
@@ -320,6 +322,7 @@ class Cosmos3PolicyProcessedInputs:
     action_chunk: int
     raw_action_dim: int
     video_shape: tuple[int, int, int]
+    content_size: tuple[int, int]
     cond_frame_indexes: tuple[int, ...] | None = None
 
 
@@ -487,6 +490,7 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
             action_chunk=transition[ACTION_CHUNK],
             raw_action_dim=transition[RAW_ACTION_DIM],
             video_shape=transition[VIDEO_SHAPE],
+            content_size=(transition[META_HEIGHT], transition[META_WIDTH]),
             cond_frame_indexes=self.cond_frame_indexes,
         )
 

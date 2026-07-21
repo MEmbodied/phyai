@@ -14,6 +14,7 @@ from phyai.models.cosmos3.modeling_cosmos3 import Cosmos3Transformer
 from phyai.models.cosmos3.sampler_unipc import UniPCMultistepSampler
 from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
     _ACTION_MODES,
+    _prepare_condition_latents,
     Cosmos3ActionRequest,
 )
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
@@ -63,7 +64,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
         vae: Cosmos3WanVAE | None = None,
         device: torch.device | str | None = None,
         flow_shift: float = 10.0,
-        use_karras_sigmas: bool = True,
+        use_karras_sigmas: bool = False,
         use_cuda_graph: bool = False,
     ) -> None:
         self.transformer = transformer
@@ -148,29 +149,49 @@ class Cosmos3PolicyWNScheduler(Scheduler):
         else:
             video_clean = [0]
         action_clean = request.mode == "forward_dynamics"
+        if any(index < 0 or index >= t_lat for index in video_clean):
+            raise ValueError(
+                f"condition frame indexes {video_clean} are outside latent T={t_lat}."
+            )
 
         seed = int(request.seed)
         video = torch.from_numpy(
             np.random.RandomState(seed)
             .standard_normal((batch, self.latent_channel, t_lat, h_lat, w_lat))
             .astype("float32")
-        ).to(dev, dt)
-        action = torch.from_numpy(
-            np.random.RandomState(seed)
-            .standard_normal((batch, chunk, ad))
-            .astype("float32")
-        ).to(dev, dt)
+        ).to(dev)
+        action = (
+            torch.from_numpy(
+                np.random.RandomState(seed)
+                .standard_normal((batch, chunk, ad))
+                .astype("float32")
+            )
+            .to(dev, dt)
+            .float()
+        )
         action[:, :, raw:] = 0.0
 
         cond_video = (
-            request.cond_video_latents.to(dev, dt)
+            _prepare_condition_latents(
+                request.cond_video_latents,
+                video_shape=request.video_shape,
+                device=dev,
+                model_dtype=dt,
+            )
             if request.cond_video_latents is not None
             else None
         )
         if cond_video is not None:
+            if any(index >= cond_video.shape[2] for index in video_clean):
+                raise ValueError(
+                    f"condition frame indexes {video_clean} exceed encoded latent "
+                    f"T={cond_video.shape[2]}."
+                )
             video[:, :, video_clean] = cond_video[:, :, video_clean]
         cond_action = (
-            request.cond_action.to(dev, dt) if request.cond_action is not None else None
+            request.cond_action.to(dev, dt).float()
+            if request.cond_action is not None
+            else None
         )
         if action_clean and cond_action is not None:
             action = cond_action.clone()
@@ -220,17 +241,19 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                 br_ids, br_mask, branch = neg_ids, neg_mask, "uncond"
             with event_scope("cosmos3.policy_denoise_loop"):
                 for timestep in uni_v.timesteps:
-                    tval = timestep.to(dev).reshape(1).to(dt)
+                    tval = timestep.to(dev).reshape(1).float()
+                    model_video = video.to(dt)
+                    model_action = action.to(dt)
                     v_local, a_local = self.runner.forward(
                         branch,
-                        video,
+                        model_video,
                         tval,
                         text_ids=br_ids,
                         text_mask=br_mask,
                         video_shape=request.video_shape,
                         fps=request.fps,
                         noisy_frame_mask=video_mask,
-                        action_latents=action,
+                        action_latents=model_action,
                         action_domain_id=domain,
                         action_noisy_mask=action_mask,
                     )
@@ -239,54 +262,60 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                     a_pair = P.all_gather(a_local.unsqueeze(0), axis="cfg", dim=0)
                     v_vel = v_pair[1] + request.guidance_scale * (v_pair[0] - v_pair[1])
                     a_vel = a_pair[1] + request.guidance_scale * (a_pair[0] - a_pair[1])
+                    v_vel = v_vel * video_mask[:, None, :, None, None].to(v_vel.dtype)
+                    a_vel = a_vel * action_mask.unsqueeze(-1).to(a_vel.dtype)
                     a_vel[:, :, raw:] = 0.0
                     video = uni_v.step(v_vel, timestep, video)
                     action = uni_a.step(a_vel, timestep, action)
                     if cond_video is not None:
                         video[:, :, video_clean] = cond_video[:, :, video_clean]
                     if action_clean and cond_action is not None:
-                        action = cond_action.to(action.dtype).clone()
+                        action = cond_action.clone()
                         action[:, :, raw:] = 0.0
         else:
             with event_scope("cosmos3.policy_denoise_loop"):
                 for timestep in uni_v.timesteps:
-                    tval = timestep.to(dev).reshape(1).to(dt)
+                    tval = timestep.to(dev).reshape(1).float()
+                    model_video = video.to(dt)
+                    model_action = action.to(dt)
                     v_vel, a_vel = self.runner.forward(
                         "cond",
-                        video,
+                        model_video,
                         tval,
                         text_ids=text_ids,
                         text_mask=text_mask,
                         video_shape=request.video_shape,
                         fps=request.fps,
                         noisy_frame_mask=video_mask,
-                        action_latents=action,
+                        action_latents=model_action,
                         action_domain_id=domain,
                         action_noisy_mask=action_mask,
                     )
                     if do_cfg:
                         vu, au = self.runner.forward(
                             "uncond",
-                            video,
+                            model_video,
                             tval,
                             text_ids=neg_ids,
                             text_mask=neg_mask,
                             video_shape=request.video_shape,
                             fps=request.fps,
                             noisy_frame_mask=video_mask,
-                            action_latents=action,
+                            action_latents=model_action,
                             action_domain_id=domain,
                             action_noisy_mask=action_mask,
                         )
                         v_vel = vu + request.guidance_scale * (v_vel - vu)
                         a_vel = au + request.guidance_scale * (a_vel - au)
+                    v_vel = v_vel * video_mask[:, None, :, None, None].to(v_vel.dtype)
+                    a_vel = a_vel * action_mask.unsqueeze(-1).to(a_vel.dtype)
                     a_vel[:, :, raw:] = 0.0
                     video = uni_v.step(v_vel, timestep, video)
                     action = uni_a.step(a_vel, timestep, action)
                     if cond_video is not None:
                         video[:, :, video_clean] = cond_video[:, :, video_clean]
                     if action_clean and cond_action is not None:
-                        action = cond_action.to(action.dtype).clone()
+                        action = cond_action.clone()
                         action[:, :, raw:] = 0.0
 
         out = {"video": video, "action": action[:, :, :raw]}
@@ -295,7 +324,7 @@ class Cosmos3PolicyWNScheduler(Scheduler):
                 raise RuntimeError(
                     "decode_video=True but the scheduler was built without a VAE."
                 )
-            pixels = self.vae_runner.decode(video)
+            pixels = self.vae_runner.decode(video.to(dt))
             out["pixels"] = ((pixels.float() + 1.0) / 2.0).clamp(0.0, 1.0)
         return out
 

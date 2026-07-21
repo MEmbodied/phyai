@@ -14,6 +14,7 @@ from phyai_kernel.triton.layer_norm import layernorm
 from phyai_kernel.triton.masked_embedding import masked_embedding_lookup
 from phyai_kernel.triton.nvfp4 import nvfp4_scale_output
 from phyai_kernel.triton.paged_kv_indices import create_paged_kv_indices
+from phyai_kernel.triton.relu2 import relu2
 from phyai_kernel.triton.rms_norm import (
     fused_add_rmsnorm,
     gemma_fused_add_rmsnorm,
@@ -38,6 +39,7 @@ __all__ = [
     "layernorm",
     "masked_embedding_lookup",
     "nvfp4_scale_output",
+    "relu2",
     "rmsnorm",
     "rmsnorm_hf",
 ]

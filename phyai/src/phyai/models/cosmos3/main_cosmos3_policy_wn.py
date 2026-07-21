@@ -47,7 +47,7 @@ class Cosmos3PolicyWNArgs(EntryArgs):
     checkpoint_dir: str | Path | None = None
     config: Cosmos3Config | None = None
     flow_shift: float = 10.0
-    use_karras_sigmas: bool | None = None
+    use_karras_sigmas: bool | None = False
     decode_video: bool = False
     weight_strict: bool = False
 
