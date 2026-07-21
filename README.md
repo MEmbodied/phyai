@@ -43,6 +43,9 @@ cd phyai
 uv sync
 ```
 
+For model-specific setup, see the
+[MiniCPM-GR00T local deployment guide](examples/minicpm_gr00t/README.md).
+
 **Nightly build:**
 
 ```bash

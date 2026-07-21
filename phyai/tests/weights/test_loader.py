@@ -389,6 +389,35 @@ def test_load_from_single_file_path(tmp_path: Path, fake_mesh):
     assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
 
 
+@pytest.mark.parametrize("wrapper_key", [None, "model_state_dict", "state_dict"])
+def test_load_from_pytorch_checkpoint(
+    tmp_path: Path,
+    fake_mesh,
+    wrapper_key: str | None,
+):
+    """PTH uses the same hf_keys dispatch and strict report as safetensors."""
+
+    fake_mesh(sizes={"tp": 1})
+    _init_dispatcher()
+    layer = _make_replicated()
+    src_w = torch.randn(8, 4, dtype=torch.float32)
+    src_b = torch.randn(8, dtype=torch.float32)
+    state = {"mod.fc.weight": src_w, "mod.fc.bias": src_b}
+    checkpoint = (
+        state if wrapper_key is None else {wrapper_key: state, "current_iter": 42}
+    )
+    path = tmp_path / "checkpoint.pth"
+    torch.save(checkpoint, path)
+
+    report = load_pretrained(layer, path)
+
+    assert sorted(report.loaded) == ["mod.fc.bias", "mod.fc.weight"]
+    assert not report.missing
+    assert not report.unexpected
+    torch.testing.assert_close(layer.weight.data, src_w)
+    torch.testing.assert_close(layer.bias.data, src_b)
+
+
 def test_load_from_iterable_of_str(tmp_path: Path, fake_mesh):
     """source = iterable of str (existing-iterable contract preserved)."""
     fake_mesh(sizes={"tp": 1})
@@ -487,6 +516,23 @@ def test_count_keys_sums_across_shards(tmp_path: Path):
     save_file({"x": torch.zeros(2), "y": torch.zeros(2)}, str(a))
     save_file({"z": torch.zeros(2)}, str(b))
     assert loader_mod._count_keys([a, b]) == 3
+
+
+def test_count_keys_supports_mixed_checkpoint_formats(tmp_path: Path):
+    safetensors_path = tmp_path / "a.safetensors"
+    pytorch_path = tmp_path / "b.pth"
+    save_file({"x": torch.zeros(2)}, str(safetensors_path))
+    torch.save(
+        {
+            "model_state_dict": {
+                "y": torch.zeros(2),
+                "z": torch.zeros(2),
+            },
+            "current_iter": 42,
+        },
+        pytorch_path,
+    )
+    assert loader_mod._count_keys([safetensors_path, pytorch_path]) == 3
 
 
 def test_progress_disable_resolution(fake_mesh):
