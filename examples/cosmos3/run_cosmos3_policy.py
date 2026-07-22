@@ -1,11 +1,17 @@
 """End-to-end Cosmos3 action/policy demo.
 
-Drives the ``cosmos3_policy`` engine plugin on a Cosmos3-Nano checkpoint:
+Drives the ``cosmos3_policy`` engine plugin on a Cosmos3 policy checkpoint:
 preprocesses an observation (single ``--image`` or a multi-frame ``--video``) +
 task prompt, runs the diffusion policy, and writes the predicted action (JSON) plus
 an optional rollout video (mp4).
 
-Requires CUDA and a Cosmos3-Nano checkpoint.
+Requires CUDA and a Cosmos3 Edge or Nano policy checkpoint.
+
+For the released DROID RoboLab checkpoints, pass ``--robolab-observation`` with
+an ``.npz`` containing ``observation/joint_position``,
+``observation/gripper_position``, and either ``observation/image`` or all three
+RoboLab camera keys. This selects the native 32-action/state-conditioned path and
+infers the Edge JSON versus Nano plain prompt format from the checkpoint.
 
 Example (policy mode, the default)::
 
@@ -50,6 +56,7 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 
@@ -131,12 +138,28 @@ def _load_action_from_file(path: str, chunk_index: int = 0) -> torch.Tensor:
     raise ValueError(f"Unrecognized action file format: {path}")
 
 
+def _load_robolab_observation(path: str) -> dict:
+    """Load one complete RoboLab observation from a non-pickled NPZ file."""
+    with np.load(path, allow_pickle=False) as payload:
+        observation = {key: payload[key] for key in payload.files}
+    for key in ("prompt", "domain_name"):
+        value = observation.get(key)
+        if isinstance(value, np.ndarray) and value.ndim == 0:
+            observation[key] = value.item()
+    return observation
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--checkpoint", required=True, help="Cosmos3-Nano checkpoint dir"
+        "--checkpoint", required=True, help="Cosmos3 policy checkpoint dir"
+    )
+    parser.add_argument(
+        "--robolab-observation",
+        default=None,
+        help="Full RoboLab observation NPZ; mutually exclusive with --image/--video.",
     )
     parser.add_argument(
         "--image", default=None, help="Single observation image (-> t_lat=1)"
@@ -147,7 +170,7 @@ def main() -> None:
         help="Observation video (mp4): reads the first action_chunk_size+1 frames "
         "as a multi-frame observation (-> correct t_lat). Decoded via PyAV.",
     )
-    parser.add_argument("--prompt", default="robot manipulates objects")
+    parser.add_argument("--prompt", default=None)
     parser.add_argument("--negative-prompt", default="")
     parser.add_argument(
         "--mode",
@@ -168,7 +191,7 @@ def main() -> None:
         "sentences.",
     )
     parser.add_argument("--view-point", default="ego_view")
-    parser.add_argument("--domain-name", default="agibotworld")
+    parser.add_argument("--domain-name", default=None)
     parser.add_argument(
         "--action-file",
         default=None,
@@ -185,8 +208,8 @@ def main() -> None:
         help="Snap the observation to the closest aspect ratio in this tier. "
         "Pass 0 to use the explicit --height/--width instead.",
     )
-    parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--guidance-scale", type=float, default=None)
     parser.add_argument("--flow-shift", type=float, default=5.0)
     parser.add_argument(
         "--policy-modeling-mode",
@@ -202,9 +225,9 @@ def main() -> None:
         "checkpoint scheduler_config.json. 'false' (default) matches native "
         "linear-flow + flow_shift.",
     )
-    parser.add_argument("--fps", type=float, default=24.0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--action-chunk-size", type=int, default=16)
+    parser.add_argument("--fps", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--action-chunk-size", type=int, default=None)
     parser.add_argument(
         "--raw-action-dim",
         type=int,
@@ -223,32 +246,81 @@ def main() -> None:
         default="minmax",
         help="Denormalization method for --action-stats-path.",
     )
+    parser.add_argument(
+        "--robolab-prompt-format",
+        choices=("auto", "json", "plain"),
+        default="auto",
+    )
+    parser.add_argument("--history-length", type=int, default=1)
     parser.add_argument("--no-prompt-metadata", action="store_true")
+    parser.add_argument(
+        "--decode-video",
+        action="store_true",
+        help="Decode and save the optional predicted rollout video.",
+    )
     parser.add_argument("--out", default=".cache/cosmos3_policy_out")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required.")
-    if (args.image is None) == (args.video is None):
+    is_robolab = args.robolab_observation is not None
+    if is_robolab:
+        if args.image is not None or args.video is not None:
+            raise SystemExit(
+                "--robolab-observation is mutually exclusive with --image/--video."
+            )
+        if args.mode != "policy":
+            raise SystemExit("--robolab-observation supports policy mode only.")
+    elif (args.image is None) == (args.video is None):
         raise SystemExit("pass exactly one of --image or --video.")
 
-    # Observation frames + default clean-frame conditioning per input type
-    if args.video is not None:
-        observation = _read_video_frames(args.video, args.action_chunk_size + 1)
-        default_cond = (0, 1)
-    else:
-        observation = args.image
-        default_cond = (0,)
-    if args.condition_frames is not None:
-        cond_frames = tuple(int(x) for x in args.condition_frames.split(",") if x != "")
-    else:
-        cond_frames = default_cond
+    domain_name = args.domain_name or ("droid_lerobot" if is_robolab else "agibotworld")
+    action_chunk_size = (
+        args.action_chunk_size
+        if args.action_chunk_size is not None
+        else (32 if is_robolab else 16)
+    )
+    raw_action_dim = (
+        args.raw_action_dim
+        if args.raw_action_dim is not None
+        else (8 if is_robolab else None)
+    )
+    steps = args.steps if args.steps is not None else (4 if is_robolab else 30)
+    guidance_scale = (
+        args.guidance_scale
+        if args.guidance_scale is not None
+        else (3.0 if is_robolab else 1.0)
+    )
+    fps = args.fps if args.fps is not None else (15.0 if is_robolab else 24.0)
+    seed = args.seed if args.seed is not None else (0 if is_robolab else 42)
+    prompt = (
+        args.prompt
+        if args.prompt is not None
+        else (None if is_robolab else "robot manipulates objects")
+    )
+
+    if not is_robolab:
+        if args.video is not None:
+            observation = _read_video_frames(args.video, action_chunk_size + 1)
+            default_cond = (0, 1)
+        else:
+            observation = args.image
+            default_cond = (0,)
+        if args.condition_frames is not None:
+            cond_frames = tuple(
+                int(x) for x in args.condition_frames.split(",") if x != ""
+            )
+        else:
+            cond_frames = default_cond
 
     from phyai.engine import Engine, EngineArgs
     from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
     from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
     from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
-    from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+    from phyai_utils_tools.models.cosmos3 import (
+        Cosmos3PolicyProcessor,
+        Cosmos3RoboLabPolicyProcessor,
+    )
 
     device = "cuda"
     dtype = torch.bfloat16
@@ -266,7 +338,7 @@ def main() -> None:
                 flow_shift=args.flow_shift,
                 use_karras_sigmas=use_karras,
                 policy_modeling_mode=args.policy_modeling_mode,
-                decode_video=True,
+                decode_video=args.decode_video,
             ),
             config=EngineConfig(
                 device=DeviceConfig(target=device, params_dtype=dtype),
@@ -277,38 +349,62 @@ def main() -> None:
 
     try:
         print("[processor] preprocessing ...")
-        processor = Cosmos3PolicyProcessor(
-            tokenizer_name_or_path=f"{args.checkpoint}/text_tokenizer",
-            height=args.height,
-            width=args.width,
-            num_frames=args.num_frames,
-            mode=args.mode,
-            domain_name=args.domain_name,
-            action_chunk_size=args.action_chunk_size,
-            raw_action_dim=args.raw_action_dim,
-            fps=args.fps,
-            image_size=(args.image_size if args.image_size > 0 else None),
-            append_metadata=not args.no_prompt_metadata,
-            prompt_format=args.prompt_format,
-            view_point=args.view_point,
-            cond_frame_indexes=cond_frames,
-            action_stats_path=args.action_stats_path,
-            action_normalization=args.action_normalization,
-            negative_prompt=args.negative_prompt,
-            device=device,
-            params_dtype=dtype,
-        )
-
-        raw_input: dict = {
-            "images": observation,
-            "task": args.prompt,
-        }
-        if args.mode == "forward_dynamics":
-            if args.action_file is None:
-                raise ValueError("--action-file is required for forward_dynamics mode.")
-            raw_input["cond_action"] = _load_action_from_file(
-                args.action_file, args.action_chunk_index
+        if is_robolab:
+            format_json = {
+                "auto": None,
+                "json": True,
+                "plain": False,
+            }[args.robolab_prompt_format]
+            processor = Cosmos3RoboLabPolicyProcessor(
+                tokenizer_name_or_path=f"{args.checkpoint}/text_tokenizer",
+                format_prompt_as_json=format_json,
+                action_chunk_size=action_chunk_size,
+                history_length=args.history_length,
+                domain_name=domain_name,
+                raw_action_dim=raw_action_dim,
+                fps=fps,
+                negative_prompt=args.negative_prompt,
+                device=device,
+                params_dtype=dtype,
             )
+            raw_input = _load_robolab_observation(args.robolab_observation)
+            if prompt is not None:
+                raw_input["prompt"] = prompt
+            if not isinstance(raw_input.get("prompt"), str):
+                raise ValueError(
+                    "RoboLab input requires a string prompt in the NPZ or --prompt."
+                )
+        else:
+            processor = Cosmos3PolicyProcessor(
+                tokenizer_name_or_path=f"{args.checkpoint}/text_tokenizer",
+                height=args.height,
+                width=args.width,
+                num_frames=args.num_frames,
+                mode=args.mode,
+                domain_name=domain_name,
+                action_chunk_size=action_chunk_size,
+                raw_action_dim=raw_action_dim,
+                fps=fps,
+                image_size=(args.image_size if args.image_size > 0 else None),
+                append_metadata=not args.no_prompt_metadata,
+                prompt_format=args.prompt_format,
+                view_point=args.view_point,
+                cond_frame_indexes=cond_frames,
+                action_stats_path=args.action_stats_path,
+                action_normalization=args.action_normalization,
+                negative_prompt=args.negative_prompt,
+                device=device,
+                params_dtype=dtype,
+            )
+            raw_input = {"images": observation, "task": prompt}
+            if args.mode == "forward_dynamics":
+                if args.action_file is None:
+                    raise ValueError(
+                        "--action-file is required for forward_dynamics mode."
+                    )
+                raw_input["cond_action"] = _load_action_from_file(
+                    args.action_file, args.action_chunk_index
+                )
 
         processed = processor.preprocess(raw_input)
 
@@ -336,16 +432,16 @@ def main() -> None:
             cond_frame_indexes=processed.cond_frame_indexes,
             cond_action_indexes=processed.cond_action_indexes,
             action_start_frame_offset=processed.action_start_frame_offset,
-            fps=args.fps,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance_scale,
-            seed=args.seed,
+            fps=fps,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
         )
 
         print(
-            f"[run] mode={args.mode} domain={args.domain_name} "
-            f"latent={video_shape} clean_frames={list(cond_frames)} "
-            f"steps={args.steps} action_chunk={args.action_chunk_size}x{args.raw_action_dim}"
+            f"[run] mode={processed.mode} domain_id={processed.domain_id} "
+            f"latent={video_shape} clean_frames={list(processed.cond_frame_indexes or ())} "
+            f"steps={steps} action_chunk={processed.action_chunk}x{processed.raw_action_dim}"
         )
         result = engine.step(request)
 
@@ -362,7 +458,7 @@ def main() -> None:
 
         if "pixels" in output:
             video_path = f"{args.out}.mp4"
-            _save_video(output["pixels"], video_path, args.fps)
+            _save_video(output["pixels"], video_path, fps)
             print(f"[saved] video -> {video_path}")
 
     finally:

@@ -67,7 +67,7 @@ class Cosmos3PolicyWNEntry(Entry):
         self.decode_video = False
 
     def setup(self, args: Cosmos3PolicyWNArgs) -> None:  # type: ignore[override]
-        """Build the transformer (+ optional VAE) and warm the policy scheduler."""
+        """Build the transformer and conditioning VAE, then warm the scheduler."""
         if args.checkpoint_dir is None:
             raise ValueError(
                 "Cosmos3PolicyWNArgs.checkpoint_dir is required (no random-weight "
@@ -97,16 +97,15 @@ class Cosmos3PolicyWNEntry(Entry):
             strict=args.weight_strict,
         )
 
-        if self.decode_video:
-            vae_config = load_config(ckpt / "vae", Cosmos3WanVAEConfig)
-            self.vae = Cosmos3WanVAE(vae_config)
-            load_pretrained(
-                self.vae,
-                ckpt / "vae",
-                remap=cosmos3_vae_weight_remap,
-                strict=args.weight_strict,
-            )
-            self.vae = self.vae.to(device=device, dtype=dtype).eval()
+        vae_config = load_config(ckpt / "vae", Cosmos3WanVAEConfig)
+        self.vae = Cosmos3WanVAE(vae_config)
+        load_pretrained(
+            self.vae,
+            ckpt / "vae",
+            remap=cosmos3_vae_weight_remap,
+            strict=args.weight_strict,
+        )
+        self.vae = self.vae.to(device=device, dtype=dtype).eval()
 
         use_karras = resolve_use_karras_sigmas(args.use_karras_sigmas, ckpt)
         self.scheduler = Cosmos3PolicyWNScheduler(

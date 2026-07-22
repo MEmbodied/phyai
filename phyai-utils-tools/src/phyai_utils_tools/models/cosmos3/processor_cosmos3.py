@@ -53,6 +53,36 @@ COSMOS3_ROBOLAB_CONCAT_VIEW_DESCRIPTION = (
 )
 
 
+def _infer_robolab_json_prompt(tokenizer_name_or_path: str) -> bool:
+    """Resolve the released DROID checkpoint's training prompt format."""
+    import json
+
+    tokenizer_path = Path(tokenizer_name_or_path).expanduser()
+    checkpoint_path = (
+        tokenizer_path.parent
+        if tokenizer_path.name == "text_tokenizer"
+        else tokenizer_path
+    )
+    transformer_config = checkpoint_path / "transformer" / "config.json"
+    if transformer_config.is_file():
+        config = json.loads(transformer_config.read_text(encoding="utf-8"))
+        hidden_act = config.get("hidden_act")
+        if hidden_act == "relu2":
+            return True
+        if hidden_act == "silu":
+            return False
+
+    checkpoint_name = str(tokenizer_name_or_path).lower()
+    if "cosmos3-edge-policy-droid" in checkpoint_name:
+        return True
+    if "cosmos3-nano-policy-droid" in checkpoint_name:
+        return False
+    raise ValueError(
+        "Cannot infer the RoboLab prompt format from the checkpoint; pass "
+        "format_prompt_as_json=True for Edge or False for Nano."
+    )
+
+
 def _flatten_chat_ids(out) -> list[int]:
     """Normalize ``apply_chat_template(tokenize=True)`` output to ``list[int]``.
 
@@ -605,7 +635,7 @@ class Cosmos3RoboLabPolicyProcessor(Cosmos3PolicyProcessor):
         self,
         *,
         tokenizer_name_or_path: str,
-        format_prompt_as_json: bool = False,
+        format_prompt_as_json: bool | None = None,
         image_height: int = 540,
         image_width: int = 640,
         action_chunk_size: int = 32,
@@ -618,8 +648,20 @@ class Cosmos3RoboLabPolicyProcessor(Cosmos3PolicyProcessor):
         device: torch.device | str = "cpu",
         params_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
+        history_length = int(history_length)
+        if history_length < 1:
+            raise ValueError(
+                "history_length must be at least 1 for RoboLab state conditioning."
+            )
+        if image_height <= 0 or image_width <= 0:
+            raise ValueError("image_height and image_width must be positive.")
         self.robolab_image_height = int(image_height)
         self.robolab_image_width = int(image_width)
+        self.format_prompt_as_json = (
+            _infer_robolab_json_prompt(tokenizer_name_or_path)
+            if format_prompt_as_json is None
+            else bool(format_prompt_as_json)
+        )
         super().__init__(
             tokenizer_name_or_path=tokenizer_name_or_path,
             height=544,
@@ -634,7 +676,7 @@ class Cosmos3RoboLabPolicyProcessor(Cosmos3PolicyProcessor):
             fps=fps,
             image_size=480,
             append_metadata=True,
-            prompt_format="json" if format_prompt_as_json else "plain",
+            prompt_format="json" if self.format_prompt_as_json else "plain",
             view_point="concat_view",
             additional_view_description=COSMOS3_ROBOLAB_CONCAT_VIEW_DESCRIPTION,
             cond_frame_indexes=(0,),
