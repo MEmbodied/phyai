@@ -401,7 +401,10 @@ class PI0ExpertRunner(ModelRunner):
                 f"time_emb_table shape {tuple(time_emb_table.shape)} "
                 f"!= {expected_shape}."
             )
-        if time_emb_table.device != self.device:
+        if time_emb_table.device.type != self.device.type or (
+            self.device.index is not None
+            and time_emb_table.device.index != self.device.index
+        ):
             raise ValueError(
                 f"time_emb_table device {time_emb_table.device} != {self.device}."
             )
