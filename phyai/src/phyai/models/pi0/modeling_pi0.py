@@ -964,20 +964,35 @@ class ActionTimeHeads(nn.Module):
         out, _ = self.action_in_proj(x)
         return out
 
-    def embed_action_time(
-        self,
-        x_t: torch.Tensor,
-        time: torch.Tensor,
-    ) -> torch.Tensor:
-        """Fuse noisy actions and scalar flow time into expert action tokens."""
+    def embed_time(self, time: torch.Tensor) -> torch.Tensor:
+        """Encode scalar flow times as sinusoidal embeddings."""
 
-        action_emb = self.embed_action(x_t)
-        time_emb = create_sinusoidal_pos_embedding(
+        return create_sinusoidal_pos_embedding(
             time,
             dimension=self.expert_hidden,
             min_period=self.min_period,
             max_period=self.max_period,
         )
+
+    def fuse_action_time(
+        self,
+        x_t: torch.Tensor,
+        time_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse noisy actions with precomputed timestep embeddings."""
+
+        if time_emb.dim() != 2:
+            raise ValueError(
+                f"time_emb must be 2-D (B, expert_hidden), got "
+                f"shape {tuple(time_emb.shape)}."
+            )
+        expected_shape = (x_t.shape[0], self.expert_hidden)
+        if time_emb.shape != expected_shape:
+            raise ValueError(
+                f"time_emb shape {tuple(time_emb.shape)} != {expected_shape}."
+            )
+
+        action_emb = self.embed_action(x_t)
         time_emb = time_emb.to(action_emb.dtype)
         time_emb = time_emb[:, None, :].expand_as(action_emb)
         action_time_emb = torch.cat([action_emb, time_emb], dim=-1)
@@ -986,6 +1001,15 @@ class ActionTimeHeads(nn.Module):
         h = F.silu(h)
         h, _ = self.action_time_mlp_out(h)
         return h
+
+    def embed_action_time(
+        self,
+        x_t: torch.Tensor,
+        time: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse noisy actions and scalar flow time into expert action tokens."""
+
+        return self.fuse_action_time(x_t, self.embed_time(time))
 
     def project_action(self, x: torch.Tensor) -> torch.Tensor:
         """``(B, T, expert_hidden) -> (B, T, max_action_dim)``."""

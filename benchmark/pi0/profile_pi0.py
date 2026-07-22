@@ -32,7 +32,7 @@ STAGES = [
     "pi0.expert_plan",
     "pi0.expert_loop",
 ]
-EXPERT_STEP_STAGE = "pi0.expert_step"
+EXPERT_GRAPH_STAGE = "pi0.expert_graph"
 
 
 def dims_from_config(cfg: PI0Config) -> mf.Pi0Dims:
@@ -171,7 +171,7 @@ def parse_stage_gpu_ms(trace_path: Path, n_steps: int) -> dict[str, float]:
         trace = json.load(f)
     events = trace.get("traceEvents", trace) if isinstance(trace, dict) else trace
     agg: dict[str, float] = defaultdict(float)
-    expert_step_us = 0.0
+    expert_graph_us = 0.0
     for ev in events:
         if ev.get("cat") != "gpu_user_annotation":
             continue
@@ -179,15 +179,15 @@ def parse_stage_gpu_ms(trace_path: Path, n_steps: int) -> dict[str, float]:
         dur = float(ev.get("dur", 0.0))
         if name in STAGES:
             agg[name] += dur
-        elif name == EXPERT_STEP_STAGE:
-            expert_step_us += dur
+        elif name == EXPERT_GRAPH_STAGE:
+            expert_graph_us += dur
 
     result = {stage: agg.get(stage, 0.0) / 1e3 / max(n_steps, 1) for stage in STAGES}
-    # CUDA graph replay can make the outer loop annotation only cover replay overhead.
-    # The ten expert_step annotations are the reliable GPU sum for the denoising loop.
-    expert_from_steps = expert_step_us / 1e3 / max(n_steps, 1)
-    if expert_from_steps > result["pi0.expert_loop"]:
-        result["pi0.expert_loop"] = expert_from_steps
+    # The inner annotation directly wraps the one graph replay containing all
+    # denoise steps and Euler updates.
+    expert_from_graph = expert_graph_us / 1e3 / max(n_steps, 1)
+    if expert_from_graph > result["pi0.expert_loop"]:
+        result["pi0.expert_loop"] = expert_from_graph
     return result
 
 

@@ -1085,42 +1085,38 @@ def dump_phyai(
 
     heads = sched.expert_runner.heads
     orig_embed_state = heads.embed_state
-    orig_embed_action_time = heads.embed_action_time
+    orig_fuse_action_time = heads.fuse_action_time
 
     def embed_state(state):
         out = orig_embed_state(state)
         dump.setdefault("state_emb", cpu(out))
         return out
 
-    def embed_action_time(x_t, time):
-        out = orig_embed_action_time(x_t, time)
+    def fuse_action_time(x_t, time_emb):
+        out = orig_fuse_action_time(x_t, time_emb)
         if "action_time_emb" not in dump:
             dump["action_time_emb"] = cpu(out)
         return out
 
     heads.embed_state = embed_state
-    heads.embed_action_time = embed_action_time
+    heads.fuse_action_time = fuse_action_time
 
-    orig_expert_fwd = sched.expert_runner.forward
-    denoise_step = 0
+    orig_one_step = sched.expert_runner._one_step
     dt = -1.0 / num_steps
 
-    def expert_fwd(batch):
-        nonlocal denoise_step
-        step = denoise_step
+    def one_step(x_t, step):
         if include_layers or step == 0:
-            dump[f"x_t_step{step}"] = cpu(batch.x_t[:batch_size])
+            dump[f"x_t_step{step}"] = cpu(x_t[:batch_size])
         current_step["value"] = step
-        out = orig_expert_fwd(batch)
+        out = orig_one_step(x_t, step)
         current_step["value"] = None
         dump[f"v_t_step{step}"] = cpu(out[:batch_size])
         if include_layers:
-            x_after = batch.x_t[:batch_size] + dt * out[:batch_size].to(batch.x_t.dtype)
+            x_after = x_t[:batch_size] + dt * out[:batch_size].to(x_t.dtype)
             dump[f"x_t_after_step{step}"] = cpu(x_after)
-        denoise_step += 1
         return out
 
-    sched.expert_runner.forward = expert_fwd
+    sched.expert_runner._one_step = one_step
 
     try:
         with torch.inference_mode():
@@ -1132,8 +1128,8 @@ def dump_phyai(
         lm.embed_lang = orig_embed_lang
         sched.llm_runner._fwd = orig_llm_fwd
         heads.embed_state = orig_embed_state
-        heads.embed_action_time = orig_embed_action_time
-        sched.expert_runner.forward = orig_expert_fwd
+        heads.fuse_action_time = orig_fuse_action_time
+        sched.expert_runner._one_step = orig_one_step
         restore_patches(layer_patches)
         restore_patches(patches)
         close = getattr(engine, "close", None)
